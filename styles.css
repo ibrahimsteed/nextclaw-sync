@@ -1,0 +1,21 @@
+.nextclaw-settings {
+  overflow-wrap: break-word;
+}
+
+.nextclaw-other-webdav-heading .setting-item-name {
+  cursor: pointer;
+}
+
+.webdav-customheaders-textarea {
+  font-family: var(--font-monospace);
+}
+
+.setting-need-wrapping .setting-item-control {
+  display: grid;
+}
+
+/* 移动端默认不显示状态栏；开启后抬高到底部导航栏之上，高度由脚本写入变量。 */
+.is-mobile .app-container .status-bar.nextclaw-mobile-status-bar {
+  display: flex;
+  margin-bottom: var(--nextclaw-mobile-navbar-height, 0);
+}

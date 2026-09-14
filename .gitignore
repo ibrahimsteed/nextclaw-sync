@@ -1,0 +1,22 @@
+# Intellij
+*.iml
+.idea
+
+# npm
+node_modules
+pnpm-lock.yaml
+
+# package-lock.json 有意提交：依赖版本钉死，保证构建可复现。
+
+# build
+main.js
+*.js.map
+
+# obsidian
+data.json
+
+# debug
+logs.txt
+
+# hidden files
+.*
