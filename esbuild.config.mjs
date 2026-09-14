@@ -14,6 +14,9 @@ const context = await esbuild.context({
   entryPoints: ["./src/main.ts"],
   bundle: true,
   external: ["obsidian", "electron"],
+  // xregexp 的发布版依赖 @babel/runtime-corejs3，会打进 core-js 的旧浏览器兼容代码
+  //（用 iframe 与 javascript: 地址造对象）。Obsidian 运行环境不需要它，改用其 ES 源码。
+  alias: { xregexp: "xregexp/src/index.js" },
   inject: ["./esbuild.injecthelper.mjs"],
   format: "cjs",
   target: "es2018",

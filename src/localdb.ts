@@ -1,9 +1,4 @@
-import localforage from "localforage";
-import { extendPrototype as ep1 } from "localforage-getitems";
-import { extendPrototype as ep2 } from "localforage-removeitems";
-ep1(localforage);
-ep2(localforage);
-export type LocalForage = typeof localforage;
+import { IdbStore } from "./idbStore";
 import { nanoid } from "nanoid";
 
 import type {
@@ -37,7 +32,7 @@ export const DEFAULT_DB_VERSION_NUMBER: number = 20240220;
  *
  * 迁移时"先装本插件与旧插件并存，确认后再卸载旧插件"是正常路径，并存是常态。
  *
- * 全部 localforage 表都走这一个常量（本文件 createInstance 处），改这一处即全部隔开。
+ * 全部表都走这一个常量（本文件 prepareDBs 处），改这一处即全部隔开。
  */
 export const DEFAULT_DB_NAME = "nextclawsyncdb";
 export const DEFAULT_TBL_VERSION = "schemaversion";
@@ -56,13 +51,13 @@ interface SyncPlanRecord {
 }
 
 export interface InternalDBs {
-  versionTbl: LocalForage;
-  syncPlansTbl: LocalForage;
-  vaultRandomIDMappingTbl: LocalForage;
-  loggerOutputTbl: LocalForage;
-  simpleKVForMiscTbl: LocalForage;
-  prevSyncRecordsTbl: LocalForage;
-  fileContentHistoryTbl: LocalForage;
+  versionTbl: IdbStore;
+  syncPlansTbl: IdbStore;
+  vaultRandomIDMappingTbl: IdbStore;
+  loggerOutputTbl: IdbStore;
+  simpleKVForMiscTbl: IdbStore;
+  prevSyncRecordsTbl: IdbStore;
+  fileContentHistoryTbl: IdbStore;
 }
 
 /**
@@ -82,36 +77,26 @@ export const prepareDBs = async (
   vaultRandomIDFromOldConfigFile: string,
   profileID: string
 ) => {
+  const stores = {
+    versionTbl: DEFAULT_TBL_VERSION,
+    syncPlansTbl: DEFAULT_SYNC_PLANS_HISTORY,
+    vaultRandomIDMappingTbl: DEFAULT_TBL_VAULT_RANDOM_ID_MAPPING,
+    loggerOutputTbl: DEFAULT_TBL_LOGGER_OUTPUT,
+    simpleKVForMiscTbl: DEFAULT_TBL_SIMPLE_KV_FOR_MISC,
+    prevSyncRecordsTbl: DEFAULT_TBL_PREV_SYNC_RECORDS,
+    fileContentHistoryTbl: DEFAULT_TBL_FILE_CONTENT_HISTORY,
+  };
+  const allStores = Object.values(stores);
+  const table = (storeName: string) =>
+    new IdbStore(DEFAULT_DB_NAME, storeName, allStores);
   const db: InternalDBs = {
-    versionTbl: localforage.createInstance({
-      name: DEFAULT_DB_NAME,
-      storeName: DEFAULT_TBL_VERSION,
-    }),
-    syncPlansTbl: localforage.createInstance({
-      name: DEFAULT_DB_NAME,
-      storeName: DEFAULT_SYNC_PLANS_HISTORY,
-    }),
-    vaultRandomIDMappingTbl: localforage.createInstance({
-      name: DEFAULT_DB_NAME,
-      storeName: DEFAULT_TBL_VAULT_RANDOM_ID_MAPPING,
-    }),
-    loggerOutputTbl: localforage.createInstance({
-      name: DEFAULT_DB_NAME,
-      storeName: DEFAULT_TBL_LOGGER_OUTPUT,
-    }),
-    simpleKVForMiscTbl: localforage.createInstance({
-      name: DEFAULT_DB_NAME,
-      storeName: DEFAULT_TBL_SIMPLE_KV_FOR_MISC,
-    }),
-    prevSyncRecordsTbl: localforage.createInstance({
-      name: DEFAULT_DB_NAME,
-      storeName: DEFAULT_TBL_PREV_SYNC_RECORDS,
-    }),
-
-    fileContentHistoryTbl: localforage.createInstance({
-      name: DEFAULT_DB_NAME,
-      storeName: DEFAULT_TBL_FILE_CONTENT_HISTORY,
-    }),
+    versionTbl: table(stores.versionTbl),
+    syncPlansTbl: table(stores.syncPlansTbl),
+    vaultRandomIDMappingTbl: table(stores.vaultRandomIDMappingTbl),
+    loggerOutputTbl: table(stores.loggerOutputTbl),
+    simpleKVForMiscTbl: table(stores.simpleKVForMiscTbl),
+    prevSyncRecordsTbl: table(stores.prevSyncRecordsTbl),
+    fileContentHistoryTbl: table(stores.fileContentHistoryTbl),
   };
 
   // try to get vaultRandomID firstly
@@ -251,8 +236,10 @@ export const getAllPrevSyncRecordsByVaultAndProfile = async (
   profileID: string
 ) => {
   const res: Entity[] = [];
-  const kv: Record<string, Entity | null> =
-    await db.prevSyncRecordsTbl.getItems();
+  const kv = (await db.prevSyncRecordsTbl.getItems()) as Record<
+    string,
+    Entity | null
+  >;
   for (const key of Object.getOwnPropertyNames(kv)) {
     if (key.startsWith(`${vaultRandomID}\t${profileID}\t`)) {
       const val = kv[key];
