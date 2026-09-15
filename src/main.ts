@@ -36,6 +36,7 @@ import {
   upsertPluginVersionByVault,
 } from "./localdb";
 import { changeMobileStatusBar } from "./misc";
+import { relativeTimeText } from "./statusBarTime";
 import { NextclawSyncSettingTab } from "./settings";
 
 import { NEXTCLAW_WEBDAV_DEFAULTS } from "./nextclaw/constants";
@@ -1029,32 +1030,7 @@ export default class NextclawSyncPlugin extends Plugin {
       }
 
       const deltaTime = Date.now() - inputTs;
-      // create human readable time
-      const years = Math.floor(deltaTime / 31556952000);
-      const months = Math.floor(deltaTime / 2629746000);
-      const weeks = Math.floor(deltaTime / 604800000);
-      const days = Math.floor(deltaTime / 86400000);
-      const hours = Math.floor(deltaTime / 3600000);
-      const minutes = Math.floor(deltaTime / 60000);
-      const seconds = Math.floor(deltaTime / 1000);
-      let timeText = "";
-      if (years > 0) {
-        timeText = t("statusbar_time_years", { time: years });
-      } else if (months > 0) {
-        timeText = t("statusbar_time_months", { time: months });
-      } else if (weeks > 0) {
-        timeText = t("statusbar_time_weeks", { time: weeks });
-      } else if (days > 0) {
-        timeText = t("statusbar_time_days", { time: days });
-      } else if (hours > 0) {
-        timeText = t("statusbar_time_hours", { time: hours });
-      } else if (minutes > 0) {
-        timeText = t("statusbar_time_minutes", { time: minutes });
-      } else if (seconds > 30) {
-        timeText = t("statusbar_time_lessminute");
-      } else {
-        timeText = t("statusbar_time_now");
-      }
+      const timeText = relativeTimeText(deltaTime, t);
       const dateText = new Date(inputTs).toLocaleTimeString(
         navigator.language,
         {

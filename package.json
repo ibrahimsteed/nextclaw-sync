@@ -1,6 +1,6 @@
 {
   "name": "nextclaw-sync",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Sync an Obsidian vault with a WebDAV server such as Nextcloud.",
   "scripts": {
     "dev": "node esbuild.config.mjs",

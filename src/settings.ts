@@ -1,5 +1,6 @@
 import {
   type App,
+  type DropdownComponent,
   type ExtraButtonComponent,
   Modal,
   Notice,
@@ -114,19 +115,10 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName(t("nextclaw_group_account")).setHeading();
 
-    new Setting(containerEl)
-      .setName(t("settings_webdav_addr"))
-      .setDesc(t("settings_webdav_addr_desc"))
-      .addText((text) => {
-        locks.bindAddress(text); // A 分支强制回落并置灰
-        text.setValue(settings.webdav.address).onChange(async (value) => {
-          settings.webdav.address = value.trim();
-          locks.refresh(); // 地址决定远端目录是否可编辑
-          await save();
-        });
-      });
-
     let usernameText: TextComponent | undefined;
+    // 分支切换会改掉自动同步两项的取值，下拉框要跟着刷新（不重绘整页，免得打断输入）。
+    let startupDropdown: DropdownComponent | undefined;
+    let autorunDropdown: DropdownComponent | undefined;
     new Setting(containerEl)
       .setName(t("settings_webdav_user"))
       .setDesc(t("settings_webdav_user_desc"))
@@ -141,6 +133,10 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
           }
           if (r.addressChanged) {
             locks.showAddress(r.address); // 别只改设置不改显示
+          }
+          if (r.branchChanged) {
+            startupDropdown?.setValue(`${settings.initRunAfterMilliseconds}`);
+            autorunDropdown?.setValue(`${settings.autoRunEveryMilliseconds}`);
           }
           await save();
         });
@@ -170,6 +166,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
       .setName(t("settings_runoncestartup"))
       .setDesc(t("settings_runoncestartup_desc"))
       .addDropdown((dropdown) => {
+        startupDropdown = dropdown;
         locks.lockInA(dropdown);
         dropdown
           .addOption("-1", t("settings_runoncestartup_notset"))
@@ -187,6 +184,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
       .setName(t("settings_autorun"))
       .setDesc(t("settings_autorun_desc"))
       .addDropdown((dropdown) => {
+        autorunDropdown = dropdown;
         locks.lockInA(dropdown);
         dropdown
           .addOption("-1", t("settings_autorun_notset"))
@@ -282,6 +280,20 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
     });
     const otherBody = containerEl.createDiv();
     otherBody.hide();
+
+    // 服务器地址放在折叠区块里：使用 NextClaw 账号时按用户名自动填写，学生不需要看到它；
+    // 连接其他 WebDAV 服务的用户展开后填写。
+    new Setting(otherBody)
+      .setName(t("settings_webdav_addr"))
+      .setDesc(t("settings_webdav_addr_desc"))
+      .addText((text) => {
+        locks.bindAddress(text); // A 分支强制回落并置灰
+        text.setValue(settings.webdav.address).onChange(async (value) => {
+          settings.webdav.address = value.trim();
+          locks.refresh(); // 地址决定远端目录是否可编辑
+          await save();
+        });
+      });
 
     let newRemoteBaseDir = settings.webdav.remoteBaseDir || "";
     new Setting(otherBody)

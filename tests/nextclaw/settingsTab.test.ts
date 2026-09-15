@@ -68,7 +68,6 @@ const render = (webdav: Record<string, any>, extra: Record<string, any> = {}) =>
 
 const LAYOUT = [
   "# nextclaw_group_account",
-  "settings_webdav_addr",
   "settings_webdav_user",
   "settings_webdav_password",
   "# nextclaw_group_sync",
@@ -78,6 +77,7 @@ const LAYOUT = [
   "settings_syncplans",
   "settings_debuglevel",
   "# nextclaw_group_otherwebdav",
+  "settings_webdav_addr",
   "settings_remotebasedir",
   "settings_webdav_auth",
   "settings_webdav_depth",
@@ -90,7 +90,7 @@ describe("NextClaw 设置页（渲染）：布局", () => {
     Modal.opened = [];
   });
 
-  it("只渲染四组、共 11 项，顺序固定，没有其它设置项", () => {
+  it("只渲染四组、共 11 项，顺序固定，服务器地址在折叠区块最前，没有其它设置项", () => {
     const { all } = render({});
     assert.deepEqual(
       all.map((s: Setting) => (s.heading ? `# ${s.name}` : s.name)),
@@ -109,7 +109,7 @@ describe("NextClaw 设置页（渲染）：布局", () => {
     assert.deepEqual(tags.filter((t) => /^h[1-6]$/.test(t)), []);
   });
 
-  it("\"其他 WebDAV 服务\"默认折叠：四项不可见，其余可见", () => {
+  it("\"其他 WebDAV 服务\"默认折叠：服务器地址等五项不可见，其余可见", () => {
     const { all } = render({});
     for (const s of all as Setting[]) {
       const folded = FOLDED.includes(s.name);
@@ -197,6 +197,17 @@ describe("NextClaw 设置页（渲染）：锁定", () => {
     assert.equal(r.byName("settings_autorun").dropdown.disabled, false);
     assert.equal(r.plugin.settings.nextclawPendingSwitchToB, true);
     assert.ok(r.saves() > 0);
+  });
+
+  it("分支切换后，自动同步两项的下拉框显示切换后的取值", async () => {
+    const r = render({});
+    await r.byName("settings_webdav_user").text.change("s1");
+    assert.equal(r.byName("settings_runoncestartup").dropdown.value, `${r.plugin.settings.initRunAfterMilliseconds}`);
+    assert.equal(r.byName("settings_autorun").dropdown.value, `${r.plugin.settings.autoRunEveryMilliseconds}`);
+    assert.notEqual(r.plugin.settings.autoRunEveryMilliseconds, -1, "模式 B 预设应开启定时同步");
+    await r.byName("settings_webdav_user").text.change("");
+    assert.equal(r.byName("settings_runoncestartup").dropdown.value, "-1");
+    assert.equal(r.byName("settings_autorun").dropdown.value, "-1");
   });
 
   it("清空用户名：回到模式 A，地址回落演示库并重新锁定", async () => {

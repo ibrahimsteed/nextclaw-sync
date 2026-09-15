@@ -35,20 +35,19 @@ saving) so that the downloaded settings and plugins take effect.
 
 **This plugin talks to the network. Here is exactly when, and to where.**
 
-| When | Where | What |
-|---|---|---|
-| You tap sync with the username field **empty** | `https://cloud.nextclaw.chat/public.php/webdav` | **Downloads only.** A small public read-only demo vault (~28 KB). |
-| Your own username is filled in | The server address you entered | Two-way sync of your vault: on startup (after a short delay), every 10 minutes, a few seconds after you stop editing, and whenever you tap sync. |
-| Never | — | No telemetry, no analytics, no other destinations. |
+**With the username field empty**, the plugin connects only when you tap sync. It downloads a small public
+read-only demo vault from NextClaw's Nextcloud server, `cloud.nextclaw.chat`. Nothing is uploaded, and demo
+mode never syncs automatically. The demo vault is reached through a public share link, not an account; the
+server rejects every write to it.
 
-- **With the username field empty, nothing is sent anywhere until you press sync.**
-  The demo mode has no automatic syncing.
-- The demo vault is reached through a **public share link**, not an account.
-  The link is read-only: the server rejects every write
-  (`PUT`, `DELETE`, `MKCOL`, `MOVE`) with `403`.
-- **You are not locked to our server.** The address field is an editable default.
-  Point it at any WebDAV service you like; fill in your username and the demo
-  configuration steps out of the way entirely.
+**Once you fill in your own username**, the plugin syncs your vault in both directions with your server: on
+startup (after a short delay), every 10 minutes, a few seconds after you stop editing, and whenever you tap
+sync. For a NextClaw account this is `cloud.nextclaw.chat`; the server address is filled in from your username.
+
+**The plugin sends nothing else anywhere**: no telemetry, no analytics, no other destinations.
+
+**You are not locked to our server.** Open "Other WebDAV services" in the settings to enter the address of any
+WebDAV service you like, such as your own Nextcloud.
 
 ## Switching to your own storage — read before you fill in a username
 
@@ -59,7 +58,9 @@ account.
 
 Install the plugin in a **new, empty vault**. If you install it in a vault that
 already contains your notes, those notes will be moved to `.trash` at the switch
-(they are recoverable from there, but they will not be synced).
+(they are recoverable from there, but they will not be synced). Before that happens,
+the plugin asks you to confirm and lists what will be moved; it also warns you before
+the first demo sync replaces the settings of a vault that already has files.
 
 ## The `.obsidian` settings folder
 
