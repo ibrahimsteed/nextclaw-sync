@@ -1,4 +1,5 @@
 import type { Vault, moment as obsidianMoment } from "obsidian";
+import { liftHeight } from "./nextclaw/mobileStatusBar";
 
 declare global {
   interface Window {
@@ -155,7 +156,36 @@ export const delay = (ms: number) =>
   new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
 const MOBILE_STATUS_BAR_CLASS = "nextclaw-mobile-status-bar";
+const MOBILE_STATUS_BAR_IDLE_CLASS = "nextclaw-mobile-status-bar-idle";
 const NAVBAR_HEIGHT_VAR = "--nextclaw-mobile-navbar-height";
+const BOTTOM_BAR_SELECTORS = [".mobile-navbar", ".mobile-toolbar"];
+
+const isBottomBar = (node: Node) =>
+  node.instanceOf(HTMLElement) &&
+  (node.hasClass("mobile-navbar") || node.hasClass("mobile-toolbar"));
+
+const getMobileStatusBar = () => {
+  const statusbar = activeDocument.querySelector(
+    ".is-mobile .app-container .status-bar"
+  );
+  return statusbar instanceof HTMLElement ? statusbar : undefined;
+};
+
+/**
+ * 移动端状态条淡入/淡出。真正的显隐由 styles.css 里的 idle 类做，
+ * 这里只负责开关它；桌面端查不到 `.is-mobile`，调用是空操作。
+ */
+export const setMobileStatusBarIdle = (idle: boolean) => {
+  const statusbar = getMobileStatusBar();
+  if (statusbar === undefined) {
+    return;
+  }
+  if (idle) {
+    statusbar.addClass(MOBILE_STATUS_BAR_IDLE_CLASS);
+  } else {
+    statusbar.removeClass(MOBILE_STATUS_BAR_IDLE_CLASS);
+  }
+};
 
 /**
  * 移动端显示状态栏，并把它抬到底部导航栏之上。
@@ -166,50 +196,54 @@ export const changeMobileStatusBar = (
   oldAppContainerObserver?: MutationObserver
 ) => {
   const appContainer = activeDocument.querySelector(".app-container");
-  const statusbar = activeDocument.querySelector(
-    ".is-mobile .app-container .status-bar"
-  );
+  const statusbar = getMobileStatusBar();
 
-  if (
-    !(appContainer instanceof HTMLElement) ||
-    !(statusbar instanceof HTMLElement)
-  ) {
+  if (!(appContainer instanceof HTMLElement) || statusbar === undefined) {
     console.warn("give up watching appContainer for statusbar");
     return undefined;
   }
 
-  const liftAbove = (navbar: Element) => {
-    const height = window.getComputedStyle(navbar).getPropertyValue("height");
-    statusbar.addClass(MOBILE_STATUS_BAR_CLASS);
-    statusbar.style.setProperty(NAVBAR_HEIGHT_VAR, height);
+  /**
+   * 重新量一次抬高量。**插入和移除都要调**：只在插入时量，导航栏消失后状态条
+   * 会一直悬在半空，正好压住屏幕右下角别人的按钮。
+   */
+  const applyLift = () => {
+    const heights = BOTTOM_BAR_SELECTORS.map((sel) => {
+      const el = activeDocument.querySelector(sel);
+      // 用 getBoundingClientRect：已隐藏的条高度为 0，会被 liftHeight 当作不存在。
+      return el instanceof HTMLElement ? el.getBoundingClientRect().height : 0;
+    });
+    statusbar.style.setProperty(NAVBAR_HEIGHT_VAR, `${liftHeight(heights)}px`);
   };
 
   if (op === "disable") {
     oldAppContainerObserver?.disconnect();
     statusbar.removeClass(MOBILE_STATUS_BAR_CLASS);
+    statusbar.removeClass(MOBILE_STATUS_BAR_IDLE_CLASS);
     statusbar.style.removeProperty(NAVBAR_HEIGHT_VAR);
     return undefined;
   }
 
   const observer = new MutationObserver((mutationList) => {
     for (const mutation of mutationList) {
-      const added = mutation.addedNodes[0];
-      if (
-        mutation.type === "childList" &&
-        added?.instanceOf(HTMLElement) &&
-        (added.hasClass("mobile-navbar") || added.hasClass("mobile-toolbar"))
-      ) {
-        // 刚插入时高度还不对，稍等再取。
-        window.setTimeout(() => liftAbove(added), 300);
+      if (mutation.type !== "childList") {
+        continue;
+      }
+      // NodeList 在本项目的 lib 设定下不可迭代，用 Array.from 转。
+      const touched =
+        Array.from(mutation.addedNodes).some(isBottomBar) ||
+        Array.from(mutation.removedNodes).some(isBottomBar);
+      if (touched) {
+        // 刚插入时高度还不对，稍等再取；移除时同样延后，等布局稳定。
+        window.setTimeout(applyLift, 300);
+        break;
       }
     }
   });
   observer.observe(appContainer, { childList: true });
 
-  const navbar = activeDocument.querySelector(".mobile-navbar");
-  if (navbar !== null) {
-    liftAbove(navbar);
-  }
+  statusbar.addClass(MOBILE_STATUS_BAR_CLASS);
+  applyLift();
   return observer;
 };
 

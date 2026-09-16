@@ -1,7 +1,7 @@
 {
   "id": "nextclaw-sync",
   "name": "NextClaw Sync",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "minAppVersion": "1.13.0",
   "description": "Sync your vault with Nextcloud or any WebDAV server. Made for NextClaw accounts; without an account it connects to a read-only demo vault.",
   "author": "NextClaw",

@@ -14,8 +14,56 @@
   display: grid;
 }
 
-/* 移动端默认不显示状态栏；开启后抬高到底部导航栏之上，高度由脚本写入变量。 */
+/* 移动端：带输入框的行改成上下堆叠，输入框独占一行。
+   官方的 `.is-mobile input[type="text"] { width: 100% }` 只匹配 text，
+   眼睛按钮切换 type 时输入框会突然缩水；堆叠后两种 type 宽度一致。 */
+.is-mobile .nextclaw-settings .nextclaw-stacked-input {
+  flex-wrap: wrap;
+}
+
+.is-mobile .nextclaw-settings .nextclaw-stacked-input .setting-item-info {
+  width: 100%;
+}
+
+.is-mobile .nextclaw-settings .nextclaw-stacked-input .setting-item-control {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.is-mobile
+  .nextclaw-settings
+  .nextclaw-stacked-input
+  .setting-item-control
+  input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+
+/* 移动端默认不显示状态栏；开启后抬高到底部导航栏之上，高度由脚本写入变量。
+   状态栏固定在视口右下角，那里通常是别人的按钮，所以：
+   ①不接受点击（本条目只展示，没有点击行为）；②只放出自己那一项。 */
 .is-mobile .app-container .status-bar.nextclaw-mobile-status-bar {
   display: flex;
   margin-bottom: var(--nextclaw-mobile-navbar-height, 0);
+  pointer-events: none;
+  transition: opacity 0.4s ease, visibility 0s;
+}
+
+/* 官方在移动端藏起整条状态栏是有意为之，我们只该为自己开口子，
+   不替反向链接、笔记属性、字数统计等核心插件决定要不要在移动端露面。 */
+.is-mobile
+  .app-container
+  .status-bar.nextclaw-mobile-status-bar
+  > .status-bar-item:not(.plugin-nextclaw-sync) {
+  display: none;
+}
+
+/* 同步成功若干秒后淡出，把角落还给别人；同步中、失败、从未同步则常驻。 */
+.is-mobile
+  .app-container
+  .status-bar.nextclaw-mobile-status-bar.nextclaw-mobile-status-bar-idle {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.4s ease, visibility 0s 0.4s;
 }

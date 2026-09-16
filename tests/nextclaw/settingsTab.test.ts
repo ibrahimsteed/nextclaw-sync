@@ -315,3 +315,63 @@ describe("NextClaw 设置页（渲染）：修改值", () => {
     assert.ok(values.includes(`${PRESET_B_MOBILE_OVERRIDES.initRunAfterMilliseconds}`));
   });
 });
+
+describe("NextClaw 设置页（渲染）：移动端输入框宽度", () => {
+  const css = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "..", "styles.css"),
+    "utf8"
+  ) as string;
+  const flat = css.replace(/\s+/g, " ");
+  // 带输入框的四行都要堆叠：眼睛按钮把 type 从 password 切成 text 时，
+  // 官方的 `.is-mobile input[type="text"] { width: 100% }` 会让输入框突然缩水
+  // （竖屏实测 238px → 65px，用户名看不全）。
+  const STACKED = [
+    "settings_webdav_user",
+    "settings_webdav_password",
+    "settings_webdav_addr",
+    "settings_remotebasedir",
+  ];
+
+  it("四个带输入框的设置项都带上了堆叠类", () => {
+    const { byName } = render({});
+    for (const name of STACKED) {
+      assert.ok(
+        byName(name).settingEl.classes.has("nextclaw-stacked-input"),
+        `${name} 缺少 nextclaw-stacked-input`
+      );
+    }
+  });
+
+  it("没有输入框的设置项不加这个类", () => {
+    const { all } = render({});
+    const extra = all
+      .filter(
+        (s: Setting) =>
+          !s.heading &&
+          !STACKED.includes(s.name) &&
+          s.settingEl.classes.has("nextclaw-stacked-input")
+      )
+      .map((s: Setting) => s.name);
+    assert.deepEqual(extra, []);
+  });
+
+  it("样式里这个类让输入框占满一行，且只在移动端生效", () => {
+    assert.match(
+      flat,
+      /\.is-mobile \.nextclaw-settings \.nextclaw-stacked-input \.setting-item-control \{[^}]*width: 100%;/
+    );
+    assert.match(
+      flat,
+      /\.is-mobile \.nextclaw-settings \.nextclaw-stacked-input \.setting-item-control input \{[^}]*width: 100%;/
+    );
+    // 桌面端不受影响：所有相关规则都挂在 .is-mobile 下。
+    for (const rule of flat.split("}")) {
+      if (rule.includes("nextclaw-stacked-input")) {
+        assert.ok(
+          rule.includes(".is-mobile"),
+          `规则未限定在移动端: ${rule.trim().slice(0, 80)}`
+        );
+      }
+    }
+  });
+});

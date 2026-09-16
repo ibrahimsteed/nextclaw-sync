@@ -79,6 +79,20 @@ export class ChangeRemoteBaseDirModal extends Modal {
   }
 }
 
+/**
+ * 移动端把整行改成上下堆叠，输入框独占一行。
+ *
+ * 官方样式里有 `.is-mobile input[type="text"] { width: 100% }`，**只匹配 text**：
+ * 眼睛按钮是靠改 `input.type` 遮内容的，一切到显示状态就命中这条规则，
+ * 而 `width: 100%` 在内容宽度的一行里退化成"剩多少算多少"，输入框突然缩水
+ * （实测 238px → 120px，用户名看不全）。竖屏下长说明文字挤得更狠。
+ * 堆叠后输入框占满一行，两种 type 宽度一致。
+ */
+const stackInputOnMobile = (setting: Setting) => {
+  setting.settingEl.addClass("nextclaw-stacked-input");
+  return setting;
+};
+
 /** 输入框默认遮住内容，右侧的眼睛按钮切换显示。 */
 const hideTextWithToggle = (text: TextComponent, eye: ExtraButtonComponent) => {
   text.inputEl.type = "password";
@@ -119,7 +133,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
     // 分支切换会改掉自动同步两项的取值，下拉框要跟着刷新（不重绘整页，免得打断输入）。
     let startupDropdown: DropdownComponent | undefined;
     let autorunDropdown: DropdownComponent | undefined;
-    new Setting(containerEl)
+    stackInputOnMobile(new Setting(containerEl))
       .setName(t("settings_webdav_user"))
       .setDesc(t("settings_webdav_user_desc"))
       .addText((text) => {
@@ -144,7 +158,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
       .addExtraButton((eye) => hideTextWithToggle(usernameText!, eye));
 
     let passwordText: TextComponent | undefined;
-    new Setting(containerEl)
+    stackInputOnMobile(new Setting(containerEl))
       .setName(t("settings_webdav_password"))
       .setDesc(t("settings_webdav_password_desc"))
       .addText((text) => {
@@ -283,7 +297,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
 
     // 服务器地址放在折叠区块里：使用 NextClaw 账号时按用户名自动填写，学生不需要看到它；
     // 连接其他 WebDAV 服务的用户展开后填写。
-    new Setting(otherBody)
+    stackInputOnMobile(new Setting(otherBody))
       .setName(t("settings_webdav_addr"))
       .setDesc(t("settings_webdav_addr_desc"))
       .addText((text) => {
@@ -296,7 +310,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
       });
 
     let newRemoteBaseDir = settings.webdav.remoteBaseDir || "";
-    new Setting(otherBody)
+    stackInputOnMobile(new Setting(otherBody))
       .setName(t("settings_remotebasedir"))
       .setDesc(t("settings_remotebasedir_desc"))
       .addText((text) => {

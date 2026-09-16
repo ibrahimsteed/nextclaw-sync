@@ -35,7 +35,12 @@ import {
   upsertLastSuccessSyncTimeByVault,
   upsertPluginVersionByVault,
 } from "./localdb";
-import { changeMobileStatusBar } from "./misc";
+import { changeMobileStatusBar, setMobileStatusBarIdle } from "./misc";
+import {
+  type MobileStatusBarState,
+  SUCCESS_VISIBLE_MS,
+  shouldShowMobileStatusBar,
+} from "./nextclaw/mobileStatusBar";
 import { relativeTimeText } from "./statusBarTime";
 import { NextclawSyncSettingTab } from "./settings";
 
@@ -167,6 +172,8 @@ export default class NextclawSyncPlugin extends Plugin {
   vaultRandomID!: string;
   syncEvent?: Events;
   appContainerObserver?: MutationObserver;
+  /** 移动端状态条"同步成功后淡出"的一次性定时器。 */
+  mobileStatusBarTimer?: number;
   /** 本次运行已提示过"需要手动同步确认"，自动同步不再重复提示。 */
   existingVaultNoticeShown = false;
 
@@ -712,6 +719,10 @@ export default class NextclawSyncPlugin extends Plugin {
       this.appContainerObserver.disconnect();
       this.appContainerObserver = undefined;
     }
+    if (this.mobileStatusBarTimer !== undefined) {
+      window.clearTimeout(this.mobileStatusBarTimer);
+      this.mobileStatusBarTimer = undefined;
+    }
   }
 
   async loadSettings() {
@@ -969,6 +980,30 @@ export default class NextclawSyncPlugin extends Plugin {
     });
   }
 
+  /**
+   * 同步成功 SUCCESS_VISIBLE_MS 后把状态条淡出，其余状态常驻。
+   * 状态条固定在视口右下角，那里通常是别人的按钮，不该长期占着。
+   */
+  refreshMobileStatusBarVisibility(state: MobileStatusBarState) {
+    if (!Platform.isMobile || !this.settings.enableMobileStatusBar) {
+      return;
+    }
+    if (this.mobileStatusBarTimer !== undefined) {
+      window.clearTimeout(this.mobileStatusBarTimer);
+      this.mobileStatusBarTimer = undefined;
+    }
+    const visible = shouldShowMobileStatusBar(state);
+    setMobileStatusBarIdle(!visible);
+    if (visible && !state.syncing && state.hasTimestamp && state.isSuccess) {
+      // 文字每 30 秒才刷新一次，等不到那时候，单独安排一次淡出。
+      const remaining = Math.max(SUCCESS_VISIBLE_MS - state.msSinceLastSync, 0);
+      this.mobileStatusBarTimer = window.setTimeout(() => {
+        this.mobileStatusBarTimer = undefined;
+        setMobileStatusBarIdle(true);
+      }, remaining);
+    }
+  }
+
   setCurrSyncMsg(
     t: (x: TransItemType, vars?: TransVars) => string,
     s: SyncTriggerSourceType,
@@ -991,6 +1026,12 @@ export default class NextclawSyncPlugin extends Plugin {
       this.statusBarElement.setText(shortMsg);
       this.statusBarElement.setAttribute("aria-label", longMsg);
     }
+    this.refreshMobileStatusBarVisibility({
+      syncing: true,
+      hasTimestamp: false,
+      isSuccess: false,
+      msSinceLastSync: 0,
+    });
   }
 
   updateLastSyncMsg(
@@ -1050,6 +1091,13 @@ export default class NextclawSyncPlugin extends Plugin {
 
     this.statusBarElement.setText(lastSyncMsg);
     this.statusBarElement.setAttribute("aria-label", lastSyncLabelMsg);
+
+    this.refreshMobileStatusBarVisibility({
+      syncing: syncStatus === "syncing",
+      hasTimestamp: inputTs > 0,
+      isSuccess,
+      msSinceLastSync: Date.now() - inputTs,
+    });
   }
 
   /**
