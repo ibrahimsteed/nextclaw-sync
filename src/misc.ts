@@ -155,6 +155,21 @@ export const isSpecialFolderNameToSkip = (
 export const delay = (ms: number) =>
   new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
+/**
+ * 把响应头的值统一成字符串。
+ *
+ * 桌面端 requestUrl 走 Electron 主进程，重复的响应头原样返回**数组**
+ * （Nextcloud 一次发 4 个 set-cookie）；移动端走 Capacitor，全是字符串。
+ * 不统一的话 onlyLatin1 会在数组上抛 "charCodeAt is not a function"，
+ * 整个桌面端同步都用不了。
+ */
+export function headerValueToText(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((x) => String(x)).join(", ");
+  }
+  return typeof value === "string" ? value : String(value);
+}
+
 const MOBILE_STATUS_BAR_CLASS = "nextclaw-mobile-status-bar";
 const MOBILE_STATUS_BAR_IDLE_CLASS = "nextclaw-mobile-status-bar-idle";
 const NAVBAR_HEIGHT_VAR = "--nextclaw-mobile-navbar-height";

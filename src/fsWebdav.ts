@@ -16,6 +16,7 @@ import { FakeFs } from "./fsAll";
 import {
   bufferToArrayBuffer,
   chunkArray,
+  headerValueToText,
   splitFileSizeToChunkRanges,
 } from "./misc";
 
@@ -71,10 +72,9 @@ if (VALID_REQURL) {
 
     const rspHeaders = objKeyToLower({ ...r.headers });
     for (const key of Object.keys(rspHeaders)) {
+      const text = headerValueToText(rspHeaders[key]);
       // Response 的头只允许 ISO-8859-1 字符，否则构造时报错。
-      if (!onlyLatin1(rspHeaders[key])) {
-        rspHeaders[key] = encodeURIComponent(rspHeaders[key]);
-      }
+      rspHeaders[key] = onlyLatin1(text) ? text : encodeURIComponent(text);
     }
 
     const statusText = getReasonPhrase(r.status);
