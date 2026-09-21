@@ -12,6 +12,7 @@ import {
   insertSyncPlanRecordByVault,
 } from "../../../src/localdb";
 import { canAskNow, evaluateGuard } from "../../../src/nextclaw/existingVaultGuard";
+import { isStudentAccountOnDesktop } from "../../../src/nextclaw/desktopPolicy";
 import { switchAtoB } from "../../../src/nextclaw/switchAtoB";
 import {
   markReloadPending,
@@ -41,7 +42,11 @@ function mainHarness() {
   const notices: string[] = [];
   // 保护弹窗：默认用户点"继续"，并记下弹过哪些。
   const guardUi = { answer: true, asked: [] as any[] };
+  // 运行平台：默认移动端；测桌面端拦截时改成 true。
+  const platform = { isDesktopApp: false };
   const globals: Record<string, any> = {
+    isStudentAccountOnDesktop,
+    Platform: platform,
     insertSyncPlanRecordByVault,
     getAllPrevSyncRecordsByVaultAndProfile,
     evaluateGuard,
@@ -125,6 +130,7 @@ function mainHarness() {
     notices,
     executed,
     guardUi,
+    platform,
     run: (trigger = "manual") => fn.call(plugin, trigger),
   };
 }
@@ -372,5 +378,70 @@ describe("§3 §8 main syncRun real method wiring", () => {
     d.h.local.put("my note.md");
     await d.run("dry");
     assert.equal(d.guardUi.asked.length, 0);
+  });
+});
+
+describe("NextClaw 桌面端不同步学生账号：syncRun 真实方法接线", () => {
+  const STUDENT = {
+    username: "s10012",
+    address: "https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents",
+  };
+
+  it("桌面端学生账号：不发任何请求、不动本地文件、切换标记保留", async () => {
+    const t = mainHarness();
+    t.platform.isDesktopApp = true;
+    t.plugin.settings.webdav = { ...STUDENT };
+    // 刚填了用户名、还没切换：放行的话 switchAtoB 会把本地内容移进 .trash。
+    t.plugin.settings.nextclawPendingSwitchToB = true;
+    t.h.local.put("my-own-note.md");
+    await t.run("manual");
+    assert.deepEqual(t.h.remote.calls, [], "一个请求都不能发");
+    assert.deepEqual(t.h.local.writes(), [], "本地一个文件都不能动");
+    assert.equal(t.plugin.settings.nextclawPendingSwitchToB, true);
+    assert.equal(t.plugin.isSyncing, false, "不能把同步锁留在锁住状态");
+    assert.deepEqual(t.notices, ["nextclaw_desktop_student_blocked"]);
+    assert.deepEqual(t.executed, [], "不能触发重新加载");
+  });
+
+  it("手动触发每次都提示，自动触发只提示一次", async () => {
+    const t = mainHarness();
+    t.platform.isDesktopApp = true;
+    t.plugin.settings.webdav = { ...STUDENT };
+    await t.run("auto");
+    await t.run("auto_sync_on_save");
+    await t.run("auto_once_init");
+    assert.equal(t.notices.length, 1, "自动触发不刷屏");
+    await t.run("manual");
+    await t.run("manual");
+    assert.equal(t.notices.length, 3, "手动触发每次都要给反馈");
+    assert.deepEqual(t.h.remote.calls, []);
+  });
+
+  it("移动端同一个学生账号照常同步", async () => {
+    const t = mainHarness();
+    t.platform.isDesktopApp = false;
+    t.plugin.settings.webdav = { ...STUDENT };
+    t.h.remote.put("student.md");
+    await t.run("manual");
+    assert.ok(t.h.remote.calls.some((c) => c.op === "walk"), "应当真的去列远端");
+    assert.ok(!t.notices.includes("nextclaw_desktop_student_blocked"));
+  });
+
+  it("桌面端演示库、其他 WebDAV 服务照常同步", async () => {
+    for (const webdav of [
+      { username: "", address: "https://cloud.nextclaw.chat/public.php/webdav" },
+      { username: "me", address: "https://dav.example.com/remote.php/dav/files/me" },
+    ]) {
+      const t = mainHarness();
+      t.platform.isDesktopApp = true;
+      t.plugin.settings.webdav = webdav;
+      t.h.remote.put("note.md");
+      await t.run("manual");
+      assert.ok(
+        t.h.remote.calls.some((c) => c.op === "walk"),
+        `应当放行：${webdav.address}`
+      );
+      assert.ok(!t.notices.includes("nextclaw_desktop_student_blocked"));
+    }
   });
 });

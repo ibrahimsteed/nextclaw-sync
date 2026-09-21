@@ -109,5 +109,7 @@
   "nextclaw_guard_more": "……另有 {{count}} 項",
   "nextclaw_guard_cancel": "取消",
   "nextclaw_guard_cancelled": "NextClaw Sync：已取消，本次未同步。",
-  "nextclaw_guard_manual_required": "NextClaw Sync：庫裡已有 {{count}} 個檔案，需要你確認後才能繼續。請手動點一次同步。"
+  "nextclaw_guard_manual_required": "NextClaw Sync：庫裡已有 {{count}} 個檔案，需要你確認後才能繼續。請手動點一次同步。",
+  "nextclaw_desktop_student_blocked": "NextClaw Sync：電腦上不能同步 NextClaw 學生帳號，請在 iPad 或 Android 平板上使用。示範庫和其他 WebDAV 服務不受影響。",
+  "nextclaw_desktop_student_hint": "電腦上不能同步 NextClaw 學生帳號，請在 iPad 或 Android 平板上使用；連接其他 WebDAV 服務不受影響。"
 }

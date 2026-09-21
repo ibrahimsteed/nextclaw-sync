@@ -1,7 +1,7 @@
 # NextClaw Sync
 
 Sync your Obsidian vault with Nextcloud or any other WebDAV server, on desktop and
-mobile.
+mobile. NextClaw accounts sync on iPad and Android tablets only — see below.
 
 NextClaw Sync is made for NextClaw accounts: the
 server address is filled in for you, and a read-only demo vault works before you
@@ -12,7 +12,10 @@ Nextcloud or any WebDAV service and it works the same way.
 
 - **Demo vault:** free, no account needed.
 - **Syncing your own vault:** needs an account on a WebDAV server.
-  - A **NextClaw account is a paid service**.
+  - A **NextClaw account is a paid service**, and it syncs on **iPad and Android
+    tablets only**. On Windows, macOS and Linux the plugin does not sync a
+    NextClaw account and says so in the settings; the demo vault and other
+    WebDAV servers work normally on desktop.
   - Any other WebDAV server (for example your own Nextcloud) works free of charge
     as far as this plugin is concerned. Change the server address in the settings.
 
@@ -43,6 +46,7 @@ server rejects every write to it.
 **Once you fill in your own username**, the plugin syncs your vault in both directions with your server: on
 startup (after a short delay), every 10 minutes, a few seconds after you stop editing, and whenever you tap
 sync. For a NextClaw account this is `cloud.nextclaw.chat`; the server address is filled in from your username.
+On desktop, a NextClaw account is not synced at all and no request is sent.
 
 **The plugin sends nothing else anywhere**: no telemetry, no analytics, no other destinations.
 

@@ -177,10 +177,12 @@ export class Setting {
   desc = "";
   heading = false;
   components: any[] = [];
+  descEl: FakeEl;
   constructor(containerEl: FakeEl) {
     this.settingEl = containerEl.createDiv();
     this.settingEl.setting = this;
     this.nameEl = this.settingEl.createDiv();
+    this.descEl = this.settingEl.createDiv();
   }
   setName(n: string) {
     this.name = n;
@@ -263,7 +265,7 @@ export class Notice {
   }
 }
 
-export const Platform = { isMobile: false };
+export const Platform = { isMobile: false, isDesktopApp: false };
 
 let installed = false;
 export const installFakeObsidian = () => {

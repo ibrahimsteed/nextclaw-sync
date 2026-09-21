@@ -375,3 +375,33 @@ describe("NextClaw 设置页（渲染）：移动端输入框宽度", () => {
     }
   });
 });
+
+describe("NextClaw 设置页（渲染）：桌面端学生账号提示", () => {
+  const { Platform } = require("./fakeObsidian");
+  const hintOf = (r: ReturnType<typeof render>) =>
+    r.byName("settings_webdav_user").descEl.texts();
+  afterEach(() => {
+    Platform.isDesktopApp = false;
+  });
+
+  it("桌面端在用户名下方提示：学生账号只能在平板上同步", () => {
+    Platform.isDesktopApp = true;
+    const r = render({});
+    assert.deepEqual(hintOf(r), ["nextclaw_desktop_student_hint"]);
+  });
+
+  it("移动端不显示这条提示", () => {
+    Platform.isDesktopApp = false;
+    const r = render({});
+    assert.deepEqual(hintOf(r), []);
+  });
+
+  it("提示挂在用户名那一项上，不挂在其它项上", () => {
+    Platform.isDesktopApp = true;
+    const { all } = render({});
+    const carriers = all
+      .filter((s: Setting) => s.descEl.texts().includes("nextclaw_desktop_student_hint"))
+      .map((s: Setting) => s.name);
+    assert.deepEqual(carriers, ["settings_webdav_user"]);
+  });
+});

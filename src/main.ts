@@ -57,6 +57,7 @@ import {
 import { detectBranch, effectiveIgnorePaths } from "./nextclaw/branch";
 import { applyBranchPreset, enforceHiddenSettings } from "./nextclaw/presets";
 import { canAskNow, evaluateGuard } from "./nextclaw/existingVaultGuard";
+import { isStudentAccountOnDesktop } from "./nextclaw/desktopPolicy";
 import { confirmExistingVault } from "./nextclaw/existingVaultModal";
 const DEFAULT_SETTINGS: NextclawSyncSettings = {
   // NextClaw：叠加预填值。展开顺序保证上游新增字段自动继承默认。
@@ -176,10 +177,23 @@ export default class NextclawSyncPlugin extends Plugin {
   mobileStatusBarTimer?: number;
   /** 本次运行已提示过"需要手动同步确认"，自动同步不再重复提示。 */
   existingVaultNoticeShown = false;
+  /** 本次运行已提示过"桌面端不能同步学生账号"，自动同步不再重复提示。 */
+  desktopBlockNoticeShown = false;
 
   async syncRun(triggerSource: SyncTriggerSourceType = "manual") {
     if (this.isSyncing) {
       if (triggerSource === "manual" || triggerSource === "dry") new Notice(this.i18n.t("syncrun_alreadyrunning", { pluginName: this.manifest.name, syncStatus: "running", newTriggerSource: triggerSource }));
+      return;
+    }
+    // NextClaw：桌面端不同步学生账号（付费内容只交付到平板），见 nextclaw/desktopPolicy.ts。
+    // 必须在一切之前：A→B 切换会把本地内容移进 .trash，被拦下时一个文件都不能动，
+    // 也不能发出任何请求。
+    if (isStudentAccountOnDesktop(this.settings.webdav, Platform.isDesktopApp)) {
+      // 手动触发每次都提示；自动触发（启动、定时、保存后）只提示一次，免得刷屏。
+      if (triggerSource === "manual" || triggerSource === "dry" || !this.desktopBlockNoticeShown) {
+        this.desktopBlockNoticeShown = true;
+        new Notice(this.i18n.t("nextclaw_desktop_student_blocked"), 10 * 1000);
+      }
       return;
     }
     this.isSyncing = true;
