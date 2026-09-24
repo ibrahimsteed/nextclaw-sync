@@ -405,3 +405,47 @@ describe("NextClaw 设置页（渲染）：桌面端学生账号提示", () => {
     assert.deepEqual(carriers, ["settings_webdav_user"]);
   });
 });
+
+describe("NextClaw 设置页（渲染）：没填密码的提示", () => {
+  const hintOf = (r: ReturnType<typeof render>) => {
+    const pw = r.byName("settings_webdav_password");
+    return { shown: pw.descEl.children.some((c: any) => c.shown && c.text === "nextclaw_password_required_hint"),
+             exists: pw.descEl.texts().includes("nextclaw_password_required_hint") };
+  };
+
+  it("填了学号、没填密码 → 显示提示", () => {
+    const r = render({ username: "s1", address: studentAddr, password: "" });
+    assert.deepEqual(hintOf(r), { shown: true, exists: true });
+  });
+
+  it("演示库 → 不显示", () => {
+    const r = render({});
+    assert.deepEqual(hintOf(r), { shown: false, exists: true });
+  });
+
+  it("学号和密码都填了 → 不显示", () => {
+    const r = render({ username: "s1", address: studentAddr, password: "x" });
+    assert.deepEqual(hintOf(r), { shown: false, exists: true });
+  });
+
+  it("填上密码，提示当场消失（不用重开设置页）", async () => {
+    const r = render({ username: "s1", address: studentAddr, password: "" });
+    assert.equal(hintOf(r).shown, true);
+    await r.byName("settings_webdav_password").text.change("my-password");
+    assert.equal(hintOf(r).shown, false);
+  });
+
+  it("从演示库填入学号，提示当场出现", async () => {
+    const r = render({});
+    assert.equal(hintOf(r).shown, false);
+    await r.byName("settings_webdav_user").text.change("s1");
+    assert.equal(hintOf(r).shown, true);
+  });
+
+  it("清空学号回到演示库，提示当场消失", async () => {
+    const r = render({ username: "s1", address: studentAddr, password: "" });
+    assert.equal(hintOf(r).shown, true);
+    await r.byName("settings_webdav_user").text.change("");
+    assert.equal(hintOf(r).shown, false);
+  });
+});

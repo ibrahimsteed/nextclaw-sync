@@ -12,7 +12,10 @@ import {
   insertSyncPlanRecordByVault,
 } from "../../../src/localdb";
 import { canAskNow, evaluateGuard } from "../../../src/nextclaw/existingVaultGuard";
-import { isStudentAccountOnDesktop } from "../../../src/nextclaw/desktopPolicy";
+import {
+  isStudentAccountOnDesktop,
+  needsPasswordBeforeSync,
+} from "../../../src/nextclaw/accountPolicy";
 import { switchAtoB } from "../../../src/nextclaw/switchAtoB";
 import {
   markReloadPending,
@@ -46,6 +49,7 @@ function mainHarness() {
   const platform = { isDesktopApp: false };
   const globals: Record<string, any> = {
     isStudentAccountOnDesktop,
+    needsPasswordBeforeSync,
     Platform: platform,
     insertSyncPlanRecordByVault,
     getAllPrevSyncRecordsByVaultAndProfile,
@@ -102,6 +106,7 @@ function mainHarness() {
   const plugin: any = {
     isSyncing: false,
     settings: {
+      webdav: { username: "", address: "", password: "" },
       syncDirection: "bidirectional",
       serviceType: "webdav",
       concurrency: 2,
@@ -385,6 +390,8 @@ describe("NextClaw 桌面端不同步学生账号：syncRun 真实方法接线",
   const STUDENT = {
     username: "s10012",
     address: "https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents",
+    // 带上密码：否则会被"没填密码不同步"拦下，桌面端那几条就测不到桌面规则本身。
+    password: "not-a-real-password",
   };
 
   it("桌面端学生账号：不发任何请求、不动本地文件、切换标记保留", async () => {
@@ -430,7 +437,7 @@ describe("NextClaw 桌面端不同步学生账号：syncRun 真实方法接线",
   it("桌面端演示库、其他 WebDAV 服务照常同步", async () => {
     for (const webdav of [
       { username: "", address: "https://cloud.nextclaw.chat/public.php/webdav" },
-      { username: "me", address: "https://dav.example.com/remote.php/dav/files/me" },
+      { username: "me", address: "https://dav.example.com/remote.php/dav/files/me", password: "p" },
     ]) {
       const t = mainHarness();
       t.platform.isDesktopApp = true;
@@ -442,6 +449,65 @@ describe("NextClaw 桌面端不同步学生账号：syncRun 真实方法接线",
         `应当放行：${webdav.address}`
       );
       assert.ok(!t.notices.includes("nextclaw_desktop_student_blocked"));
+    }
+  });
+});
+
+describe("NextClaw 学生账号没填密码不同步：syncRun 真实方法接线", () => {
+  const NO_PASSWORD = {
+    username: "s10012",
+    address: "https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents",
+    password: "",
+  };
+
+  it("不发请求、不动本地文件、切换标记保留", async () => {
+    const t = mainHarness();
+    t.plugin.settings.webdav = { ...NO_PASSWORD };
+    // 刚填完用户名的那一刻：放行的话 switchAtoB 会把演示库内容移进 .trash。
+    t.plugin.settings.nextclawPendingSwitchToB = true;
+    t.h.local.put("welcome.md");
+    await t.run("manual");
+    assert.deepEqual(t.h.remote.calls, [], "一个请求都不能发");
+    assert.deepEqual(t.h.local.writes(), [], "本地一个文件都不能动");
+    assert.equal(t.plugin.settings.nextclawPendingSwitchToB, true);
+    assert.equal(t.plugin.isSyncing, false, "不能把同步锁留在锁住状态");
+    assert.deepEqual(t.notices, ["nextclaw_password_required"]);
+  });
+
+  it("自动触发只提示一次，手动触发每次都提示", async () => {
+    const t = mainHarness();
+    t.plugin.settings.webdav = { ...NO_PASSWORD };
+    await t.run("auto");
+    await t.run("auto_once_init");
+    assert.equal(t.notices.length, 1);
+    await t.run("manual");
+    await t.run("manual");
+    assert.equal(t.notices.length, 3);
+  });
+
+  it("填上密码后照常同步", async () => {
+    const t = mainHarness();
+    t.plugin.settings.webdav = { ...NO_PASSWORD, password: "x" };
+    t.h.remote.put("student.md");
+    await t.run("manual");
+    assert.ok(t.h.remote.calls.some((c) => c.op === "walk"), "应当真的去列远端");
+    assert.ok(!t.notices.includes("nextclaw_password_required"));
+  });
+
+  it("演示库、其他 WebDAV 服务不受影响", async () => {
+    for (const webdav of [
+      { username: "", address: "https://cloud.nextclaw.chat/public.php/webdav" },
+      { username: "me", address: "https://dav.example.com/webdav", password: "" },
+    ]) {
+      const t = mainHarness();
+      t.plugin.settings.webdav = webdav;
+      t.h.remote.put("note.md");
+      await t.run("manual");
+      assert.ok(
+        t.h.remote.calls.some((c) => c.op === "walk"),
+        `应当放行：${webdav.address}`
+      );
+      assert.ok(!t.notices.includes("nextclaw_password_required"));
     }
   });
 });

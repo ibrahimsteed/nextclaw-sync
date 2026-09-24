@@ -57,7 +57,10 @@ import {
 import { detectBranch, effectiveIgnorePaths } from "./nextclaw/branch";
 import { applyBranchPreset, enforceHiddenSettings } from "./nextclaw/presets";
 import { canAskNow, evaluateGuard } from "./nextclaw/existingVaultGuard";
-import { isStudentAccountOnDesktop } from "./nextclaw/desktopPolicy";
+import {
+  isStudentAccountOnDesktop,
+  needsPasswordBeforeSync,
+} from "./nextclaw/accountPolicy";
 import { confirmExistingVault } from "./nextclaw/existingVaultModal";
 const DEFAULT_SETTINGS: NextclawSyncSettings = {
   // NextClaw：叠加预填值。展开顺序保证上游新增字段自动继承默认。
@@ -179,13 +182,15 @@ export default class NextclawSyncPlugin extends Plugin {
   existingVaultNoticeShown = false;
   /** 本次运行已提示过"桌面端不能同步学生账号"，自动同步不再重复提示。 */
   desktopBlockNoticeShown = false;
+  /** 本次运行已提示过"还需要填写密码"，自动同步不再重复提示。 */
+  passwordNoticeShown = false;
 
   async syncRun(triggerSource: SyncTriggerSourceType = "manual") {
     if (this.isSyncing) {
       if (triggerSource === "manual" || triggerSource === "dry") new Notice(this.i18n.t("syncrun_alreadyrunning", { pluginName: this.manifest.name, syncStatus: "running", newTriggerSource: triggerSource }));
       return;
     }
-    // NextClaw：桌面端不同步学生账号（付费内容只交付到平板），见 nextclaw/desktopPolicy.ts。
+    // NextClaw：桌面端不同步学生账号（付费内容只交付到平板），见 nextclaw/accountPolicy.ts。
     // 必须在一切之前：A→B 切换会把本地内容移进 .trash，被拦下时一个文件都不能动，
     // 也不能发出任何请求。
     if (isStudentAccountOnDesktop(this.settings.webdav, Platform.isDesktopApp)) {
@@ -193,6 +198,16 @@ export default class NextclawSyncPlugin extends Plugin {
       if (triggerSource === "manual" || triggerSource === "dry" || !this.desktopBlockNoticeShown) {
         this.desktopBlockNoticeShown = true;
         new Notice(this.i18n.t("nextclaw_desktop_student_blocked"), 10 * 1000);
+      }
+      return;
+    }
+    // NextClaw：学生账号没填密码就不同步。分支判据是用户名，所以"填了用户名、
+    // 还没填密码"这段时间里插件已经是 B 分支，放行的话 A→B 切换会把演示库内容
+    // 移进 .trash，然后因为没有密码而同步失败。见 nextclaw/accountPolicy.ts。
+    if (needsPasswordBeforeSync(this.settings.webdav)) {
+      if (triggerSource === "manual" || triggerSource === "dry" || !this.passwordNoticeShown) {
+        this.passwordNoticeShown = true;
+        new Notice(this.i18n.t("nextclaw_password_required"), 10 * 1000);
       }
       return;
     }

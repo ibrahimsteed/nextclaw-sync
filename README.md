@@ -60,6 +60,11 @@ the `.obsidian` settings folder into the vault's `.trash` folder**, then downloa
 your own storage. This keeps the demo content from being uploaded into your
 account.
 
+Nothing happens until you have entered **both** a username and a password: with a
+NextClaw username filled in but the password still empty, the plugin does not sync
+at all and says so in the settings, so typing your username and then going to look
+up your password cannot move anything.
+
 Install the plugin in a **new, empty vault**. If you install it in a vault that
 already contains your notes, those notes will be moved to `.trash` at the switch
 (they are recoverable from there, but they will not be synced). Before that happens,

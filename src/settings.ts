@@ -17,6 +17,7 @@ import { checkHasSpecialCharForDir } from "./misc";
 
 import { BranchLocks } from "./nextclaw/branchUi";
 import { applyUsernameChange } from "./nextclaw/usernameChange";
+import { needsPasswordBeforeSync } from "./nextclaw/accountPolicy";
 
 export class ChangeRemoteBaseDirModal extends Modal {
   readonly plugin: NextclawSyncPlugin;
@@ -123,6 +124,11 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
     // NextClaw：A 分支下若干控件不可编辑，收集起来统一切换，见 nextclaw/branchUi.ts
     const locks = new BranchLocks(settings.webdav);
 
+    // 密码提示由用户名和密码两处输入共同决定，先声明，两个 onChange 都会调。
+    let passwordHint: HTMLElement | undefined;
+    const refreshPasswordHint = () =>
+      passwordHint?.toggle(needsPasswordBeforeSync(settings.webdav));
+
     //////////////////////////////////////////////////
     // 账号
     //////////////////////////////////////////////////
@@ -153,6 +159,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
             startupDropdown?.setValue(`${settings.initRunAfterMilliseconds}`);
             autorunDropdown?.setValue(`${settings.autoRunEveryMilliseconds}`);
           }
+          refreshPasswordHint();
           await save();
         });
       })
@@ -166,17 +173,26 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
     }
 
     let passwordText: TextComponent | undefined;
-    stackInputOnMobile(new Setting(containerEl))
+    const passwordSetting = stackInputOnMobile(new Setting(containerEl));
+    passwordSetting
       .setName(t("settings_webdav_password"))
       .setDesc(t("settings_webdav_password_desc"))
       .addText((text) => {
         passwordText = text;
         text.setValue(settings.webdav.password).onChange(async (value) => {
           settings.webdav.password = value.trim();
+          refreshPasswordHint(); // 填上密码，提示要跟着消失
           await save();
         });
       })
       .addExtraButton((eye) => hideTextWithToggle(passwordText!, eye));
+    // 学生账号填了用户名却没填密码时，同步不会开始（见 nextclaw/accountPolicy.ts）。
+    // 在这里说明，别让用户点了同步才发现。
+    passwordHint = passwordSetting.descEl.createDiv({
+      text: t("nextclaw_password_required_hint"),
+      cls: "mod-warning",
+    });
+    refreshPasswordHint();
 
     //////////////////////////////////////////////////
     // 同步

@@ -111,5 +111,7 @@
   "nextclaw_guard_cancelled": "NextClaw Sync: cancelled, nothing was synced.",
   "nextclaw_guard_manual_required": "NextClaw Sync: this vault already has {{count}} files and needs your confirmation. Tap sync once to continue.",
   "nextclaw_desktop_student_blocked": "NextClaw Sync: NextClaw student accounts can't be synced on a computer. Please use an iPad or Android tablet. The demo vault and other WebDAV services are not affected.",
-  "nextclaw_desktop_student_hint": "NextClaw student accounts can't be synced on a computer; please use an iPad or Android tablet. Other WebDAV services are not affected."
+  "nextclaw_desktop_student_hint": "NextClaw student accounts can't be synced on a computer; please use an iPad or Android tablet. Other WebDAV services are not affected.",
+  "nextclaw_password_required": "NextClaw Sync: enter your password first. Syncing has not started, and nothing in this vault has been touched.",
+  "nextclaw_password_required_hint": "Your password is still empty. Syncing will not start until you fill it in."
 }
