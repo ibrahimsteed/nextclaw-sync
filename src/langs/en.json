@@ -113,5 +113,9 @@
   "nextclaw_desktop_student_blocked": "NextClaw Sync: NextClaw student accounts can't be synced on a computer. Please use an iPad or Android tablet. The demo vault and other WebDAV services are not affected.",
   "nextclaw_desktop_student_hint": "NextClaw student accounts can't be synced on a computer; please use an iPad or Android tablet. Other WebDAV services are not affected.",
   "nextclaw_password_required": "NextClaw Sync: enter your password first. Syncing has not started, and nothing in this vault has been touched.",
-  "nextclaw_password_required_hint": "Your password is still empty. Syncing will not start until you fill it in."
+  "nextclaw_password_required_hint": "Your password is still empty. Syncing will not start until you fill it in.",
+  "nextclaw_renew_name": "Renew subscription",
+  "nextclaw_renew_desc": "Open the renewal page on this tablet. Pick a plan and a QR code appears on screen; a parent scans it with WeChat on their phone.",
+  "nextclaw_renew_button": "Open renewal page",
+  "nextclaw_renew_needs_username": "NextClaw Sync: enter your username before opening the renewal page."
 }

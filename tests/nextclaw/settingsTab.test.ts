@@ -20,12 +20,14 @@ const studentAddr = accountAddressFor("s1");
 const render = (webdav: Record<string, any>, extra: Record<string, any> = {}) => {
   const intervals: { id: number; ms: number }[] = [];
   const cleared: number[] = [];
+  const opened: { url: string; target: string }[] = [];
   (global as any).window = {
     setInterval: (_fn: () => void, ms: number) => {
       intervals.push({ id: intervals.length + 1, ms });
       return intervals.length;
     },
     clearInterval: (id: number) => cleared.push(id),
+    open: (url: string, target: string) => opened.push({ url, target }),
   };
   let saves = 0;
   const plugin: any = {
@@ -63,13 +65,17 @@ const render = (webdav: Record<string, any>, extra: Record<string, any> = {}) =>
     assert.ok(s, `找不到设置项 ${name}`);
     return s;
   };
-  return { tab, root, all, byName, plugin, intervals, cleared, saves: () => saves };
+  return {
+    tab, root, all, byName, plugin, intervals, cleared, opened,
+    saves: () => saves,
+  };
 };
 
 const LAYOUT = [
   "# nextclaw_group_account",
   "settings_webdav_user",
   "settings_webdav_password",
+  "nextclaw_renew_name",
   "# nextclaw_group_sync",
   "settings_runoncestartup",
   "settings_autorun",
@@ -84,13 +90,15 @@ const LAYOUT = [
   "settings_webdav_customheaders",
 ];
 const FOLDED = LAYOUT.slice(LAYOUT.indexOf("# nextclaw_group_otherwebdav") + 1);
+// 续费按钮只对 NextClaw 学生账号显示；默认（演示库）是隐藏的。
+const HIDDEN_BY_DEFAULT = [...FOLDED, "nextclaw_renew_name"];
 
 describe("NextClaw 设置页（渲染）：布局", () => {
   beforeEach(() => {
     Modal.opened = [];
   });
 
-  it("只渲染四组、共 11 项，顺序固定，服务器地址在折叠区块最前，没有其它设置项", () => {
+  it("只渲染四组、共 12 项，顺序固定，服务器地址在折叠区块最前，没有其它设置项", () => {
     const { all } = render({});
     assert.deepEqual(
       all.map((s: Setting) => (s.heading ? `# ${s.name}` : s.name)),
@@ -112,8 +120,8 @@ describe("NextClaw 设置页（渲染）：布局", () => {
   it("\"其他 WebDAV 服务\"默认折叠：服务器地址等五项不可见，其余可见", () => {
     const { all } = render({});
     for (const s of all as Setting[]) {
-      const folded = FOLDED.includes(s.name);
-      assert.equal(s.settingEl.visible(), !folded, s.name);
+      const hidden = HIDDEN_BY_DEFAULT.includes(s.name);
+      assert.equal(s.settingEl.visible(), !hidden, s.name);
     }
   });
 
@@ -447,5 +455,98 @@ describe("NextClaw 设置页（渲染）：没填密码的提示", () => {
     assert.equal(hintOf(r).shown, true);
     await r.byName("settings_webdav_user").text.change("");
     assert.equal(hintOf(r).shown, false);
+  });
+});
+
+describe("NextClaw 设置页（渲染）：续费按钮", () => {
+  const { Notice, Platform } = require("./fakeObsidian");
+  const student = { username: "s10013", address: studentAddr };
+  const renewOf = (r: ReturnType<typeof render>) => r.byName("nextclaw_renew_name");
+
+  beforeEach(() => {
+    Notice.messages = [];
+    Platform.isDesktopApp = false;
+    Platform.isMobile = true;
+  });
+
+  after(() => {
+    Platform.isDesktopApp = false;
+    Platform.isMobile = false;
+  });
+
+  it("学生账号上显示，位置紧跟在密码之后", () => {
+    const r = render(student);
+    assert.equal(renewOf(r).settingEl.visible(), true);
+    const names = r.all.map((s: Setting) => s.name);
+    assert.equal(
+      names.indexOf("nextclaw_renew_name"),
+      names.indexOf("settings_webdav_password") + 1
+    );
+  });
+
+  it("演示库上不显示", () => {
+    assert.equal(renewOf(render({})).settingEl.visible(), false);
+  });
+
+  it("用其他 WebDAV 服务时不显示", () => {
+    const r = render({
+      username: "someone",
+      address: "https://dav.example.com/remote.php",
+    });
+    assert.equal(renewOf(r).settingEl.visible(), false);
+  });
+
+  it("桌面端不显示（0.1.5 起本来就不同步学生账号）", () => {
+    Platform.isDesktopApp = true;
+    Platform.isMobile = false;
+    assert.equal(renewOf(render(student)).settingEl.visible(), false);
+  });
+
+  it("点一下打开续费页面，链接带学号", async () => {
+    const r = render(student);
+    await renewOf(r).buttons[0].click();
+
+    assert.deepEqual(r.opened, [
+      { url: "https://ai.nextclaw.chat/?customer=s10013&pay=qr", target: "_blank" },
+    ]);
+  });
+
+  it("链接里绝不出现密码", async () => {
+    const r = render({ ...student, password: "这是应用密码" });
+    await renewOf(r).buttons[0].click();
+
+    assert.equal(r.opened.length, 1);
+    assert.ok(!r.opened[0].url.includes("这是应用密码"));
+    assert.ok(!r.opened[0].url.includes("password"));
+  });
+
+  it("用户名一改，按钮跟着出现和消失", async () => {
+    const r = render({});
+    const renew = renewOf(r);
+    assert.equal(renew.settingEl.visible(), false);
+
+    await r.byName("settings_webdav_user").text.change("s10013");
+    assert.equal(renew.settingEl.visible(), true, "填上用户名后该出现");
+
+    await r.byName("settings_webdav_user").text.change("");
+    assert.equal(renew.settingEl.visible(), false, "删空后该消失");
+  });
+
+  it("用户名被删空时点按钮：提示先填，不打开任何页面", async () => {
+    const r = render(student);
+    await r.byName("settings_webdav_user").text.change("");
+    await renewOf(r).buttons[0].click();
+
+    assert.deepEqual(r.opened, []);
+    assert.deepEqual(Notice.messages, ["nextclaw_renew_needs_username"]);
+  });
+
+  it("按钮不发任何网络请求——方案 D 的全部好处所在", async () => {
+    const r = render(student);
+    await renewOf(r).buttons[0].click();
+    // 唯一的外部动作是 window.open；没有 fetch、没有 requestUrl
+    assert.equal(r.opened.length, 1);
+    assert.equal(typeof (global as any).fetch, "function"); // node 自带的，没被调用
+    assert.equal(r.saves(), 0, "点续费不该改设置");
   });
 });

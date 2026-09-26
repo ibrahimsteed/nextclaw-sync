@@ -113,5 +113,9 @@
   "nextclaw_desktop_student_blocked": "NextClaw Sync：电脑上不能同步 NextClaw 学生账号，请在 iPad 或 Android 平板上使用。演示库和其他 WebDAV 服务不受影响。",
   "nextclaw_desktop_student_hint": "电脑上不能同步 NextClaw 学生账号，请在 iPad 或 Android 平板上使用；连接其他 WebDAV 服务不受影响。",
   "nextclaw_password_required": "NextClaw Sync：请先填写密码。本次没有开始同步，库里的内容也没有被改动。",
-  "nextclaw_password_required_hint": "密码还没填。填好之前不会开始同步。"
+  "nextclaw_password_required_hint": "密码还没填。填好之前不会开始同步。",
+  "nextclaw_renew_name": "续费",
+  "nextclaw_renew_desc": "在这台平板上打开续费页面，选好套餐后屏幕上会出现二维码，请家长用手机微信「扫一扫」扫平板屏幕。",
+  "nextclaw_renew_button": "打开续费页面",
+  "nextclaw_renew_needs_username": "NextClaw Sync：请先填写用户名，再打开续费页面。"
 }

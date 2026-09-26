@@ -113,5 +113,9 @@
   "nextclaw_desktop_student_blocked": "NextClaw Sync：電腦上不能同步 NextClaw 學生帳號，請在 iPad 或 Android 平板上使用。示範庫和其他 WebDAV 服務不受影響。",
   "nextclaw_desktop_student_hint": "電腦上不能同步 NextClaw 學生帳號，請在 iPad 或 Android 平板上使用；連接其他 WebDAV 服務不受影響。",
   "nextclaw_password_required": "NextClaw Sync：請先填寫密碼。本次沒有開始同步，庫裡的內容也沒有被改動。",
-  "nextclaw_password_required_hint": "密碼還沒填。填好之前不會開始同步。"
+  "nextclaw_password_required_hint": "密碼還沒填。填好之前不會開始同步。",
+  "nextclaw_renew_name": "續費",
+  "nextclaw_renew_desc": "在這台平板上開啟續費頁面，選好方案後螢幕上會出現 QR Code，請家長用手機微信「掃一掃」掃平板螢幕。",
+  "nextclaw_renew_button": "開啟續費頁面",
+  "nextclaw_renew_needs_username": "NextClaw Sync：請先填寫使用者名稱，再開啟續費頁面。"
 }

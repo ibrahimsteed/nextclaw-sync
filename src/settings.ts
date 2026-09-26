@@ -18,6 +18,7 @@ import { checkHasSpecialCharForDir } from "./misc";
 import { BranchLocks } from "./nextclaw/branchUi";
 import { applyUsernameChange } from "./nextclaw/usernameChange";
 import { needsPasswordBeforeSync } from "./nextclaw/accountPolicy";
+import { renewLink, shouldShowRenewButton } from "./nextclaw/renew";
 
 export class ChangeRemoteBaseDirModal extends Modal {
   readonly plugin: NextclawSyncPlugin;
@@ -129,6 +130,13 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
     const refreshPasswordHint = () =>
       passwordHint?.toggle(needsPasswordBeforeSync(settings.webdav));
 
+    // 续费按钮的显示条件只看用户名与地址，用户名一改就要跟着变。
+    let renewSetting: Setting | undefined;
+    const refreshRenewButton = () =>
+      renewSetting?.settingEl.toggle(
+        shouldShowRenewButton(settings.webdav, Platform.isDesktopApp)
+      );
+
     //////////////////////////////////////////////////
     // 账号
     //////////////////////////////////////////////////
@@ -160,6 +168,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
             autorunDropdown?.setValue(`${settings.autoRunEveryMilliseconds}`);
           }
           refreshPasswordHint();
+          refreshRenewButton();
           await save();
         });
       })
@@ -193,6 +202,28 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
       cls: "mod-warning",
     });
     refreshPasswordHint();
+
+    // NextClaw：续费入口（设计文档第九节）。**只有一个按钮**，不显示到期日、
+    // 不显示订阅状态——插件不发任何订阅相关的请求，不缓存、不轮询。
+    //
+    // 显不显示只看本地设置。按网络或订阅状态决定的话，会在最需要续费的时候
+    // （服务已停、网络不通）恰好把按钮藏起来。
+    renewSetting = new Setting(containerEl)
+      .setName(t("nextclaw_renew_name"))
+      .setDesc(t("nextclaw_renew_desc"))
+      .addButton((button) =>
+        button.setButtonText(t("nextclaw_renew_button")).onClick(() => {
+          // 链接在本地拼，域名是插件里的常量；点的这一刻重新读一次用户名，
+          // 因为设置页开着时它可能刚被删空。
+          const link = renewLink(settings.webdav);
+          if (!link.ok) {
+            new Notice(t("nextclaw_renew_needs_username"));
+            return;
+          }
+          window.open(link.url, "_blank");
+        })
+      );
+    refreshRenewButton();
 
     //////////////////////////////////////////////////
     // 同步
