@@ -76,9 +76,15 @@ export const PRESET_A = {
 
 export const PRESET_B = {
   ...COMMON,
-  // 学生库约 1440 个文件；A→B 切换时计入保护阈值的只有两边都存在的
-  // .obsidian/ 配置，约 23 条（1.6%），远低于 50%。全量拉取走"新建"，不计入。
-  protectModifyPercentage: 50,
+  /**
+   * **关闭修改保护**（100 = 关闭）。2026-10-14 按库主决定由 50 改为 100。
+   *
+   * 50% 阈值会拦下服务端批量改写、季度库更新这类正当的大面积更新，且被拦后
+   * 没有任何继续的入口。关闭后，远端目录指错、本地库丢失（同步记录仍在）
+   * 这类事故也不再被拦：删除本地进 `.trash`，删除/覆盖远端只能靠 Nextcloud
+   * 回收站与版本历史恢复。
+   */
+  protectModifyPercentage: 100,
   syncDirection: "bidirectional",
   autoRunEveryMilliseconds: 600000, //  10 分钟
   initRunAfterMilliseconds: 10000, //   启动后 10 秒

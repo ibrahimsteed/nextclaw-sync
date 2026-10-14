@@ -13,6 +13,8 @@ import {
 } from "../../src/nextclaw/branch";
 import { applyBranchPreset, PRESET_A, PRESET_B } from "../../src/nextclaw/presets";
 import { applyUsernameChange } from "../../src/nextclaw/usernameChange";
+import { protection } from "../../src/nextclaw/engine/plan";
+import type { PlanItem } from "../../src/nextclaw/engine/model";
 import {
   NEXTCLAW_PUBLIC_WEBDAV_URL,
   NEXTCLAW_REMOTE_BASE_DIR,
@@ -209,8 +211,25 @@ describe("回归：欢迎库太小，A 分支同步被修改保护误中断", ()
     assert.equal(PRESET_A.protectModifyPercentage, 100);
   });
 
-  it("B 分支保持 50——学生库约 1440 个文件，切换时只有约 1.6% 计入", () => {
-    assert.equal(PRESET_B.protectModifyPercentage, 50);
+  it("B 分支同样关闭修改保护（2026-10-14 库主决定，由 50 改为 100）", () => {
+    assert.equal(PRESET_B.protectModifyPercentage, 100);
+  });
+
+  it("B 分支取值下，全部文件被删除/覆盖也不中断（真实 protection 判定）", () => {
+    const item = (decision: PlanItem["decision"]): PlanItem => ({
+      decision, reason: "", change: true,
+      local: { keyRaw: "x", sizeRaw: 1 }, remote: { keyRaw: "x", sizeRaw: 1 },
+    });
+    const plan: Record<string, PlanItem> = {
+      "a.md": item("deleteLocal"),
+      "b.md": item("deleteRemote"),
+      "c.md": item("pull"),
+      "d.md": item("push"),
+    };
+    // 同一份计划在旧取值 50 下必然中断，证明这里的放行确实来自取值改变。
+    assert.equal(protection(plan, 50).abort, true);
+    const r = protection(plan, PRESET_B.protectModifyPercentage);
+    assert.deepEqual(r, { count: 4, total: 4, abort: false });
   });
 
   it("按引擎规格复算：A 分支取 100 时，欢迎库场景不会中断", () => {

@@ -112,7 +112,7 @@ const DEFAULT_SETTINGS: NextclawSyncSettings = {
    */
   deleteToWhere: "obsidian",
   conflictAction: "keep_newer",
-  protectModifyPercentage: 50,
+  protectModifyPercentage: 100, // NextClaw：两个模式都关闭修改保护，见 presets.ts
   syncDirection: "bidirectional",
   obfuscateSettingFile: true,
   enableMobileStatusBar: false,
@@ -507,7 +507,7 @@ export default class NextclawSyncPlugin extends Plugin {
         syncConfigDir: this.settings.syncConfigDir ?? false,
         pluginId: this.manifest.id,
         ignorePaths: effectiveIgnorePaths(this.settings.ignorePaths, this.manifest.id, this.app.vault.configDir),
-        protectModifyPercentage: this.settings.protectModifyPercentage ?? (mode === "A" ? 100 : 50),
+        protectModifyPercentage: this.settings.protectModifyPercentage ?? 100,
         concurrency: this.settings.concurrency ?? 5,
         callbacks: {
           protectError: getProtectError, markIsSyncing: markIsSyncingFunc,
@@ -829,7 +829,7 @@ export default class NextclawSyncPlugin extends Plugin {
       this.settings.conflictAction = "keep_newer";
     }
     if (this.settings.protectModifyPercentage === undefined) {
-      this.settings.protectModifyPercentage = 50;
+      this.settings.protectModifyPercentage = 100;
     }
     if (this.settings.syncDirection === undefined) {
       this.settings.syncDirection = "bidirectional";
