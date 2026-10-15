@@ -55,9 +55,18 @@ export class FakeFsLocal extends FakeFs {
         // ignore
         continue;
       } else if (entry instanceof TFile) {
-        let mtimeLocal: number | undefined = entry.stat.mtime;
-        if (mtimeLocal <= 0) {
-          mtimeLocal = entry.stat.ctime;
+        // On Android a timestamped adapter write can leave TFile.stat holding
+        // the watcher time indefinitely. Discovery and CAS must observe disk.
+        let measured;
+        try {
+          measured = await statFix(this.vault, key);
+        } catch (error) {
+          if ((error as { code?: string }).code === "ENOENT") continue;
+          throw error;
+        }
+        let mtimeLocal: number | undefined = measured.mtime;
+        if ((mtimeLocal ?? 0) <= 0) {
+          mtimeLocal = measured.ctime;
         }
         if (mtimeLocal === 0) {
           mtimeLocal = undefined;
@@ -72,8 +81,8 @@ export class FakeFsLocal extends FakeFs {
           keyRaw: key,
           mtimeCli: mtimeLocal,
           mtimeSvr: mtimeLocal,
-          size: entry.stat.size, // local always unencrypted
-          sizeRaw: entry.stat.size,
+          size: measured.size, // local always unencrypted
+          sizeRaw: measured.size,
         };
       } else if (entry instanceof TFolder) {
         key = `${key}/`;

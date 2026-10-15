@@ -226,3 +226,38 @@ describe("unsupported host capability fails before destructive replacement", () 
     assert.deepEqual(h.files.get("a.bin"), old);
   });
 });
+
+describe("local discovery uses the same metadata source as mutation guards", () => {
+  function scannedHost(stat: () => Promise<any>) {
+    class TFile {
+      path = "downloaded.md";
+      // Android can report a watcher timestamp here after a timestamped download.
+      stat = { mtime: 19000, ctime: 18000, size: 3 };
+    }
+    const mod = { exports: {} as any };
+    const load = (name: string) => name === "obsidian"
+      ? { TFile, TFolder: class {}, normalizePath: (p: string) => p }
+      : require(name);
+    new Function("require", "module", "exports", code)(load, mod, mod.exports);
+    const fs = new mod.exports.FakeFsLocal({
+      adapter: { stat }, getAllLoadedFiles: () => [new TFile()],
+    }, false, false, ".obsidian", "nextclaw-sync", "obsidian");
+    return fs;
+  }
+  it("uses measured size and mtime instead of the stale Vault cache", async () => {
+    const fs = scannedHost(async () => ({ type: "file", mtime: 18000, ctime: 18000, size: 40 }));
+    const [observed] = await fs.walk();
+    assert.equal(observed.size, 40);
+    assert.equal(observed.mtimeCli, 18000);
+    const measured = await fs.stat(observed.key);
+    assert.equal(observed.mtimeCli, measured.mtimeCli);
+  });
+  it("ignores a cached entry already missing on disk", async () => {
+    const fs = scannedHost(async () => null);
+    assert.deepEqual(await fs.walk(), []);
+  });
+  it("does not treat an I/O error as a deleted local file", async () => {
+    const fs = scannedHost(async () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); });
+    await assert.rejects(fs.walk(), /denied/);
+  });
+});
