@@ -1,19 +1,16 @@
 /** Coalesced follow-up intent. No recursive retries or overlapping runs. */
 export class SyncQueue {
   private dirty = false;
-  private timer?: ReturnType<typeof setTimeout>;
+  private timer?: ReturnType<Window["setTimeout"]>;
   private failures = 0;
   private stopped = false;
   constructor(
     private readonly run: () => Promise<"ok" | "failed" | "blocked">,
+    // Capture the owning window once so native timer calls retain their receiver.
     private readonly clock: {
-      setTimeout(fn: () => void, delay: number): ReturnType<typeof setTimeout>;
-      clearTimeout(handle: ReturnType<typeof setTimeout>): void;
-    } = {
-      // Native Window timers require their global receiver, not this clock object.
-      setTimeout: (fn, delay) => globalThis.setTimeout(fn, delay),
-      clearTimeout: (handle) => globalThis.clearTimeout(handle),
-    }
+      setTimeout(fn: () => void, delay: number): ReturnType<Window["setTimeout"]>;
+      clearTimeout(handle: ReturnType<Window["setTimeout"]>): void;
+    } = window
   ) {}
   request(delay = 0) {
     if (this.stopped) return;

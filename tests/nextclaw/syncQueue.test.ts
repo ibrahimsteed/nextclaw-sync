@@ -145,14 +145,32 @@ describe("bounded retry budget", () => {
 });
 
 describe("native timer receiver", () => {
-  it("calls default timers on globalThis instead of the clock wrapper", () => {
-    const originalSet=globalThis.setTimeout, originalClear=globalThis.clearTimeout;
-    let scheduled=false,cleared=false;
+  it("keeps the owning window as timer receiver through disposal", () => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    let scheduled = false, cleared = false;
+    const owner = {
+      setTimeout(this: unknown) {
+        assert.equal(this, owner);
+        scheduled = true;
+        return 1;
+      },
+      clearTimeout(this: unknown, handle: number) {
+        assert.equal(this, owner);
+        assert.equal(handle, 1);
+        cleared = true;
+      },
+    };
     try {
-      globalThis.setTimeout=function(this: unknown){assert.equal(this,globalThis);scheduled=true;return 1 as any;} as any;
-      globalThis.clearTimeout=function(this:unknown){assert.equal(this,globalThis);cleared=true;} as any;
-      const q=new SyncQueue(async()=>"ok");q.request(3000);q.dispose();
-      assert.equal(scheduled,true);assert.equal(cleared,true);
-    } finally {globalThis.setTimeout=originalSet;globalThis.clearTimeout=originalClear;}
+      Object.defineProperty(globalThis, "window", { configurable: true, value: owner });
+      const q = new SyncQueue(async () => "ok");
+      q.request(3000);
+      Object.defineProperty(globalThis, "window", { configurable: true, value: {} });
+      q.dispose();
+      assert.equal(scheduled, true);
+      assert.equal(cleared, true);
+    } finally {
+      if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+      else delete (globalThis as any).window;
+    }
   });
 });
