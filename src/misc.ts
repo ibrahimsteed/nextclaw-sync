@@ -85,7 +85,9 @@ export const unixTimeToStr = (x: number | undefined | null, hasMs = false) => {
 export const statFix = async (vault: Vault, path: string) => {
   const s = await vault.adapter.stat(path);
   if (s === undefined || s === null) {
-    throw Error(`${path} doesn't exist cannot run stat`);
+    throw Object.assign(new Error(`${path} doesn't exist cannot run stat`), {
+      code: "ENOENT",
+    });
   }
   const fixed = s as {
     type: "file" | "folder";

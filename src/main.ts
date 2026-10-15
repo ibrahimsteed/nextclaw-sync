@@ -1,3 +1,4 @@
+import { SyncQueue } from "./nextclaw/syncQueue";
 // biome-ignore lint/suspicious/noShadowRestrictedNames: <explanation>
 import AggregateError from "aggregate-error";
 import {
@@ -10,10 +11,7 @@ import {
   setIcon,
 } from "obsidian";
 import { runSync } from "./nextclaw/syncEngine";
-import type {
-  NextclawSyncSettings,
-  SyncTriggerSourceType,
-} from "./baseTypes";
+import type { NextclawSyncSettings, SyncTriggerSourceType } from "./baseTypes";
 import { messyConfigToNormal, normalConfigToMessy } from "./configPersist";
 import { exportVaultSyncPlansToFiles } from "./debugMode";
 import { getClient } from "./fsGetter";
@@ -166,6 +164,7 @@ export default class NextclawSyncPlugin extends Plugin {
   db!: InternalDBs;
   isSyncing!: boolean;
   hasPendingSyncOnSave!: boolean;
+  syncQueue?: SyncQueue;
   statusBarElement!: HTMLSpanElement;
   currLogLevel!: string;
   currSyncMsg?: string;
@@ -185,34 +184,55 @@ export default class NextclawSyncPlugin extends Plugin {
   /** 本次运行已提示过"还需要填写密码"，自动同步不再重复提示。 */
   passwordNoticeShown = false;
 
-  async syncRun(triggerSource: SyncTriggerSourceType = "manual") {
+  async syncRun(
+    triggerSource: SyncTriggerSourceType = "manual"
+  ): Promise<"ok" | "failed" | "blocked"> {
     if (this.isSyncing) {
-      if (triggerSource === "manual" || triggerSource === "dry") new Notice(this.i18n.t("syncrun_alreadyrunning", { pluginName: this.manifest.name, syncStatus: "running", newTriggerSource: triggerSource }));
-      return;
+      if (triggerSource !== "dry") this.syncQueue?.request(3000);
+      if (triggerSource === "manual" || triggerSource === "dry")
+        new Notice(
+          this.i18n.t("syncrun_alreadyrunning", {
+            pluginName: this.manifest.name,
+            syncStatus: "running",
+            newTriggerSource: triggerSource,
+          })
+        );
+      return "blocked";
     }
     // NextClaw：桌面端不同步学生账号（付费内容只交付到平板），见 nextclaw/accountPolicy.ts。
     // 必须在一切之前：A→B 切换会把本地内容移进 .trash，被拦下时一个文件都不能动，
     // 也不能发出任何请求。
-    if (isStudentAccountOnDesktop(this.settings.webdav, Platform.isDesktopApp)) {
+    if (
+      isStudentAccountOnDesktop(this.settings.webdav, Platform.isDesktopApp)
+    ) {
       // 手动触发每次都提示；自动触发（启动、定时、保存后）只提示一次，免得刷屏。
-      if (triggerSource === "manual" || triggerSource === "dry" || !this.desktopBlockNoticeShown) {
+      if (
+        triggerSource === "manual" ||
+        triggerSource === "dry" ||
+        !this.desktopBlockNoticeShown
+      ) {
         this.desktopBlockNoticeShown = true;
         new Notice(this.i18n.t("nextclaw_desktop_student_blocked"), 10 * 1000);
       }
-      return;
+      return "blocked";
     }
     // NextClaw：学生账号没填密码就不同步。分支判据是用户名，所以"填了用户名、
     // 还没填密码"这段时间里插件已经是 B 分支，放行的话 A→B 切换会把演示库内容
     // 移进 .trash，然后因为没有密码而同步失败。见 nextclaw/accountPolicy.ts。
     if (needsPasswordBeforeSync(this.settings.webdav)) {
-      if (triggerSource === "manual" || triggerSource === "dry" || !this.passwordNoticeShown) {
+      if (
+        triggerSource === "manual" ||
+        triggerSource === "dry" ||
+        !this.passwordNoticeShown
+      ) {
         this.passwordNoticeShown = true;
         new Notice(this.i18n.t("nextclaw_password_required"), 10 * 1000);
       }
-      return;
+      return "blocked";
     }
     this.isSyncing = true;
     const startedAt = Date.now();
+    let outcome: "ok" | "failed" | "blocked" = "blocked";
     try {
       const fsLocal = new FakeFsLocal(
         this.app.vault,
@@ -227,7 +247,6 @@ export default class NextclawSyncPlugin extends Plugin {
         this.app.vault.getName(),
         async () => await this.saveSettings()
       );
-
 
       const t = (x: TransItemType, vars?: TransVars) => {
         return this.i18n.t(x, vars);
@@ -405,17 +424,26 @@ export default class NextclawSyncPlugin extends Plugin {
           this.updateLastSyncMsg(s, "syncing", -1, -1);
         } else if (step === 8 && everythingOk) {
           const ts = Date.now();
-          await upsertLastSuccessSyncTimeByVault(this.db, this.vaultRandomID, ts);
+          await upsertLastSuccessSyncTimeByVault(
+            this.db,
+            this.vaultRandomID,
+            ts
+          );
           this.updateLastSyncMsg(s, "not_syncing", ts, null); // hack: 'not_syncing'
         } else if (!everythingOk) {
           const ts = Date.now();
-          await upsertLastFailedSyncTimeByVault(this.db, this.vaultRandomID, ts);
+          await upsertLastFailedSyncTimeByVault(
+            this.db,
+            this.vaultRandomID,
+            ts
+          );
           this.updateLastSyncMsg(s, "not_syncing", null, ts);
         }
       };
 
       const markIsSyncingFunc = async (isSyncing: boolean) => {
-        this.isSyncing = isSyncing;
+        // The outer run owns the guard through reload handling and finally.
+        if (isSyncing) this.isSyncing = true;
       };
 
       const callbackSyncProcess = async (
@@ -436,8 +464,12 @@ export default class NextclawSyncPlugin extends Plugin {
         );
       };
 
-      const mode = this.settings.syncDirection === "incremental_pull_only" ? "A"
-        : this.settings.syncDirection === "bidirectional" ? "B" : undefined;
+      const mode =
+        this.settings.syncDirection === "incremental_pull_only"
+          ? "A"
+          : this.settings.syncDirection === "bidirectional"
+            ? "B"
+            : undefined;
       if (!mode) throw new Error("不支持的同步方向");
 
       // NextClaw：装进已有笔记的库时，首次同步演示库与 A→B 切换之前先确认。
@@ -446,25 +478,33 @@ export default class NextclawSyncPlugin extends Plugin {
         mode,
         triggerSource,
         pendingSwitchToB: this.settings.nextclawPendingSwitchToB === true,
-        acknowledgedFirstDemoSync: this.settings.nextclawExistingVaultAcknowledged === true,
+        acknowledgedFirstDemoSync:
+          this.settings.nextclawExistingVaultAcknowledged === true,
         configDir: this.app.vault.configDir,
         readRecordKeys: async () =>
-          (await getAllPrevSyncRecordsByVaultAndProfile(this.db, this.vaultRandomID, profileID)).map(
-            (r) => r.key ?? r.keyRaw
-          ),
+          (
+            await getAllPrevSyncRecordsByVaultAndProfile(
+              this.db,
+              this.vaultRandomID,
+              profileID
+            )
+          ).map((r) => r.key ?? r.keyRaw),
         walk: () => fsLocal.walk(),
       });
       if (guard !== null) {
         if (!canAskNow(triggerSource)) {
           if (!this.existingVaultNoticeShown) {
             this.existingVaultNoticeShown = true;
-            new Notice(t("nextclaw_guard_manual_required", { count: guard.fileCount }), 10 * 1000);
+            new Notice(
+              t("nextclaw_guard_manual_required", { count: guard.fileCount }),
+              10 * 1000
+            );
           }
-          return;
+          return "blocked";
         }
         if (!(await confirmExistingVault(this.app, t, guard))) {
           new Notice(t("nextclaw_guard_cancelled"));
-          return;
+          return "blocked";
         }
         if (guard.kind === "first-demo-sync") {
           this.settings.nextclawExistingVaultAcknowledged = true;
@@ -475,7 +515,10 @@ export default class NextclawSyncPlugin extends Plugin {
       // NextClaw：A→B 切换，必须在本次同步**开始之前**做完。
       // 枚举本地 → 删配置目录与 .trash 以外的全部顶层条目 → 清 prevSync。
       // 见 nextclaw/switchAtoB.ts。
-      if (this.settings.nextclawPendingSwitchToB === true && triggerSource !== "dry") {
+      if (
+        this.settings.nextclawPendingSwitchToB === true &&
+        triggerSource !== "dry"
+      ) {
         const receipt = await switchAtoB({
           db: this.db,
           vaultRandomID: this.vaultRandomID,
@@ -483,7 +526,8 @@ export default class NextclawSyncPlugin extends Plugin {
           configDir: this.app.vault.configDir,
         });
         console.debug(formatReceipt(receipt));
-        if (receipt.failed.length) throw new Error("A→B 清理未完成，请重试；本次未同步");
+        if (receipt.failed.length)
+          throw new Error("A→B 清理未完成，请重试；本次未同步");
         // 标记只在切换**成功执行**后清掉。上面任何一步抛异常都会让本次
         // syncRun 中止而标记仍在，下次同步会重来——宁可重做，不可漏做：
         // 漏做的后果是欢迎库的内容被推进学生库。
@@ -494,36 +538,55 @@ export default class NextclawSyncPlugin extends Plugin {
       }
 
       // NextClaw：远端目录变更后，同步记录对应的是旧目录，必须先清空。
-      if (this.settings.nextclawPendingRecordReset === true && triggerSource !== "dry") {
+      if (
+        this.settings.nextclawPendingRecordReset === true &&
+        triggerSource !== "dry"
+      ) {
         await clearAllPrevSyncRecordByVault(this.db, this.vaultRandomID);
         this.settings.nextclawPendingRecordReset = false;
         await this.saveSettings();
       }
 
       const result = await runSync({
-        mode, fsLocal, fsRemote, db: this.db, triggerSource, profileID,
+        mode,
+        fsLocal,
+        fsRemote,
+        db: this.db,
+        triggerSource,
+        profileID,
         vaultRandomID: this.vaultRandomID,
         configDir: this.app.vault.configDir,
         syncConfigDir: this.settings.syncConfigDir ?? false,
         pluginId: this.manifest.id,
-        ignorePaths: effectiveIgnorePaths(this.settings.ignorePaths, this.manifest.id, this.app.vault.configDir),
+        ignorePaths: effectiveIgnorePaths(
+          this.settings.ignorePaths,
+          this.manifest.id,
+          this.app.vault.configDir
+        ),
         protectModifyPercentage: this.settings.protectModifyPercentage ?? 100,
         concurrency: this.settings.concurrency ?? 5,
         callbacks: {
-          protectError: getProtectError, markIsSyncing: markIsSyncingFunc,
-          notify: notifyFunc, errNotify: errNotifyFunc, ribbon: ribboonFunc,
-          statusBar: statusBarFunc, progress: callbackSyncProcess,
+          protectError: getProtectError,
+          markIsSyncing: markIsSyncingFunc,
+          notify: notifyFunc,
+          errNotify: errNotifyFunc,
+          ribbon: ribboonFunc,
+          statusBar: statusBarFunc,
+          progress: callbackSyncProcess,
         },
       });
 
-      this.syncEvent?.trigger("SYNC_DONE");
+      outcome = result.ok ? "ok" : "failed";
 
       const reloadDeps = {
         settings: this.settings,
         saveSettings: async () => await this.saveSettings(),
-        notice: (message: string, timeoutMs: number) => new Notice(message, timeoutMs),
-        commands: (this.app as unknown as { commands: ReloadDeps["commands"] }).commands,
-        delay: (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms)),
+        notice: (message: string, timeoutMs: number) =>
+          new Notice(message, timeoutMs),
+        commands: (this.app as unknown as { commands: ReloadDeps["commands"] })
+          .commands,
+        delay: (ms: number) =>
+          new Promise<void>((resolve) => window.setTimeout(resolve, ms)),
       };
       if (
         shouldReloadAfterSync({
@@ -549,19 +612,47 @@ export default class NextclawSyncPlugin extends Plugin {
         await reloadAfterFirstASync(reloadDeps);
       }
     } catch (error) {
-      await insertSyncPlanRecordByVault(this.db, {
-        "/$@meta": {
-          mode: this.settings.syncDirection === "incremental_pull_only" ? "A" : this.settings.syncDirection === "bidirectional" ? "B" : "invalid",
-          triggerSource, startedAt, finishedAt: Date.now(), aborted: "error",
-          error: error instanceof Error ? error.message : String(error),
+      outcome = "failed";
+      await insertSyncPlanRecordByVault(
+        this.db,
+        {
+          "/$@meta": {
+            mode:
+              this.settings.syncDirection === "incremental_pull_only"
+                ? "A"
+                : this.settings.syncDirection === "bidirectional"
+                  ? "B"
+                  : "invalid",
+            triggerSource,
+            startedAt,
+            finishedAt: Date.now(),
+            aborted: "error",
+            error: error instanceof Error ? error.message : String(error),
+          },
         },
-      }, this.vaultRandomID, "webdav");
-      await upsertLastFailedSyncTimeByVault(this.db, this.vaultRandomID, Date.now());
+        this.vaultRandomID,
+        "webdav"
+      );
+      await upsertLastFailedSyncTimeByVault(
+        this.db,
+        this.vaultRandomID,
+        Date.now()
+      );
       this.updateLastSyncMsg(triggerSource, "not_syncing", null, Date.now());
-      if (triggerSource === "manual" || triggerSource === "dry") new Notice(error instanceof Error ? error.message : String(error));
+      if (triggerSource === "manual" || triggerSource === "dry")
+        new Notice(error instanceof Error ? error.message : String(error));
     } finally {
       this.isSyncing = false;
+      if (triggerSource !== "dry") {
+        const retryEnabled = this.settings.syncDirection === "bidirectional" &&
+          ((this.settings.autoRunEveryMilliseconds ?? -1) > 0 ||
+           (this.settings.syncOnSaveAfterMilliseconds ?? -1) > 0 ||
+           (this.settings.initRunAfterMilliseconds ?? -1) > 0);
+        this.syncQueue?.finished(outcome === "failed" && !retryEnabled ? "blocked" : outcome);
+      }
+      this.syncEvent?.trigger("SYNC_DONE");
     }
+    return outcome;
   }
 
   async onload() {
@@ -593,7 +684,9 @@ export default class NextclawSyncPlugin extends Plugin {
       await this.prepareDBAndVaultRandomID(vaultBasePath, profileID);
     } catch (err) {
       new Notice(
-        err instanceof Error ? err.message : "error of prepareDBAndVaultRandomID",
+        err instanceof Error
+          ? err.message
+          : "error of prepareDBAndVaultRandomID",
         10 * 1000
       );
       throw err;
@@ -731,6 +824,17 @@ export default class NextclawSyncPlugin extends Plugin {
 
     this.addSettingTab(new NextclawSyncSettingTab(this.app, this));
 
+    this.syncQueue = new SyncQueue(async () => {
+      if (this.isSyncing) return "blocked";
+      return await this.syncRun("auto_sync_on_save");
+    });
+    this.registerDomEvent(window, "online", () => this.requestRecoverySync());
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState === "visible") this.requestRecoverySync();
+    });
+    // Intent is reconstructed from disk and the journal after reload, not mtime
+    // versus a previous completion timestamp. Respect all-auto-off and mode A.
+    this.app.workspace.onLayoutReady(() => this.requestRecoverySync());
     this.enableAutoSyncIfSet();
     this.enableInitSyncIfSet();
     this.toggleSyncOnSaveIfSet();
@@ -743,6 +847,7 @@ export default class NextclawSyncPlugin extends Plugin {
   }
 
   onunload() {
+    this.syncQueue?.dispose();
     this.syncRibbon = undefined;
     if (this.appContainerObserver !== undefined) {
       this.appContainerObserver.disconnect();
@@ -843,7 +948,6 @@ export default class NextclawSyncPlugin extends Plugin {
       this.settings.enableMobileStatusBar = false;
     }
 
-
     await this.saveSettings();
   }
 
@@ -877,7 +981,11 @@ export default class NextclawSyncPlugin extends Plugin {
   }
 
   async prepareDBAndVaultRandomID(vaultBasePath: string, profileID: string) {
-    const { db, vaultRandomID } = await prepareDBs(vaultBasePath, "", profileID);
+    const { db, vaultRandomID } = await prepareDBs(
+      vaultBasePath,
+      "",
+      profileID
+    );
     this.db = db;
     this.vaultRandomID = vaultRandomID;
   }
@@ -912,55 +1020,37 @@ export default class NextclawSyncPlugin extends Plugin {
     }
   }
 
+  requestRecoverySync() {
+    if (this.settings.syncDirection !== "bidirectional") return;
+    if (
+      (this.settings.autoRunEveryMilliseconds ?? -1) <= 0 &&
+      (this.settings.syncOnSaveAfterMilliseconds ?? -1) <= 0 &&
+      (this.settings.initRunAfterMilliseconds ?? -1) <= 0
+    )
+      return;
+    this.syncQueue?.request(3000);
+  }
+
   async _checkCurrFileModified(caller: "SYNC" | "FILE_CHANGES") {
-    console.debug(`inside checkCurrFileModified`);
-    const currentFile = this.app.workspace.getActiveFile();
-
-    if (currentFile) {
-      console.debug(`we have currentFile=${currentFile.path}`);
-      // get the last modified time of the current file
-      // if it has modified after lastSuccessSync
-      // then schedule a run for syncOnSaveAfterMilliseconds after it was modified
-      const lastModified = currentFile.stat.mtime;
-      const lastSuccessSyncMillis = await getLastSuccessSyncTimeByVault(
-        this.db,
-        this.vaultRandomID
-      );
-
-      console.debug(
-        `lastModified=${lastModified}, lastSuccessSyncMillis=${lastSuccessSyncMillis}`
-      );
-
-      if (
-        caller === "SYNC" ||
-        (caller === "FILE_CHANGES" &&
-          lastModified > (lastSuccessSyncMillis ?? 1))
-      ) {
-        console.debug(
-          `so lastModified > lastSuccessSyncMillis or it's called while syncing before`
-        );
-        console.debug(
-          `caller=${caller}, isSyncing=${this.isSyncing}, hasPendingSyncOnSave=${this.hasPendingSyncOnSave}`
-        );
-        if (this.isSyncing) {
-          this.hasPendingSyncOnSave = true;
-          // wait for next event
-          return;
-        } else {
-          if (this.hasPendingSyncOnSave || caller === "FILE_CHANGES") {
-            this.hasPendingSyncOnSave = false;
-            await this.syncRun("auto_sync_on_save");
-          }
-          return;
-        }
-      }
-    } else {
-      console.debug(`no currentFile here`);
+    if (this.syncQueue) {
+      if (caller === "FILE_CHANGES") this.syncQueue.request();
+      return;
     }
+    const currentFile = this.app.workspace.getActiveFile();
+    if (!currentFile) return;
+    // A save event is dirty even when its debounce runs after the previous
+    // sync finished: that run may have read an earlier version of the file.
+    // Its completion timestamp does not acknowledge later edits.
+    if (caller === "FILE_CHANGES") this.hasPendingSyncOnSave = true;
+    if (this.isSyncing || !this.hasPendingSyncOnSave) return;
+    this.hasPendingSyncOnSave = false;
+    await this.syncRun("auto_sync_on_save");
   }
 
   _syncOnSaveEvent1 = () => {
-    void this._checkCurrFileModified("SYNC");
+    // SYNC_DONE fires inside syncRun, before its finally. Defer so the old
+    // run cannot clear the running guard belonging to the new queued run.
+    queueMicrotask(() => void this._checkCurrFileModified("SYNC"));
   };
 
   // 首次变化后等 3 秒再检查，期间的变化合并为一次（不重置计时）。

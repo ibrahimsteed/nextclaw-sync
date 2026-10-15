@@ -1,3 +1,4 @@
+import { etagHeader, SyncConflict } from "./nextclaw/engine/versionGuard";
 import { Queue } from "@fyears/tsqueue";
 import { getReasonPhrase } from "http-status-codes/build/cjs/utils-functions";
 import { Platform, type RequestUrlParam, requestUrl } from "obsidian";
@@ -38,55 +39,58 @@ function objKeyToLower(obj: Record<string, string>) {
 
 if (VALID_REQURL) {
   // 用 Obsidian 的 requestUrl 发请求，绕开 CORS。
-  getPatcher().patch("request", async (...args: unknown[]): Promise<Response> => {
-    const options = args[0] as RequestOptionsWithState;
-    const transformedHeaders = objKeyToLower({ ...options.headers });
-    delete transformedHeaders["host"];
-    delete transformedHeaders["content-length"];
+  getPatcher().patch(
+    "request",
+    async (...args: unknown[]): Promise<Response> => {
+      const options = args[0] as RequestOptionsWithState;
+      const transformedHeaders = objKeyToLower({ ...options.headers });
+      delete transformedHeaders["host"];
+      delete transformedHeaders["content-length"];
 
-    const reqContentType =
-      transformedHeaders["accept"] ?? transformedHeaders["content-type"];
+      const reqContentType =
+        transformedHeaders["accept"] ?? transformedHeaders["content-type"];
 
-    const p: RequestUrlParam = {
-      url: options.url,
-      method: options.method,
-      body: options.data as string | ArrayBuffer,
-      headers: transformedHeaders,
-      contentType: reqContentType,
-      throw: false,
-    };
+      const p: RequestUrlParam = {
+        url: options.url,
+        method: options.method,
+        body: options.data as string | ArrayBuffer,
+        headers: transformedHeaders,
+        contentType: reqContentType,
+        throw: false,
+      };
 
-    let r = await requestUrl(p);
+      let r = await requestUrl(p);
 
-    if (
-      r.status === 401 &&
-      Platform.isIosApp &&
-      !options.url.endsWith("/") &&
-      !options.url.endsWith(".md") &&
-      options.method.toUpperCase() === "PROPFIND"
-    ) {
-      // 某些服务器对不带斜杠的文件夹返回 401 而不是 404，补上斜杠重试。
-      p.url = `${options.url}/`;
-      r = await requestUrl(p);
+      if (
+        r.status === 401 &&
+        Platform.isIosApp &&
+        !options.url.endsWith("/") &&
+        !options.url.endsWith(".md") &&
+        options.method.toUpperCase() === "PROPFIND"
+      ) {
+        // 某些服务器对不带斜杠的文件夹返回 401 而不是 404，补上斜杠重试。
+        p.url = `${options.url}/`;
+        r = await requestUrl(p);
+      }
+
+      const rspHeaders = objKeyToLower({ ...r.headers });
+      for (const key of Object.keys(rspHeaders)) {
+        const text = headerValueToText(rspHeaders[key]);
+        // Response 的头只允许 ISO-8859-1 字符，否则构造时报错。
+        rspHeaders[key] = onlyLatin1(text) ? text : encodeURIComponent(text);
+      }
+
+      const statusText = getReasonPhrase(r.status);
+      // 101、103、204、205、304 不能带响应体。
+      // https://fetch.spec.whatwg.org/#statuses
+      const nullBody = [101, 103, 204, 205, 304].includes(r.status);
+      return new Response(nullBody ? null : r.arrayBuffer, {
+        status: r.status,
+        statusText: statusText,
+        headers: rspHeaders,
+      });
     }
-
-    const rspHeaders = objKeyToLower({ ...r.headers });
-    for (const key of Object.keys(rspHeaders)) {
-      const text = headerValueToText(rspHeaders[key]);
-      // Response 的头只允许 ISO-8859-1 字符，否则构造时报错。
-      rspHeaders[key] = onlyLatin1(text) ? text : encodeURIComponent(text);
-    }
-
-    const statusText = getReasonPhrase(r.status);
-    // 101、103、204、205、304 不能带响应体。
-    // https://fetch.spec.whatwg.org/#statuses
-    const nullBody = [101, 103, 204, 205, 304].includes(r.status);
-    return new Response(nullBody ? null : r.arrayBuffer, {
-      status: r.status,
-      statusText: statusText,
-      headers: rspHeaders,
-    });
-  });
+  );
 }
 
 export const DEFAULT_WEBDAV_CONFIG = {
@@ -153,6 +157,7 @@ const fromWebdavItemToEntity = (x: FileStat, remoteBaseDir: string): Entity => {
   return {
     key: key,
     keyRaw: key,
+    etag: x.etag ?? undefined,
     mtimeSvr: mtimeSvr,
     mtimeCli: mtimeSvr, // TODO: no universal way to set mtime in webdav
     size: x.size,
@@ -274,7 +279,9 @@ export class FakeFsWebdav extends FakeFs {
         // console.info("remote vault folder exits!");
         this.vaultFolderExists = true;
       } else {
-        throw new Error(`Remote root directory does not exist: /${this.remoteBaseDir}/`);
+        throw new Error(
+          `Remote root directory does not exist: /${this.remoteBaseDir}/`
+        );
       }
     }
 
@@ -802,17 +809,60 @@ export class FakeFsWebdav extends FakeFs {
     return await this.stat(origKey);
   }
 
-  async readFile(key: string): Promise<ArrayBuffer> {
+  async writeFileGuarded(
+    key: string,
+    content: ArrayBuffer,
+    _mtime: number,
+    _ctime: number,
+    expected: Entity | null
+  ): Promise<Entity> {
+    await this._init();
+    const fullPath = getWebdavPath(key, this.remoteBaseDir);
+    // One conditional PUT also for large files: never fall back to unguarded chunks.
+    const response = await this.client.customRequest(fullPath, {
+      method: "PUT",
+      data: content,
+      headers: {
+        "Content-Type": "application/octet-stream",
+        ...(expected
+          ? { "If-Match": etagHeader(expected) }
+          : { "If-None-Match": "*" }),
+      },
+    });
+    const writtenTag = response.headers.get("etag");
+    const stored = await this._statFromRoot(fullPath);
+    if (!writtenTag || etagHeader(stored) !== writtenTag)
+      throw new SyncConflict("上传后远端版本无法确认，保留本地版本并重新发现");
+    return stored;
+  }
+
+  async rmGuarded(key: string, expected: Entity): Promise<void> {
+    if (key.endsWith("/") || key === "/")
+      throw new SyncConflict("目录删除需重新核对全部子项，暂不自动执行");
+    await this._init();
+    await this.client.customRequest(getWebdavPath(key, this.remoteBaseDir), {
+      method: "DELETE",
+      headers: { "If-Match": etagHeader(expected) },
+    });
+  }
+
+  async readFile(key: string, expected?: Entity): Promise<ArrayBuffer> {
     if (key.endsWith("/")) {
       throw Error(`you should not call readFile on ${key}`);
     }
     await this._init();
     const downloadFile = getWebdavPath(key, this.remoteBaseDir);
-    return await this._readFileFromRoot(downloadFile);
+    return await this._readFileFromRoot(downloadFile, expected);
   }
 
-  async _readFileFromRoot(key: string): Promise<ArrayBuffer> {
-    const buff = (await this.client.getFileContents(key)) as BufferLike;
+  async _readFileFromRoot(
+    key: string,
+    expected?: Entity
+  ): Promise<ArrayBuffer> {
+    const buff = (await this.client.getFileContents(
+      key,
+      expected ? { headers: { "If-Match": etagHeader(expected) } } : undefined
+    )) as BufferLike;
     if (buff instanceof ArrayBuffer) {
       return buff;
     } else if (ArrayBuffer.isView(buff)) {

@@ -59,8 +59,17 @@ describe("§4 filtering and paths", () => {
     h.local.put(nfc, "old", 10000);
     h.remote.put(nfd, "new", 30000);
     await runSync(h.input);
-    assert.equal(h.local.writes().find((c) => c.op === "writeFile")!.key, nfd);
+    assert.equal(
+      h.local
+        .writes()
+        .find(
+          (c) => c.op === "writeFile" && !c.key.includes(".sync-conflict-")
+        )!.key,
+      nfd
+    );
     assert.ok(h.rec(nfc));
+    await runSync(h.input); // the preserved loser is uploaded as a conflict copy
+    assert.equal(h.last()[nfc].change, false);
     await runSync(h.input);
     assert.equal(
       Object.values(h.last()).some((p: any) => p.change),
@@ -300,7 +309,7 @@ describe("§6.5 directory planning and dependencies", () => {
       ]
     );
   });
-  it("propagates deleted empty subtree deepest first", async () => {
+  it("deletes files but defers directory deletion without an atomic subtree guard", async () => {
     const h = harness();
     for (const key of ["a/", "a/b/", "a/b/x.md"]) {
       h.local.put(key);
@@ -309,9 +318,11 @@ describe("§6.5 directory planning and dependencies", () => {
     await runSync(h.input);
     assert.deepEqual(
       h.local.writes().map((c) => c.key),
-      ["a/b/x.md", "a/b", "a"]
+      ["a/b/x.md"]
     );
-    assert.equal(Object.keys(h.records).length, 0);
+    assert.equal(Object.keys(h.records).length, 2);
+    assert.ok(h.local.files.has("a/"));
+    assert.ok(h.local.files.has("a/b/"));
   });
   it("modified child restores a deleted directory", async () => {
     const h = harness();

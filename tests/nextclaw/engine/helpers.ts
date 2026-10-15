@@ -1,3 +1,8 @@
+import {
+  assertVersion,
+  equalBytes,
+  SyncConflict,
+} from "../../../src/nextclaw/engine/versionGuard";
 // Minimal host clock used only by the existing plan-history formatter.
 (globalThis as any).window ??= {};
 (globalThis as any).window.moment = (n: number) => ({
@@ -102,6 +107,25 @@ export class MemoryFs extends FakeFs {
     } finally {
       this.active--;
     }
+  }
+  async writeFileGuarded(
+    key: string,
+    content: ArrayBuffer,
+    mtime: number,
+    ctime: number,
+    expected: Entity | null,
+    expectedBytes?: ArrayBuffer
+  ) {
+    await assertVersion(this, key, expected);
+    if (expectedBytes && !equalBytes(await this.readFile(key), expectedBytes))
+      throw new SyncConflict();
+    return await this.writeFile(key, content, mtime, ctime);
+  }
+  async rmGuarded(key: string, expected: Entity, expectedBytes?: ArrayBuffer) {
+    await assertVersion(this, key, expected);
+    if (expectedBytes && !equalBytes(await this.readFile(key), expectedBytes))
+      throw new SyncConflict();
+    return await this.rm(key);
   }
   async rm(key: string) {
     await this.check("rm", key);

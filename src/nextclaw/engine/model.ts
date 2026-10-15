@@ -69,6 +69,7 @@ export const mtime = (e: Entity, side: "local" | "remote") =>
 export const observation = (e: Entity, side: "local" | "remote") => ({
   mtime: mtime(e, side),
   size: e.size ?? e.sizeRaw,
+  ...(side === "remote" && e.etag ? { etag: e.etag } : {}),
 });
 export const inConfig = (key: string, configDir: string) => {
   const dir = configDir.normalize("NFC").replace(/\/+$/, "");
@@ -83,7 +84,9 @@ export function state(
   if (!e) return "deleted";
   const prev = record[side];
   return record.isFolder ||
-    (mtime(e, side) === prev.mtime && (e.size ?? e.sizeRaw) === prev.size)
+    (mtime(e, side) === prev.mtime &&
+      (e.size ?? e.sizeRaw) === prev.size &&
+      (side !== "remote" || !("etag" in prev) || prev.etag === e.etag))
     ? "unchanged"
     : "modified";
 }

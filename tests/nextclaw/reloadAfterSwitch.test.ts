@@ -175,7 +175,7 @@ describe("NextClaw：切换后重新加载——main.ts 接线", () => {
   });
 
   it("打标记与清切换标记在同一分支内，且在清理失败抛错之后", () => {
-    const iThrow = m.indexOf('if (receipt.failed.length) throw');
+    const iThrow = m.search(/if\s*\(receipt\.failed\.length\)\s*throw/);
     const iClear = m.indexOf("this.settings.nextclawPendingSwitchToB = false");
     const iMark = m.indexOf("markReloadPending(this.settings)");
     assert.ok(iThrow > 0 && iThrow < iClear && iClear < iMark);

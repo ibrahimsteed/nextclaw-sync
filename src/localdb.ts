@@ -14,7 +14,7 @@ export interface NextclawSyncRecord extends Entity {
   v: 1;
   isFolder: boolean;
   local: { mtime: number; size: number };
-  remote: { mtime: number; size: number };
+  remote: { mtime: number; size: number; etag?: string };
   remoteList?: string[];
 }
 

@@ -1,3 +1,5 @@
+import { nanoid } from "nanoid";
+import { assertVersion, equalBytes, SyncConflict } from "./versionGuard";
 import {
   clearPrevSyncRecordByVaultAndProfile,
   upsertPrevSyncRecordByVaultAndProfile,
@@ -10,6 +12,7 @@ import {
   name,
   observation,
   rawPath,
+  state,
   type PlanItem,
   type SyncInput,
 } from "./model";
@@ -75,6 +78,7 @@ export async function executePlan(
   const completed = new Set<string>();
   async function run([key, item]: [string, PlanItem]) {
     if (failures >= 10) return;
+    let attemptedBytes: ArrayBuffer | undefined;
     try {
       for (const [other, parent] of Object.entries(plan)) {
         if (
@@ -97,6 +101,18 @@ export async function executePlan(
       let l = item.local,
         r = item.remote;
       let remoteList = item.record?.remoteList;
+      // Snapshot before network awaits; local CAS checks these bytes again at commit.
+      let localBytes: ArrayBuffer | undefined;
+      if (
+        !folder(key) &&
+        ["push", "pull", "deleteLocal"].includes(item.decision)
+      ) {
+        await assertVersion(localFs, key, l ?? null);
+        if (l) {
+          localBytes = await localFs.readFile(name(l));
+          await assertVersion(localFs, key, l);
+        }
+      }
       const clear = () =>
         clearPrevSyncRecordByVaultAndProfile(
           input.db,
@@ -104,9 +120,22 @@ export async function executePlan(
           input.profileID,
           item.record?.key ?? key
         );
+      const preserve = async (bytes: ArrayBuffer) => {
+        const dot = key.lastIndexOf(".");
+        const suffix = dot > key.lastIndexOf("/") ? key.slice(dot) : "";
+        const base = suffix ? key.slice(0, dot) : key;
+        await localFs.writeFileGuarded(
+          `${base}.sync-conflict-${nanoid()}${suffix}`,
+          bytes,
+          Date.now(),
+          Date.now(),
+          null
+        );
+      };
       switch (item.decision) {
         case "pull": {
-          let bytes = await remoteFs.readFile(name(r!));
+          let bytes = await remoteFs.readFile(name(r!), r);
+          attemptedBytes = bytes;
           if (
             key ===
             `${input.configDir.normalize("NFC").replace(/\/$/, "")}/community-plugins.json`
@@ -131,22 +160,50 @@ export async function executePlan(
               remoteList = undefined;
             }
           }
-          if (item.trash && l) await localFs.rm(name(l));
+          // Retain the losing local version before a planned conflict overwrite.
+          // Copy instead of rm: a later local edit must still be checked by CAS.
+          if (item.trash && localBytes && !equalBytes(localBytes, bytes)) {
+            const suffix = key.includes(".")
+              ? key.slice(key.lastIndexOf("."))
+              : "";
+            const base = suffix ? key.slice(0, -suffix.length) : key;
+            await localFs.writeFileGuarded(
+              `${base}.sync-conflict-${nanoid()}${suffix}`,
+              localBytes,
+              Date.now(),
+              Date.now(),
+              null
+            );
+          }
           // D8: compare NFC, but use the original remote spelling for writes.
-          l = await localFs.writeFile(
+          attemptedBytes = bytes;
+          l = await localFs.writeFileGuarded(
             name(r!),
             bytes,
             mtime(r!, "remote"),
-            mtime(r!, "remote")
+            mtime(r!, "remote"),
+            item.local ?? null,
+            localBytes
           );
           break;
         }
         case "push":
-          r = await remoteFs.writeFile(
+          attemptedBytes = localBytes!;
+          if (
+            r &&
+            (!item.record ||
+              (state(r, item.record, "remote") === "modified" &&
+                state(l, item.record, "local") === "modified"))
+          ) {
+            const previousRemote = await remoteFs.readFile(name(r), r);
+            if (!equalBytes(previousRemote, localBytes!)) await preserve(previousRemote);
+          }
+          r = await remoteFs.writeFileGuarded(
             r ? name(r) : name(l!),
-            await localFs.readFile(name(l!)),
+            localBytes!,
             mtime(l!, "local"),
-            l!.ctimeCli ?? mtime(l!, "local")
+            l!.ctimeCli ?? mtime(l!, "local"),
+            item.remote ?? null
           );
           break;
         case "mkdirLocal":
@@ -156,16 +213,49 @@ export async function executePlan(
           r = await remoteFs.mkdir(`${rawPath(l!)}/`);
           break;
         case "deleteLocal":
-          await localFs.rm(rawPath(l!));
+          if (folder(key))
+            throw new SyncConflict("目录删除暂缓，保留可能新增的子文件");
+          await localFs.rmGuarded(
+            rawPath(l!) + (folder(key) ? "/" : ""),
+            l!,
+            localBytes
+          );
           await clear();
           break;
         case "deleteRemote":
-          await remoteFs.rm(name(r!));
+          if (folder(key))
+            throw new SyncConflict("目录删除暂缓，保留可能新增的子文件");
+          await remoteFs.rmGuarded(name(r!), r!);
           await clear();
+          break;
+        case "record":
+          if (!folder(key)) {
+            await assertVersion(localFs, key, l!);
+            const current = await localFs.readFile(name(l!));
+            const remote = await remoteFs.readFile(name(r!), r);
+            await assertVersion(localFs, key, l!);
+            if (!equalBytes(current, remote)) {
+              // Metadata equality is not byte equality. Preserve remote first,
+              // then converge using a conditional upload of the local snapshot.
+              await preserve(remote);
+              attemptedBytes = current;
+              r = await remoteFs.writeFileGuarded(
+                name(r!),
+                current,
+                mtime(l!, "local"),
+                l!.ctimeCli ?? mtime(l!, "local"),
+                r!
+              );
+            }
+          }
           break;
         case "clear":
           await clear();
           break;
+      }
+      if (item.decision === "push" && localBytes &&
+          !equalBytes(await localFs.readFile(name(l!)), localBytes)) {
+        throw new SyncConflict("上传期间本地再次修改，保留传输版本且不更新基线");
       }
       if (
         ["pull", "push", "mkdirLocal", "mkdirRemote", "record"].includes(
@@ -199,9 +289,36 @@ export async function executePlan(
         item.decision
       );
     } catch (e) {
-      const error = new Error(`${key}：${errorOf(e).message}`);
+      const status = (e as { status?: number }).status;
+      let recovery = "";
+      if (
+        attemptedBytes &&
+        (e instanceof SyncConflict || status === 412 || status === 404)
+      ) {
+        const dot = key.lastIndexOf(".");
+        const suffix = dot > key.lastIndexOf("/") ? key.slice(dot) : "";
+        const base = suffix ? key.slice(0, dot) : key;
+        const copy = `${base}.sync-conflict-${nanoid()}${suffix}`;
+        try {
+          await localFs.writeFileGuarded(
+            copy,
+            attemptedBytes,
+            Date.now(),
+            Date.now(),
+            null
+          );
+          recovery = `；本次传输版本保留在 ${copy}`;
+        } catch (saveError) {
+          recovery = `；冲突副本保存失败：${errorOf(saveError).message}`;
+        }
+      }
+      const error = new Error(`${key}：${errorOf(e).message}${recovery}`);
       errors.push(error);
-      failures++;
+      // Deliberately deferred directories must not exhaust the I/O error budget
+      // and starve unrelated record/clear tasks later in this run.
+      if (
+        !(folder(key) && ["deleteLocal", "deleteRemote"].includes(item.decision))
+      ) failures++;
       item.error = error.message;
     }
   }

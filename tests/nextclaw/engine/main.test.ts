@@ -11,7 +11,10 @@ import {
   getAllPrevSyncRecordsByVaultAndProfile,
   insertSyncPlanRecordByVault,
 } from "../../../src/localdb";
-import { canAskNow, evaluateGuard } from "../../../src/nextclaw/existingVaultGuard";
+import {
+  canAskNow,
+  evaluateGuard,
+} from "../../../src/nextclaw/existingVaultGuard";
 import {
   isStudentAccountOnDesktop,
   needsPasswordBeforeSync,
@@ -118,7 +121,9 @@ function mainHarness() {
       vault: { configDir: ".obsidian", getName: () => "test" },
       commands: {
         commands: { "app:reload": {} },
-        executeCommandById: (id: string) => (executed.push(`${id}|isSyncing=${plugin.isSyncing}`), true),
+        executeCommandById: (id: string) => (
+          executed.push(`${id}|isSyncing=${plugin.isSyncing}`), true
+        ),
       },
     },
     db: h.input.db,
@@ -201,13 +206,25 @@ describe("§3 §8 main syncRun real method wiring", () => {
     t.h.local.put("welcome.md");
     t.h.remote.put("student.md");
     await t.run();
-    assert.deepEqual(t.executed, ["app:reload|isSyncing=true"], "执行重新加载时必须挡住新同步");
+    assert.deepEqual(
+      t.executed,
+      ["app:reload|isSyncing=true"],
+      "执行重新加载时必须挡住新同步"
+    );
     assert.equal(t.plugin.settings.nextclawReloadAfterFirstBSync, false);
-    assert.equal(saved[saved.length - 1], false, "reload 前最后一次保存时标记必须已清除");
+    assert.equal(
+      saved[saved.length - 1],
+      false,
+      "reload 前最后一次保存时标记必须已清除"
+    );
     assert.ok(saved.includes(true), "切换后应先保存待重新加载标记");
     assert.ok(t.notices.some((n) => n.includes("重新加载")));
     await t.run();
-    assert.deepEqual(t.executed, ["app:reload|isSyncing=true"], "之后的同步不再重新加载");
+    assert.deepEqual(
+      t.executed,
+      ["app:reload|isSyncing=true"],
+      "之后的同步不再重新加载"
+    );
   });
   it("§14.1 failed first B sync keeps the reload flag and does not reload", async () => {
     const t = mainHarness();
@@ -221,7 +238,11 @@ describe("§3 §8 main syncRun real method wiring", () => {
     assert.deepEqual(t.executed, []);
     t.h.remote.fail = () => false;
     await t.run();
-    assert.deepEqual(t.executed, ["app:reload|isSyncing=true"], "下一次成功的 B 同步再重新加载");
+    assert.deepEqual(
+      t.executed,
+      ["app:reload|isSyncing=true"],
+      "下一次成功的 B 同步再重新加载"
+    );
   });
   it("§14.1 ordinary B sync without switch never reloads", async () => {
     const t = mainHarness();
@@ -268,25 +289,49 @@ describe("§3 §8 main syncRun real method wiring", () => {
     const t = mainHarness();
     t.plugin.settings.nextclawPendingRecordReset = true;
     // 记录与本地文件完全一致（本地"未变"）；远端新目录里没有它。
-    t.h.seed({ key: "old-dir-note.md", v: 1, isFolder: false, local: { mtime: 10000, size: 1 }, remote: { mtime: 10000, size: 1 } });
+    t.h.seed({
+      key: "old-dir-note.md",
+      v: 1,
+      isFolder: false,
+      local: { mtime: 10000, size: 1 },
+      remote: { mtime: 10000, size: 1 },
+    });
     t.h.local.put("old-dir-note.md");
     await t.run();
     assert.equal(t.plugin.settings.nextclawPendingRecordReset, false);
     // 记录已清空：本地独有的笔记按"新建"推送，而不是按"远端已删除"被删掉。
     assert.ok(t.h.local.files.has("old-dir-note.md"), "本地笔记不应被删除");
-    assert.ok(t.h.remote.files.has("old-dir-note.md"), "应作为新建推送到新目录");
+    assert.ok(
+      t.h.remote.files.has("old-dir-note.md"),
+      "应作为新建推送到新目录"
+    );
   });
   it("remote folder change: without the reset, the stale record would delete the local note (control)", async () => {
     const t = mainHarness();
-    t.h.seed({ key: "old-dir-note.md", v: 1, isFolder: false, local: { mtime: 10000, size: 1 }, remote: { mtime: 10000, size: 1 } });
+    t.h.seed({
+      key: "old-dir-note.md",
+      v: 1,
+      isFolder: false,
+      local: { mtime: 10000, size: 1 },
+      remote: { mtime: 10000, size: 1 },
+    });
     t.h.local.put("old-dir-note.md");
     await t.run();
-    assert.ok(!t.h.local.files.has("old-dir-note.md"), "对照：旧记录让本地笔记被判为远端已删除");
+    assert.ok(
+      !t.h.local.files.has("old-dir-note.md"),
+      "对照：旧记录让本地笔记被判为远端已删除"
+    );
   });
   it("remote folder change: dry run keeps records and the flag", async () => {
     const t = mainHarness();
     t.plugin.settings.nextclawPendingRecordReset = true;
-    t.h.seed({ key: "keep.md", v: 1, isFolder: false, local: { mtime: 1, size: 1 }, remote: { mtime: 1, size: 1 } });
+    t.h.seed({
+      key: "keep.md",
+      v: 1,
+      isFolder: false,
+      local: { mtime: 1, size: 1 },
+      remote: { mtime: 1, size: 1 },
+    });
     await t.run("dry");
     assert.equal(t.plugin.settings.nextclawPendingRecordReset, true);
     assert.ok(t.h.rec("keep.md"), "空跑不清空记录");
@@ -316,7 +361,11 @@ describe("§3 §8 main syncRun real method wiring", () => {
     assert.ok(t.h.local.files.has("my note.md"), "取消后本地内容不动");
     assert.deepEqual(t.h.local.trash.size, 0);
     assert.deepEqual(t.h.remote.calls, [], "取消后不连远端");
-    assert.equal(t.plugin.settings.nextclawPendingSwitchToB, true, "取消后切换标记保留");
+    assert.equal(
+      t.plugin.settings.nextclawPendingSwitchToB,
+      true,
+      "取消后切换标记保留"
+    );
     assert.ok(t.notices.includes("nextclaw_guard_cancelled"));
     assert.equal(t.plugin.isSyncing, false);
   });
@@ -334,7 +383,13 @@ describe("§3 §8 main syncRun real method wiring", () => {
   it("guard: switch after syncing only the demo vault does not ask", async () => {
     const t = mainHarness();
     t.plugin.settings.nextclawPendingSwitchToB = true;
-    t.h.seed({ key: "welcome.md", v: 1, isFolder: false, local: { mtime: 10000, size: 1 }, remote: { mtime: 10000, size: 1 } });
+    t.h.seed({
+      key: "welcome.md",
+      v: 1,
+      isFolder: false,
+      local: { mtime: 10000, size: 1 },
+      remote: { mtime: 10000, size: 1 },
+    });
     t.h.local.put("welcome.md").put(".obsidian/app.json", "{}");
     t.h.remote.put("student.md");
     await t.run();
@@ -345,9 +400,13 @@ describe("§3 §8 main syncRun real method wiring", () => {
     const t = mainHarness();
     t.plugin.settings.nextclawPendingSwitchToB = true;
     t.h.local.put("my note.md");
-    for (const trigger of ["auto_once_init", "auto", "auto_sync_on_save"]) await t.run(trigger);
+    for (const trigger of ["auto_once_init", "auto", "auto_sync_on_save"])
+      await t.run(trigger);
     assert.equal(t.guardUi.asked.length, 0);
-    assert.equal(t.notices.filter((n) => n === "nextclaw_guard_manual_required").length, 1);
+    assert.equal(
+      t.notices.filter((n) => n === "nextclaw_guard_manual_required").length,
+      1
+    );
     assert.ok(t.h.local.files.has("my note.md"));
     assert.deepEqual(t.h.remote.calls, []);
     assert.equal(t.plugin.settings.nextclawPendingSwitchToB, true);
@@ -389,7 +448,8 @@ describe("§3 §8 main syncRun real method wiring", () => {
 describe("NextClaw 桌面端不同步学生账号：syncRun 真实方法接线", () => {
   const STUDENT = {
     username: "s10012",
-    address: "https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents",
+    address:
+      "https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents",
     // 带上密码：否则会被"没填密码不同步"拦下，桌面端那几条就测不到桌面规则本身。
     password: "not-a-real-password",
   };
@@ -430,14 +490,24 @@ describe("NextClaw 桌面端不同步学生账号：syncRun 真实方法接线",
     t.plugin.settings.webdav = { ...STUDENT };
     t.h.remote.put("student.md");
     await t.run("manual");
-    assert.ok(t.h.remote.calls.some((c) => c.op === "walk"), "应当真的去列远端");
+    assert.ok(
+      t.h.remote.calls.some((c) => c.op === "walk"),
+      "应当真的去列远端"
+    );
     assert.ok(!t.notices.includes("nextclaw_desktop_student_blocked"));
   });
 
   it("桌面端演示库、其他 WebDAV 服务照常同步", async () => {
     for (const webdav of [
-      { username: "", address: "https://cloud.nextclaw.chat/public.php/webdav" },
-      { username: "me", address: "https://dav.example.com/remote.php/dav/files/me", password: "p" },
+      {
+        username: "",
+        address: "https://cloud.nextclaw.chat/public.php/webdav",
+      },
+      {
+        username: "me",
+        address: "https://dav.example.com/remote.php/dav/files/me",
+        password: "p",
+      },
     ]) {
       const t = mainHarness();
       t.platform.isDesktopApp = true;
@@ -456,7 +526,8 @@ describe("NextClaw 桌面端不同步学生账号：syncRun 真实方法接线",
 describe("NextClaw 学生账号没填密码不同步：syncRun 真实方法接线", () => {
   const NO_PASSWORD = {
     username: "s10012",
-    address: "https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents",
+    address:
+      "https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents",
     password: "",
   };
 
@@ -490,14 +561,24 @@ describe("NextClaw 学生账号没填密码不同步：syncRun 真实方法接�
     t.plugin.settings.webdav = { ...NO_PASSWORD, password: "x" };
     t.h.remote.put("student.md");
     await t.run("manual");
-    assert.ok(t.h.remote.calls.some((c) => c.op === "walk"), "应当真的去列远端");
+    assert.ok(
+      t.h.remote.calls.some((c) => c.op === "walk"),
+      "应当真的去列远端"
+    );
     assert.ok(!t.notices.includes("nextclaw_password_required"));
   });
 
   it("演示库、其他 WebDAV 服务不受影响", async () => {
     for (const webdav of [
-      { username: "", address: "https://cloud.nextclaw.chat/public.php/webdav" },
-      { username: "me", address: "https://dav.example.com/webdav", password: "" },
+      {
+        username: "",
+        address: "https://cloud.nextclaw.chat/public.php/webdav",
+      },
+      {
+        username: "me",
+        address: "https://dav.example.com/webdav",
+        password: "",
+      },
     ]) {
       const t = mainHarness();
       t.plugin.settings.webdav = webdav;
@@ -509,5 +590,56 @@ describe("NextClaw 学生账号没填密码不同步：syncRun 真实方法接�
       );
       assert.ok(!t.notices.includes("nextclaw_password_required"));
     }
+  });
+});
+
+describe("outer sync ownership and recovery reporting", () => {
+  it("queues an interleaved trigger and reports completion only after unlocking", async () => {
+    const t = mainHarness();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r)),
+      calls: string[] = [];
+    const walk = t.h.remote.walk.bind(t.h.remote);
+    t.h.remote.walk = async () => {
+      await gate;
+      return walk();
+    };
+    t.plugin.syncQueue = {
+      request: () => calls.push("queued"),
+      finished: (outcome: string) =>
+        calls.push(`${outcome}:${t.plugin.isSyncing}`),
+    };
+    t.plugin.syncEvent = {
+      trigger: () => calls.push(`event:${t.plugin.isSyncing}`),
+    };
+    const running = t.run("manual");
+    await Promise.resolve();
+    assert.equal(t.plugin.isSyncing, true);
+    assert.equal(await t.run("auto"), "blocked");
+    release();
+    await running;
+    assert.deepEqual(calls, ["queued", "ok:false", "event:false"]);
+  });
+  it("reports failed outcomes for retry without recording a successful sync", async () => {
+    const t = mainHarness(),
+      outcomes: string[] = [];
+    t.h.remote.fail = (op) => op === "walk";
+    t.plugin.settings.syncOnSaveAfterMilliseconds = 30000;
+    t.plugin.syncQueue = {
+      finished: (outcome: string) =>
+        outcomes.push(`${outcome}:${t.plugin.isSyncing}`),
+    };
+    assert.equal(await t.run("manual"), "failed");
+    assert.deepEqual(outcomes, ["failed:false"]);
+    assert.equal(t.h.saved(), 0);
+  });
+  it("dry runs do not consume or retry pending work", async () => {
+    const t = mainHarness(),
+      outcomes: string[] = [];
+    t.plugin.syncQueue = {
+      finished: (outcome: string) => outcomes.push(outcome),
+    };
+    await t.run("dry");
+    assert.deepEqual(outcomes, []);
   });
 });

@@ -48,4 +48,4 @@ jobs:
         run: |
           sha256sum main.js manifest.json styles.css
           gh release create "${GITHUB_REF_NAME}" main.js manifest.json styles.css \
-            --title "${GITHUB_REF_NAME}" --notes "Built and attested by GitHub Actions from ${GITHUB_SHA}."
+            --title "${GITHUB_REF_NAME}" --notes-file RELEASE_NOTES.md

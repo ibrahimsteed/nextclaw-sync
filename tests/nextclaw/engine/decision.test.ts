@@ -127,12 +127,12 @@ describe("§6.2 conflict boundary and D3 D9", () => {
         h.local.put(key, "old", 10000);
         h.remote.put(key, "winner", 30000);
         await runSync(h.input);
-        assert.equal(
-          h.local.calls.some((c) => c.op === "rm"),
-          mode === "B" && !config
+        const copies = [...h.local.files].filter(([path]) =>
+          path.includes(".sync-conflict-")
         );
+        assert.equal(copies.length, mode === "B" && !config ? 1 : 0);
         if (mode === "B" && !config)
-          assert.equal(new TextDecoder().decode(h.local.trash.get(key)), "old");
+          assert.equal(new TextDecoder().decode(copies[0][1].bytes), "old");
       });
   it("D9 config wins even when local is newer; ordinary file uses mtime", async () => {
     const h = harness();

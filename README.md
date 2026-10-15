@@ -45,7 +45,9 @@ server rejects every write to it.
 
 **Once you fill in your own username**, the plugin syncs your vault in both directions with your server: on
 startup (after a short delay), every 10 minutes, a few seconds after you stop editing, and whenever you tap
-sync. For a NextClaw account this is `cloud.nextclaw.chat`; the server address is filled in from your username.
+sync. With automatic sync enabled, reconnecting, returning to the foreground, or
+reloading the plugin also schedules a scan; failed runs retry with a bounded delay.
+For a NextClaw account this is `cloud.nextclaw.chat`; the server address is filled in from your username.
 On desktop, a NextClaw account is not synced at all and no request is sent.
 
 **The plugin sends nothing else anywhere**: no telemetry, no analytics, no other destinations.
@@ -86,13 +88,28 @@ you can actually reach. It is a hidden folder, so it is never synced to the
 server — but it is also never cleaned up automatically. Delete it yourself if it
 grows.
 
+Directory deletion is temporarily paused, including empty directories. It appears
+as an error in the sync plan; unrelated safe file operations continue. Renames
+can leave old empty folders behind. Review those folders before removing them
+manually.
+
 ## Conflicts
 
 If the same note changed on both sides since the last sync, the newer
-modification time wins. When the server's version wins, your local version is first
-moved to `.trash`. When your version wins, the server's version is overwritten —
-keep a server that retains file versions (Nextcloud does by default) if that
-matters to you.
+modification time normally determines the main copy. The other content is kept
+beside it as a `.sync-conflict-…` file for you to review. These copies can sync
+to your other devices.
+
+Uploads, downloads and file deletions check the expected remote ETag. If another
+writer changed that version after scanning, the operation stops instead of
+retrying without protection. A WebDAV server without usable strong ETags may
+therefore refuse these operations.
+
+Local text replacement checks the content atomically through Obsidian's adapter.
+Binary replacement and deletion retain the removed version under
+`.trash/nextclaw-recovery-…`. These recovery files are not cleaned up automatically;
+after an interrupted operation, review them manually. Changes made by external
+programs outside Obsidian's adapter are not guaranteed to be atomic.
 
 Deletions propagate: a note deleted on one side is deleted on the other, unless it
 was modified there in the meantime, in which case the modified copy is kept.
