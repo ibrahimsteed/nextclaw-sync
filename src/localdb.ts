@@ -16,6 +16,8 @@ export interface NextclawSyncRecord extends Entity {
   local: { mtime: number; size: number };
   remote: { mtime: number; size: number; etag?: string };
   remoteList?: string[];
+  /** Acknowledged remote snapshot exists; local bytes still need rediscovery/upload. */
+  pendingLocalUpload?: boolean;
 }
 
 export const DEFAULT_DB_VERSION_NUMBER: number = 20240220;

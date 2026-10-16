@@ -79,6 +79,7 @@ export async function executePlan(
   async function run([key, item]: [string, PlanItem]) {
     if (failures >= 10) return;
     let attemptedBytes: ArrayBuffer | undefined;
+    let uploadedBytes: ArrayBuffer | undefined;
     try {
       for (const [other, parent] of Object.entries(plan)) {
         if (
@@ -205,6 +206,7 @@ export async function executePlan(
             l!.ctimeCli ?? mtime(l!, "local"),
             item.remote ?? null
           );
+          uploadedBytes = localBytes!;
           break;
         case "mkdirLocal":
           l = await localFs.mkdir(`${rawPath(r!)}/`);
@@ -246,16 +248,13 @@ export async function executePlan(
                 l!.ctimeCli ?? mtime(l!, "local"),
                 r!
               );
+              uploadedBytes = current;
             }
           }
           break;
         case "clear":
           await clear();
           break;
-      }
-      if (item.decision === "push" && localBytes &&
-          !equalBytes(await localFs.readFile(name(l!)), localBytes)) {
-        throw new SyncConflict("上传期间本地再次修改，保留传输版本且不更新基线");
       }
       if (
         ["pull", "push", "mkdirLocal", "mkdirRemote", "record"].includes(
@@ -273,6 +272,24 @@ export async function executePlan(
           remote: observation(r, "remote"),
           ...(remoteList ? { remoteList } : {}),
         };
+        if (uploadedBytes) {
+          // A successful conditional PUT is our acknowledged remote version,
+          // even if typing continued while it was in flight. Persist that fact
+          // before checking local bytes. The pending flag also catches edits
+          // with identical size/mtime after a reload or interrupted check.
+          const pendingRecord: NextclawSyncRecord = {
+            ...record, pendingLocalUpload: true,
+          };
+          await upsertPrevSyncRecordByVaultAndProfile(
+            input.db,
+            input.vaultRandomID,
+            input.profileID,
+            pendingRecord
+          );
+          if (!equalBytes(await localFs.readFile(name(l)), uploadedBytes)) {
+            throw new SyncConflict("上传期间本地再次修改，已记录传输版本，后续编辑待上传");
+          }
+        }
         await upsertPrevSyncRecordByVaultAndProfile(
           input.db,
           input.vaultRandomID,

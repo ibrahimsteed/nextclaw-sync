@@ -166,7 +166,7 @@ describe("source edits during upload", () => {
     const errors:Error[]=[];await executePlan(h.input,p,errors);
     assert.equal(text(await h.local.readFile("note.md")),"later");
     assert.equal(text(await h.remote.readFile("note.md")),"first");
-    assert.ok(errors.length);assert.equal(h.saved(),0);
+    assert.ok(errors.length);assert.equal(h.rec("note.md")?.pendingLocalUpload,true);
     assert.ok([...h.local.files].some(([k,v])=>k.includes(".sync-conflict-")&&text(v.bytes)==="first"));
   });
 });
@@ -180,5 +180,97 @@ describe("deferred directories cannot starve unrelated safe work", () => {
     const errors:Error[]=[];await executePlan(h.input,p,errors);
     assert.equal(errors.length,12);assert.ok(h.rec("safe.md"));
     assert.ok(errors.every(e=>e.message.includes("目录删除暂缓")));
+  });
+});
+
+
+describe("acknowledged upload followed by a local edit", () => {
+  for (const initial of [true, false]) {
+    for (const sameMetadata of [true, false]) {
+      it(`retries the latest bytes after restart (initial=${initial}, sameMetadata=${sameMetadata})`, async () => {
+        const h = harness();
+        h.local.put("note.md", "first", 30000);
+        if (!initial) { h.remote.put("note.md"); h.seed(record()); }
+        const write = h.remote.writeFileGuarded.bind(h.remote);
+        let inject = true;
+        h.remote.writeFileGuarded = async (...args) => {
+          const result = await write(...args);
+          if (inject) {
+            inject = false;
+            h.local.put("note.md", "later", sameMetadata ? 30000 : 31000);
+          }
+          return result;
+        };
+        const { runSync } = await import("../../../src/nextclaw/syncEngine");
+        assert.equal((await runSync(h.input)).ok, false);
+        assert.equal(text(await h.local.readFile("note.md")), "later");
+        assert.equal(text(await h.remote.readFile("note.md")), "first");
+        assert.equal(h.rec("note.md")?.pendingLocalUpload, true);
+        // No event/pending scheduler state survives into this new engine invocation.
+        assert.equal((await runSync({ ...h.input })).ok, true);
+        assert.equal(text(await h.local.readFile("note.md")), "later");
+        assert.equal(text(await h.remote.readFile("note.md")), "later");
+        assert.equal(h.rec("note.md")?.pendingLocalUpload, undefined);
+        assert.equal((await runSync({ ...h.input })).ok, true);
+        assert.equal(h.last()["note.md"].decision, "none");
+      });
+    }
+  }
+});
+
+
+describe("pending upload recovery keeps conditional-write protection", () => {
+  it("also retains the acknowledged version for a metadata-equal record upload", async () => {
+    const h = harness();
+    h.local.put("note.md", "first", 30000);
+    h.remote.put("note.md", "other", 30000);
+    const write = h.remote.writeFileGuarded.bind(h.remote);
+    h.remote.writeFileGuarded = async (...args) => {
+      const result = await write(...args);
+      h.local.put("note.md", "later", 30000);
+      h.remote.writeFileGuarded = write;
+      return result;
+    };
+    const { runSync } = await import("../../../src/nextclaw/syncEngine");
+    assert.equal((await runSync(h.input)).ok, false);
+    assert.equal(h.rec("note.md")?.pendingLocalUpload, true);
+    assert.equal((await runSync({ ...h.input })).ok, true);
+    assert.equal(text(await h.remote.readFile("note.md")), "later");
+    assert.equal(text(await h.local.readFile("note.md")), "later");
+  });
+  it("leaves a durable pending marker if the post-upload local read fails", async () => {
+    const h = harness();
+    h.local.put("note.md", "first", 30000);
+    const write = h.remote.writeFileGuarded.bind(h.remote);
+    h.remote.writeFileGuarded = async (...args) => {
+      const result = await write(...args);
+      h.local.put("note.md", "later", 30000);
+      h.local.fail = (op, key) => op === "readFile" && key === "note.md";
+      h.remote.writeFileGuarded = write;
+      return result;
+    };
+    const { runSync } = await import("../../../src/nextclaw/syncEngine");
+    assert.equal((await runSync(h.input)).ok, false);
+    assert.equal(h.rec("note.md")?.pendingLocalUpload, true);
+    h.local.fail = () => false;
+    assert.equal((await runSync({ ...h.input })).ok, true);
+    assert.equal(text(await h.remote.readFile("note.md")), "later");
+  });
+  it("does not let pending local bytes bypass a subsequent remote edit", async () => {
+    const h = harness();
+    h.local.put("note.md", "first", 30000);
+    const write = h.remote.writeFileGuarded.bind(h.remote);
+    h.remote.writeFileGuarded = async (...args) => {
+      const result = await write(...args);
+      h.local.put("note.md", "later", 30000);
+      h.remote.writeFileGuarded = write;
+      return result;
+    };
+    const { runSync } = await import("../../../src/nextclaw/syncEngine");
+    assert.equal((await runSync(h.input)).ok, false);
+    h.remote.put("note.md", "third-party remote", 400000);
+    assert.equal((await runSync({ ...h.input })).ok, true);
+    assert.equal(text(await h.remote.readFile("note.md")), "third-party remote");
+    assert.ok([...h.local.files].some(([k,v]) => k.includes(".sync-conflict-") && text(v.bytes) === "later"));
   });
 });

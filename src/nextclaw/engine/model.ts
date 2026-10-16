@@ -82,6 +82,7 @@ export function state(
 ): State {
   if (!record) return e ? "new" : "absent";
   if (!e) return "deleted";
+  if (side === "local" && record.pendingLocalUpload) return "modified";
   const prev = record[side];
   return record.isFolder ||
     (mtime(e, side) === prev.mtime &&
@@ -97,6 +98,7 @@ export function decodeRecord(value: unknown): NextclawSyncRecord | undefined {
     r.v !== 1 ||
     typeof r.key !== "string" ||
     typeof r.isFolder !== "boolean" ||
+    (r.pendingLocalUpload !== undefined && typeof r.pendingLocalUpload !== "boolean") ||
     r.isFolder !== folder(r.key)
   )
     return;
