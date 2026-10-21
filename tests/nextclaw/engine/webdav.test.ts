@@ -41,6 +41,12 @@ function adapter(client: any) {
   );
 }
 describe("§8.1 §8.3 actual WebDAV adapter", () => {
+  it("rejects legacy experimental transport settings before issuing any request", async () => {
+    let calls=0; const fs=adapter({exists:async()=>{calls++;return true;}});
+    fs.webdavConfig.transport="browser";
+    await assert.rejects(fs.stat("/"),/仅支持原生传输/);
+    assert.equal(calls,0);
+  });
   for (const status of [403, 401, 500, 404, undefined])
     it(`rm status ${status}`, async () => {
       const failure = Object.assign(new Error("transport error"), { status });
@@ -130,12 +136,12 @@ describe("§8.1 §8.3 actual WebDAV adapter", () => {
 
 describe("conditional WebDAV operations", () => {
   const version = { key: "a.md", keyRaw: "a.md", sizeRaw: 1, etag: "v1" };
-  function setup(tag = '"v2"') {
+  function setup(tag = '"v2"', status = 204) {
     const requests: any[] = [];
     const client = {
       customRequest: async (key: string, options: any) => {
         requests.push({ key, ...options });
-        return { headers: new Headers({ etag: tag }) };
+        return { status, headers: new Headers({ etag: tag }) };
       },
       stat: async () => ({
         filename: "/vault/a.md",
@@ -168,6 +174,22 @@ describe("conditional WebDAV operations", () => {
     await h.fs.writeFileGuarded("a.md", new ArrayBuffer(1), 0, 0, null);
     assert.equal(h.requests[0].headers["If-None-Match"], "*");
   });
+  for (const status of [200, 201, 204]) {
+    it(`acknowledges a completed conditional PUT with status ${status}`, async () => {
+      const h = setup('"v2"', status);
+      assert.equal((await h.fs.writeFileGuarded("a.md", new ArrayBuffer(1), 0, 0, version)).etag, "v2");
+    });
+  }
+  for (const status of [202, 205, 504]) {
+    it(`does not acknowledge status ${status} even with matching ETags`, async () => {
+      const h = setup('"v2"', status);
+      let reads = 0;
+      const stat = h.client.stat;
+      h.client.stat = async () => { reads++; return await stat(); };
+      await assert.rejects(h.fs.writeFileGuarded("a.md", new ArrayBuffer(1), 0, 0, version), /明确完成回执/);
+      assert.equal(reads, 0);
+    });
+  }
   it("preserves the observed ETag during listing/stat", async () => {
     const h = setup();
     assert.equal((await h.fs.stat("a.md")).etag, "v2");
@@ -302,4 +324,16 @@ describe("real HTTP WebDAV preconditions", () => {
       );
     }
   });
+});
+
+describe("production native request patch registration",()=>{
+ it("all actual dispatches register before requestUrl and strip the local owner header",async()=>{
+  const code=buildSync({stdin:{contents:`export {FakeFsWebdav} from './src/fsWebdav'; export {NativeWriteJournal} from './src/nextclaw/nativeWriteJournal';`,resolveDir:path.resolve(__dirname,"../../.."),loader:"ts"},bundle:true,platform:"node",format:"cjs",write:false,external:["obsidian","webdav/dist/web/index.js"],logLevel:"silent"}).outputFiles[0].text;
+  let patch:any;let seen=0;const entries=new Map<string,string>();const storage={getItem:(k:string)=>entries.get(k)??null,setItem:(k:string,v:string)=>{entries.set(k,v);},removeItem:(k:string)=>{entries.delete(k);}};
+  const mod={exports:{} as any};const load=(name:string)=>name==="obsidian"?{Platform:{isAndroidApp:true},requireApiVersion:()=>true,requestUrl:async(p:any)=>{seen++;assert.equal(entries.size,1);assert.equal(p.headers["x-nextclaw-native-owner"],undefined);return {status:201,arrayBuffer:new ArrayBuffer(0),headers:{etag:'"v2"'}};}}:name==="webdav/dist/web/index.js"?{getPatcher:()=>({patch(_n:string,fn:any){patch=fn;}}),AuthType:{}}:require(name);
+  new Function("require","module","exports",code)(load,mod,mod.exports);const owner=new mod.exports.NativeWriteJournal(storage,"native-vault");
+  const response=await patch({method:"PUT",url:"https://synthetic.invalid/vault/file.md",headers:{"x-nextclaw-native-owner":owner.token,"If-None-Match":"*"},data:new ArrayBuffer(3)});
+  assert.equal(response.status,201);assert.equal(entries.size,0);assert.equal(seen,1);owner.retire();
+  await assert.rejects(patch({method:"DELETE",url:"https://synthetic.invalid/vault/file.md",headers:{}}),/暂停/);assert.equal(seen,1);
+ });
 });

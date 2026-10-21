@@ -42,6 +42,7 @@ describe("production recovery trigger policy", () => {
             : "initRunAfterMilliseconds"
       ] = 30000;
       recover.call({
+        deferredTasks: { disposed: false },
         settings,
         syncQueue: { request: (delay: number) => delays.push(delay) },
       });
@@ -63,10 +64,23 @@ describe("production recovery trigger policy", () => {
     it(`does not introduce unsolicited automatic sync for ${JSON.stringify(settings)}`, () => {
       const delays: number[] = [];
       recover.call({
+        deferredTasks: { disposed: false },
         settings,
         syncQueue: { request: (n: number) => delays.push(n) },
       });
       assert.deepEqual(delays, []);
     });
   }
+});
+
+it("does not schedule recovery after the plugin owner is disposed", () => {
+  let requests = 0;
+  recover.call({deferredTasks:{disposed:true},settings:{syncDirection:"bidirectional",syncOnSaveAfterMilliseconds:30000},syncQueue:{request(){requests++;}}});
+  assert.equal(requests,0);
+});
+
+it("does not inspect unavailable settings or queue recovery during retirement wait",()=>{
+  let requests=0;
+  recover.call({deferredTasks:{disposed:false},initializationWaiting:true,settings:undefined,syncQueue:{request(){requests++;}}});
+  assert.equal(requests,0);
 });

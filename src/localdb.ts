@@ -1,4 +1,4 @@
-import { IdbStore } from "./idbStore";
+import { IdbStore, type IdbConnectionPool } from "./idbStore";
 import { nanoid } from "nanoid";
 
 import type {
@@ -77,7 +77,8 @@ const assertSupportedDBVersion = (oldVer: number) => {
 export const prepareDBs = async (
   vaultBasePath: string,
   vaultRandomIDFromOldConfigFile: string,
-  profileID: string
+  profileID: string,
+  connections?: IdbConnectionPool
 ) => {
   const stores = {
     versionTbl: DEFAULT_TBL_VERSION,
@@ -90,7 +91,7 @@ export const prepareDBs = async (
   };
   const allStores = Object.values(stores);
   const table = (storeName: string) =>
-    new IdbStore(DEFAULT_DB_NAME, storeName, allStores);
+    new IdbStore(DEFAULT_DB_NAME, storeName, allStores, connections);
   const db: InternalDBs = {
     versionTbl: table(stores.versionTbl),
     syncPlansTbl: table(stores.syncPlansTbl),
@@ -352,3 +353,12 @@ export const upsertPluginVersionByVault = async (
     newVersion: newVersion,
   };
 };
+
+/** Persisted separately from success time: pending directories are not failures. */
+export async function upsertPendingDirectoryCountByVault(db: InternalDBs, vaultRandomID: string, count: number) {
+  await db.simpleKVForMiscTbl.setItem(`${vaultRandomID}-pendingDirectories`, count);
+}
+export async function getPendingDirectoryCountByVault(db: InternalDBs, vaultRandomID: string): Promise<number> {
+  const count = await db.simpleKVForMiscTbl.getItem<number>(`${vaultRandomID}-pendingDirectories`);
+  return typeof count === "number" && Number.isSafeInteger(count) && count > 0 ? count : 0;
+}

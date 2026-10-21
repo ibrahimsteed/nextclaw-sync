@@ -35,9 +35,10 @@ export const getFolderLevels = (x: string, addEndingSlash = false) => {
   return res;
 };
 
-export const mkdirpInVault = async (thePath: string, vault: Vault) => {
+export const mkdirpInVault = async (thePath: string, vault: Vault, assertActive: () => void = () => {}) => {
   for (const folder of getFolderLevels(thePath)) {
     if (!(await vault.adapter.exists(folder))) {
+      assertActive();
       await vault.adapter.mkdir(folder);
     }
   }

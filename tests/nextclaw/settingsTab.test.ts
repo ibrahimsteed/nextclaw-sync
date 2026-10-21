@@ -550,3 +550,11 @@ describe("NextClaw 设置页（渲染）：续费按钮", () => {
     assert.equal(r.saves(), 0, "点续费不该改设置");
   });
 });
+
+
+describe("stable native-only transport settings", () => {
+ it("does not expose experimental transport selection", () => {
+  const t = render({username:"s1",address:studentAddr});
+  assert.equal(t.all.some(x => x.name.includes("浏览器传输")), false);
+ });
+});

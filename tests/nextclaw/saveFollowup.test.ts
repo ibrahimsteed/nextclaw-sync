@@ -45,6 +45,7 @@ function harness(mtime = 90) {
         getActiveFile: () => ({ path: "synthetic.md", stat: { mtime } }),
       },
     },
+    deferredTasks: {disposed:false},
     db: {},
     vaultRandomID: "synthetic",
     isSyncing: false,
@@ -134,4 +135,14 @@ describe("save events interleaved with other sync triggers", () => {
       );
     });
   }
+});
+
+describe("retired save events",()=>{
+  it("drops an already queued completion microtask after unload",async()=>{
+    const h=harness();
+    h.event();h.plugin.deferredTasks.disposed=true;
+    for(const fn of h.microtasks)fn();
+    await h.plugin._checkCurrFileModified("FILE_CHANGES");
+    assert.deepEqual(h.calls,[]);
+  });
 });

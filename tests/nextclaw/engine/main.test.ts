@@ -1,3 +1,7 @@
+import { NativeWriteJournal, NativeWritePaused } from "../../../src/nextclaw/nativeWriteJournal";
+import { TRANSPORT_PAUSED } from "../../../src/nextclaw/writeQuarantine";
+import { fence } from "../../../src/nextclaw/loadFence";
+import { DeferredTasks } from "../../../src/nextclaw/deferredTasks";
 import AggregateError from "aggregate-error";
 import { strict as assert } from "assert";
 import { readFileSync } from "fs";
@@ -51,6 +55,10 @@ function mainHarness() {
   // 运行平台：默认移动端；测桌面端拦截时改成 true。
   const platform = { isDesktopApp: false };
   const globals: Record<string, any> = {
+    fence,
+    NativeWriteJournal,
+    NativeWritePaused,
+    TRANSPORT_PAUSED,
     isStudentAccountOnDesktop,
     needsPasswordBeforeSync,
     Platform: platform,
@@ -77,7 +85,7 @@ function mainHarness() {
     shouldReloadAfterFirstASync,
     clearAllPrevSyncRecordByVault,
     // 提示等待不真的等 2.5 秒。
-    window: { setTimeout: (fn: () => void) => (fn(), 0) },
+    window: { localStorage: { getItem: () => null, setItem() {}, removeItem() {} }, setTimeout: (fn: () => void) => (fn(), 0) },
     effectiveIgnorePaths,
     formatReceipt: () => "test switch receipt",
     Notice: class {
@@ -88,6 +96,7 @@ function mainHarness() {
     setIcon: () => {},
     iconNameSyncRunning: "running",
     iconNameSyncWait: "idle",
+    upsertPendingDirectoryCountByVault: async () => {},
     upsertLastSuccessSyncTimeByVault: async () => {},
     upsertLastFailedSyncTimeByVault: async () => {},
     AggregateError,
@@ -107,7 +116,10 @@ function mainHarness() {
   )(...Object.values(globals));
   const executed: string[] = [];
   const plugin: any = {
+    deferredTasks: new DeferredTasks({setTimeout(fn) { queueMicrotask(fn); return 1; }, clearTimeout() {}}),
     isSyncing: false,
+    transportStorageKey: () => "test-vault",
+    transportBlocked: () => plugin.nativeWrites?.blocked() ?? false,
     settings: {
       webdav: { username: "", address: "", password: "" },
       syncDirection: "bidirectional",
@@ -641,5 +653,93 @@ describe("outer sync ownership and recovery reporting", () => {
     };
     await t.run("dry");
     assert.deepEqual(outcomes, []);
+  });
+});
+
+
+describe("unloaded sync owner", () => {
+  it("does not start file or network work from a stale sync callback", async () => {
+    const t = mainHarness();
+    t.plugin.deferredTasks.dispose();
+    assert.equal(await t.run(), "blocked");
+    assert.equal(t.plugin.isSyncing, false);
+  });
+});
+
+describe("sync unloading at asynchronous boundaries", () => {
+  for (const stage of ["walk", "readFile", "writeFileGuarded"] as const) {
+    it(`stops retired work after admitted remote ${stage} settles`, async () => {
+      const t=mainHarness();
+      if(stage==="writeFileGuarded") t.h.local.put("unload.md", "local survives");
+      else t.h.remote.put("unload.md", "remote survives");
+      let entered!:()=>void,finish!:()=>void;const started=new Promise<void>(r=>entered=r);
+      const original=(t.h.remote[stage] as Function).bind(t.h.remote);
+      (t.h.remote as any)[stage]=async(...args:any[])=>{entered();await new Promise<void>(r=>finish=r);return original(...args);};
+      const ui:string[]=[];t.plugin.updateLastSyncMsg=()=>ui.push("status");t.plugin.setCurrSyncMsg=()=>ui.push("progress");t.plugin.syncEvent={trigger(){ui.push("event");}};
+      const running=t.run();await started;const active=t.plugin.activeSync;assert.ok(active);
+      t.plugin.deferredTasks.dispose();const priorUI=ui.length;finish();assert.equal(await running,"blocked");await active;
+      assert.equal(ui.length,priorUI);assert.equal(t.plugin.isSyncing,false);assert.equal(t.plugin.activeSync,undefined);
+      // No follow-up local mutation or conflict copy after the request returned.
+      assert.deepEqual(t.h.local.writes(),[]);
+      assert.equal(await t.run(),"blocked");
+    });
+  }
+  it("does not execute a reload command when unloaded during its delay", async()=>{
+    const t=mainHarness();let started!:()=>void;const waiting=new Promise<void>(r=>started=r);
+    const timers=new Map<number,()=>void>();t.plugin.deferredTasks=new DeferredTasks({setTimeout(fn){timers.set(1,fn);started();return 1;},clearTimeout(id){timers.delete(id);}});
+    t.plugin.settings.nextclawReloadAfterFirstBSync=true;const run=t.run();await waiting;t.plugin.deferredTasks.dispose();assert.equal(await run,"blocked");assert.deepEqual(t.executed,[]);assert.equal(timers.size,0);
+  });
+});
+
+describe("unload during reload settings persistence",()=>{
+  it("does not show a stale reload notice or execute the command after save returns",async()=>{
+    const t=mainHarness();let entered!:()=>void,finish!:()=>void;const waiting=new Promise<void>(r=>entered=r);
+    t.plugin.settings.nextclawReloadAfterFirstBSync=true;
+    t.plugin.saveSettings=async()=>{entered();await new Promise<void>(r=>finish=r);};
+    const run=t.run();await waiting;t.plugin.deferredTasks.dispose();const count=t.notices.length;finish();assert.equal(await run,"blocked");assert.equal(t.notices.length,count);assert.deepEqual(t.executed,[]);
+  });
+});
+
+describe("replacement load awaiting retired native I/O",()=>{
+  it("blocks sync before reading unloaded settings or touching files",async()=>{
+    const t=mainHarness();t.plugin.initializationWaiting=true;t.plugin.settings=undefined;t.plugin.db=undefined;
+    assert.equal(await t.run(),"blocked");assert.deepEqual(t.h.local.calls,[]);assert.equal(t.plugin.isSyncing,false);assert.equal(t.plugin.activeSync,undefined);
+  });
+});
+
+
+describe("persisted unknown remote write",()=>{
+ for(const trigger of ["manual","dry","auto_sync_on_save"]){
+  it(`blocks ${trigger} before adapters, branch switches, or database access`,async()=>{
+   const t=mainHarness();t.plugin.transportBlocked=()=>true;
+   t.plugin.settings=undefined;t.plugin.db=undefined;
+   assert.equal(await t.run(trigger),"blocked");assert.equal(t.plugin.isSyncing,false);
+   if(trigger!=="auto_sync_on_save")assert(t.notices.some(x=>x.includes("写入结果未知")));
+  });
+ }
+});
+
+describe("native unknown write integration",()=>{
+  it("turns unknown dispatch into blocked and cancels a queued tail, with no retry after reload/read",async()=>{
+    const t=mainHarness();t.h.local.put("pending.md","retained");let sends=0,disposed=0;const outcomes:string[]=[];
+    t.plugin.syncQueue={dispose(){disposed++;},finished(x:string){outcomes.push(x);},request(){throw Error("no queued retry");}};
+    t.h.remote.writeFileGuarded=async()=>{
+      await t.plugin.nativeWrites.send("PUT","https://synthetic.invalid/pending.md",null,async()=>{sends++;return {status:504};});
+      throw Error("unreachable");
+    };
+    // This fixture uses a real persistent store; the other main tests never dispatch native writes.
+    const entries=new Map<string,string>();t.plugin.nativeWrites=new NativeWriteJournal({getItem:k=>entries.get(k)??null,setItem:(k,v)=>{entries.set(k,v);},removeItem:k=>{entries.delete(k);}},"test-vault");
+    assert.equal(await t.run("auto"),"blocked");assert.equal(t.plugin.isSyncing,false);assert.equal(disposed,1);assert.deepEqual(outcomes,["blocked"]);
+    assert.equal(await t.run("auto"),"blocked");assert.equal(sends,1);assert.equal(entries.size,1);t.plugin.nativeWrites.retire();
+  });
+});
+
+
+describe("diagnostic errors do not expose stack receivers to the console",()=>{
+  it("logs failed sync diagnostics as strings while preserving the error and stack",async()=>{
+    const t=mainHarness();t.h.remote.fail=op=>op==="walk";const original=console.error,logged:unknown[][]=[];
+    console.error=(...args:unknown[])=>{logged.push(args);};
+    try{assert.equal(await t.run("manual"),"failed");assert.ok(logged.length>0);assert.ok(logged.every(args=>args.every(arg=>typeof arg==="string")));assert.ok(logged.flat().some(arg=>String(arg).includes("injected walk")));}
+    finally{console.error=original;}
   });
 });

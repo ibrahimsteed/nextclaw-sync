@@ -16,13 +16,15 @@ export type { SyncCallbacks, SyncInput, SyncResult } from "./engine/model";
 
 export async function runSync(input: SyncInput): Promise<SyncResult> {
   const { callbacks: cb, triggerSource: source } = input;
-  const result: SyncResult = { ok: false, counts: {}, errors: [] };
+  const result: SyncResult = { ok: false, fullyConverged: false, pendingDirectories: [], counts: {}, errors: [] };
   const meta: {
     mode: string;
     triggerSource: string;
     startedAt: number;
     finishedAt?: number;
     aborted?: "protect" | "error";
+    outcome?: "failed" | "pending" | "converged";
+    pendingDirectories?: string[];
   } = { mode: input.mode, triggerSource: source, startedAt: Date.now() };
   let plan: Record<string, PlanItem> = Object.create(null) as Record<string, PlanItem>;
   try {
@@ -49,9 +51,13 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
     await cb.notify(source, 6);
     plan = buildPlan(input, local, remote, records);
     for (const [key, item] of Object.entries(plan)) {
+      if (key.endsWith("/") && ["deleteLocal", "deleteRemote"].includes(item.decision)) {
+        item.pending = "directory-delete-deferred";
+      }
       result.counts[item.decision] = (result.counts[item.decision] ?? 0) + 1;
       if (item.error) result.errors.push(new Error(`${key}：${item.error}`));
     }
+    result.pendingDirectories = Object.entries(plan).filter(([, item]) => item.pending).map(([key]) => key);
     const protect = protection(plan, input.protectModifyPercentage);
     if (protect.abort) {
       meta.aborted = "protect";
@@ -65,11 +71,16 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
     }
     await cb.notify(source, 7); // Existing UI maps dry + 7 to step7skip.
     if (source !== "dry") await executePlan(input, plan, result.errors);
-    if (!result.errors.length) await cb.notify(source, 8);
+    result.pendingDirectories = Object.entries(plan)
+      .filter(([, item]) => item.pending === "directory-delete-deferred")
+      .map(([key]) => key);
+    if (!result.errors.length && !result.pendingDirectories.length) await cb.notify(source, 8);
   } catch (e) {
     result.errors.push(errorOf(e));
   } finally {
     if (result.errors.length && !meta.aborted) meta.aborted = "error";
+    meta.pendingDirectories = result.pendingDirectories;
+    meta.outcome = result.errors.length ? "failed" : result.pendingDirectories.length ? "pending" : "converged";
     meta.finishedAt = Date.now();
     try {
       await insertSyncPlanRecordByVault(
@@ -88,7 +99,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       result.errors.push(errorOf(e));
     }
     try {
-      await cb.statusBar(source, 8, result.errors.length === 0);
+      await cb.statusBar(source, 8, result.errors.length === 0, result.pendingDirectories.length);
     } catch (e) {
       result.errors.push(errorOf(e));
     }
@@ -105,5 +116,6 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
     }
   }
   result.ok = result.errors.length === 0;
+  result.fullyConverged = result.ok && result.pendingDirectories.length === 0;
   return result;
 }

@@ -23,13 +23,14 @@ export interface PlanItem {
   change: boolean;
   trash?: boolean;
   error?: string;
+  pending?: "directory-delete-deferred";
 }
 type Callback = void | Promise<void>;
 export interface SyncCallbacks {
   markIsSyncing(value: boolean): Callback;
   notify(source: SyncTriggerSourceType, step: number): Callback;
   ribbon(source: SyncTriggerSourceType, step: number): Callback;
-  statusBar(source: SyncTriggerSourceType, step: number, ok: boolean): Callback;
+  statusBar(source: SyncTriggerSourceType, step: number, ok: boolean, pendingDirectories?: number): Callback;
   progress(
     source: SyncTriggerSourceType,
     done: number,
@@ -58,6 +59,8 @@ export interface SyncInput {
 }
 export interface SyncResult {
   ok: boolean;
+  fullyConverged: boolean;
+  pendingDirectories: string[];
   counts: Partial<Record<Decision, number>>;
   errors: Error[];
 }

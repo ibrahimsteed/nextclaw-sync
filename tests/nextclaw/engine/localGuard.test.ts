@@ -12,7 +12,7 @@ const code = buildSync({
   external: ["obsidian"],
   logLevel: "silent",
 }).outputFiles[0].text;
-function host(renameOverwrites = false) {
+function host(renameOverwrites = false, assertActive: () => void = () => {}) {
   const files = new Map<string, ArrayBuffer>();
   const directories = new Set(["", ".obsidian"]);
   let beforeProcess = () => {},
@@ -86,7 +86,8 @@ function host(renameOverwrites = false) {
     false,
     ".obsidian",
     "nextclaw-sync",
-    "obsidian"
+    "obsidian",
+    assertActive
   );
   return {
     files,
@@ -259,5 +260,48 @@ describe("local discovery uses the same metadata source as mutation guards", () 
   it("does not treat an I/O error as a deleted local file", async () => {
     const fs = scannedHost(async () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); });
     await assert.rejects(fs.walk(), /denied/);
+  });
+});
+
+
+describe("local callbacks respect pause and unloaded owners", () => {
+  for (const reason of ["unknown write paused", "plugin unloaded"]) {
+    it(`does not commit a queued process callback after ${reason}`, async () => {
+      let blocked = false;
+      const h = host(false, () => { if (blocked) throw Error(reason); });
+      h.files.set("late.md", bytes("old"));
+      const version = await h.fs.stat("late.md");
+      h.setBeforeProcess(() => { blocked = true; });
+      await assert.rejects(h.fs.writeFileGuarded("late.md", bytes("remote"), 10000, 10000, version, bytes("old")), new RegExp(reason));
+      assert.equal(text(h.files.get("late.md")!), "old");
+    });
+  }
+});
+
+
+describe("local publication boundaries after asynchronous work",()=>{
+  it("retains staged bytes without publishing after a pause",async()=>{
+    let paused=false;const h=host(false,()=>{if(paused)throw Error("paused");});
+    const write=h.fs.vault.adapter.writeBinary;h.fs.vault.adapter.writeBinary=async(p:string,b:ArrayBuffer)=>{await write(p,b);if(p.endsWith("/incoming"))paused=true;};
+    await assert.rejects(h.fs.writeFileGuarded("new.md",bytes("incoming"),10000,10000,null),/paused/);
+    assert.equal(h.files.has("new.md"),false);assert.ok([...h.files].some(([p,b])=>p.endsWith("/incoming")&&text(b)==="incoming"));
+  });
+  it("does not start removal after its validation wait was revoked",async()=>{
+    let paused=false;const h=host(false,()=>{if(paused)throw Error("paused");});h.files.set("old.md",bytes("old"));
+    const version=await h.fs.stat("old.md"),stat=h.fs.vault.adapter.stat;h.fs.vault.adapter.stat=async(p:string)=>{const result=await stat(p);paused=true;return result;};
+    await assert.rejects(h.fs.rmGuarded("old.md",version,bytes("old")),/paused/);assert.equal(text(h.files.get("old.md")!),"old");
+  });
+  it("preserves the actual retained binary if revoked before publication",async()=>{
+    let paused=false;const h=host(false,()=>{if(paused)throw Error("paused");}),old=new Uint8Array([255,0,1]).buffer,next=new Uint8Array([254,0,2]).buffer;h.files.set("old.bin",old);
+    const version=await h.fs.stat("old.bin"),rename=h.fs.vault.adapter.rename;h.fs.vault.adapter.rename=async(p:string,q:string)=>{await rename(p,q);if(p==="old.bin")paused=true;};
+    await assert.rejects(h.fs.writeFileGuarded("old.bin",next,10000,10000,version,old),/paused/);
+    assert.equal(h.files.has("old.bin"),false);assert.ok([...h.files].some(([p,b])=>p.startsWith(".trash/nextclaw-recovery-")&&Buffer.from(b).equals(Buffer.from(old))));assert.ok(![...h.files.values()].some(b=>Buffer.from(b).equals(Buffer.from(next))));
+  });
+  it("an interrupted probe does not poison the following load's adapter",async()=>{
+    let paused=false,interrupt=true;const h=host(false,()=>{if(paused)throw Error("unloaded");});const mkdir=h.fs.vault.adapter.mkdir;
+    h.fs.vault.adapter.mkdir=async(p:string)=>{await mkdir(p);if(interrupt){paused=true;interrupt=false;}};
+    await assert.rejects(h.fs.writeFileGuarded("new.md",bytes("new"),10000,10000,null),/unloaded/);paused=false;
+    const replacement=new h.fs.constructor(h.fs.vault,true,false,".obsidian","nextclaw-sync","obsidian",()=>{if(paused)throw Error("unloaded");});
+    await replacement.writeFileGuarded("new.md",bytes("new"),10000,10000,null);assert.equal(text(h.files.get("new.md")!),"new");
   });
 });

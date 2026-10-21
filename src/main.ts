@@ -1,3 +1,8 @@
+import { NativeWriteJournal, NativeWritePaused } from "./nextclaw/nativeWriteJournal";
+import { mutationPending, TRANSPORT_PAUSED } from "./nextclaw/writeQuarantine";
+import { fence, hasRetiredLoad, retireLoad } from "./nextclaw/loadFence";
+import { IdbConnectionPool } from "./idbStore";
+import { DeferredTasks } from "./nextclaw/deferredTasks";
 import { SyncQueue } from "./nextclaw/syncQueue";
 // biome-ignore lint/suspicious/noShadowRestrictedNames: <explanation>
 import AggregateError from "aggregate-error";
@@ -26,6 +31,8 @@ import {
   insertSyncPlanRecordByVault,
   clearAllLoggerOutputRecords,
   clearExpiredSyncPlanRecords,
+  getPendingDirectoryCountByVault,
+  upsertPendingDirectoryCountByVault,
   getLastFailedSyncTimeByVault,
   getLastSuccessSyncTimeByVault,
   prepareDBs,
@@ -160,6 +167,19 @@ const getStatusBarShortMsgFromSyncSource = (
 };
 
 export default class NextclawSyncPlugin extends Plugin {
+  private readonly databaseConnections = new IdbConnectionPool();
+  private readonly deferredTasks = new DeferredTasks();
+  private activeSync?: Promise<void>;
+  private pendingDirectoryCount = 0;
+  private nativeWrites?: NativeWriteJournal;
+  private pausedNoticeShown = false;
+  private transportStorageKey() { return `nextclaw-uncertain-write:${this.getVaultBasePath()}`; }
+  private transportBlocked() {
+    try { return this.nativeWrites ? this.nativeWrites.blocked() : mutationPending(window.localStorage, this.transportStorageKey()); }
+    catch { return true; } // Storage unavailable: do not dispatch unjournalled writes.
+  }
+
+  private initializationWaiting = false;
   settings!: NextclawSyncSettings;
   db!: InternalDBs;
   isSyncing!: boolean;
@@ -187,6 +207,13 @@ export default class NextclawSyncPlugin extends Plugin {
   async syncRun(
     triggerSource: SyncTriggerSourceType = "manual"
   ): Promise<"ok" | "failed" | "blocked"> {
+    if (this.deferredTasks.disposed || this.initializationWaiting) return "blocked";
+    if (this.transportBlocked?.()) {
+      this.syncQueue?.dispose();
+      if (!this.pausedNoticeShown || triggerSource === "manual" || triggerSource === "dry") new Notice(TRANSPORT_PAUSED, 15000);
+      this.pausedNoticeShown = true;
+      return "blocked";
+    }
     if (this.isSyncing) {
       if (triggerSource !== "dry") this.syncQueue?.request(3000);
       if (triggerSource === "manual" || triggerSource === "dry")
@@ -231,22 +258,32 @@ export default class NextclawSyncPlugin extends Plugin {
       return "blocked";
     }
     this.isSyncing = true;
+    let finish!: () => void;
+    this.activeSync = new Promise<void>((resolve) => { finish = resolve; });
+    const stopped = () => this.deferredTasks.disposed;
     const startedAt = Date.now();
     let outcome: "ok" | "failed" | "blocked" = "blocked";
     try {
-      const fsLocal = new FakeFsLocal(
+      const assertLocalActive = () => {
+        if (stopped()) throw new Error("NextClaw plugin load has been unloaded");
+        if (this.nativeWrites?.blocked()) throw new NativeWritePaused();
+      };
+      const fsLocal = fence(new FakeFsLocal(
         this.app.vault,
         this.settings.syncConfigDir ?? false,
         false,
         this.app.vault.configDir,
         this.manifest.id,
-        this.settings.deleteToWhere ?? "obsidian" // NextClaw
-      );
-      const fsRemote = getClient(
+        this.settings.deleteToWhere ?? "obsidian", // NextClaw
+        assertLocalActive
+      ), () => stopped() || (this.nativeWrites?.blocked() ?? false));
+      this.nativeWrites ??= new NativeWriteJournal(window.localStorage, this.transportStorageKey());
+      const fsRemote = fence(getClient(
         this.settings,
         this.app.vault.getName(),
-        async () => await this.saveSettings()
-      );
+        async () => { if (!stopped()) await this.saveSettings(); },
+        this.nativeWrites
+      ), stopped);
 
       const t = (x: TransItemType, vars?: TransVars) => {
         return this.i18n.t(x, vars);
@@ -282,6 +319,7 @@ export default class NextclawSyncPlugin extends Plugin {
       };
 
       const notifyFunc = async (s: SyncTriggerSourceType, step: number) => {
+        if (stopped()) return;
         switch (step) {
           case 0:
             if (s === "dry") {
@@ -382,7 +420,9 @@ export default class NextclawSyncPlugin extends Plugin {
       };
 
       const errNotifyFunc = async (s: SyncTriggerSourceType, error: Error) => {
-        console.error(error);
+        if (stopped()) return;
+        // Console Error objects retain lazy stack receivers (including retired loads).
+        console.error(error.stack ?? error.message);
         if (error instanceof AggregateError) {
           for (const e of error.errors) {
             getNotice(s, (e as Error).message, 10 * 1000);
@@ -393,6 +433,7 @@ export default class NextclawSyncPlugin extends Plugin {
       };
 
       const ribboonFunc = async (s: SyncTriggerSourceType, step: number) => {
+        if (stopped()) return;
         if (step === 1) {
           if (this.syncRibbon !== undefined) {
             setIcon(this.syncRibbon, iconNameSyncRunning);
@@ -417,19 +458,27 @@ export default class NextclawSyncPlugin extends Plugin {
       const statusBarFunc = async (
         s: SyncTriggerSourceType,
         step: number,
-        everythingOk: boolean
+        everythingOk: boolean,
+        pendingDirectories = 0
       ) => {
+        if (stopped()) return;
+        const previousPending = this.pendingDirectoryCount;
+        if (step === 8 && s !== "dry" && (everythingOk || pendingDirectories > 0)) {
+          await upsertPendingDirectoryCountByVault(this.db, this.vaultRandomID, pendingDirectories);
+          if (stopped()) return;
+          this.pendingDirectoryCount = pendingDirectories;
+        }
         if (step === 1) {
-          // change status to "syncing..." on statusbar
           this.updateLastSyncMsg(s, "syncing", -1, -1);
         } else if (step === 8 && everythingOk) {
+          if (!stopped() && pendingDirectories && pendingDirectories !== previousPending) new Notice(`文件同步成功；${pendingDirectories} 个目录删除待处理，已安全跳过。尚未全部收敛。`, 10000);
           const ts = Date.now();
           await upsertLastSuccessSyncTimeByVault(
             this.db,
             this.vaultRandomID,
             ts
           );
-          this.updateLastSyncMsg(s, "not_syncing", ts, null); // hack: 'not_syncing'
+          if (!stopped()) this.updateLastSyncMsg(s, "not_syncing", ts, null); // hack: 'not_syncing'
         } else if (!everythingOk) {
           const ts = Date.now();
           await upsertLastFailedSyncTimeByVault(
@@ -437,7 +486,7 @@ export default class NextclawSyncPlugin extends Plugin {
             this.vaultRandomID,
             ts
           );
-          this.updateLastSyncMsg(s, "not_syncing", null, ts);
+          if (!stopped()) this.updateLastSyncMsg(s, "not_syncing", null, ts);
         }
       };
 
@@ -453,6 +502,7 @@ export default class NextclawSyncPlugin extends Plugin {
         pathName: string,
         decision: string
       ) => {
+        if (stopped()) return;
         this.setCurrSyncMsg(
           t,
           s,
@@ -502,15 +552,20 @@ export default class NextclawSyncPlugin extends Plugin {
           }
           return "blocked";
         }
-        if (!(await confirmExistingVault(this.app, t, guard))) {
+        const confirmed = await confirmExistingVault(this.app, t, guard);
+        if (stopped()) return "blocked";
+        if (!confirmed) {
           new Notice(t("nextclaw_guard_cancelled"));
           return "blocked";
         }
+        if (stopped()) return "blocked";
         if (guard.kind === "first-demo-sync") {
           this.settings.nextclawExistingVaultAcknowledged = true;
           await this.saveSettings();
         }
       }
+
+      if (stopped()) return "blocked";
 
       // NextClaw：A→B 切换，必须在本次同步**开始之前**做完。
       // 枚举本地 → 删配置目录与 .trash 以外的全部顶层条目 → 清 prevSync。
@@ -576,17 +631,18 @@ export default class NextclawSyncPlugin extends Plugin {
         },
       });
 
+      if (stopped()) return "blocked";
       outcome = result.ok ? "ok" : "failed";
 
       const reloadDeps = {
         settings: this.settings,
-        saveSettings: async () => await this.saveSettings(),
-        notice: (message: string, timeoutMs: number) =>
-          new Notice(message, timeoutMs),
-        commands: (this.app as unknown as { commands: ReloadDeps["commands"] })
-          .commands,
-        delay: (ms: number) =>
-          new Promise<void>((resolve) => window.setTimeout(resolve, ms)),
+        saveSettings: async () => { if (!stopped()) await this.saveSettings(); },
+        notice: (message: string, timeoutMs: number) => {
+          if (!stopped()) new Notice(message, timeoutMs);
+        },
+        commands: fence((this.app as unknown as { commands: ReloadDeps["commands"] })
+          .commands, stopped),
+        delay: (ms: number) => this.deferredTasks.wait(ms),
       };
       if (
         shouldReloadAfterSync({
@@ -612,241 +668,326 @@ export default class NextclawSyncPlugin extends Plugin {
         await reloadAfterFirstASync(reloadDeps);
       }
     } catch (error) {
+      if (stopped()) return "blocked";
       outcome = "failed";
-      await insertSyncPlanRecordByVault(
-        this.db,
-        {
-          "/$@meta": {
-            mode:
-              this.settings.syncDirection === "incremental_pull_only"
-                ? "A"
-                : this.settings.syncDirection === "bidirectional"
-                  ? "B"
-                  : "invalid",
-            triggerSource,
-            startedAt,
-            finishedAt: Date.now(),
-            aborted: "error",
-            error: error instanceof Error ? error.message : String(error),
+      try {
+        await insertSyncPlanRecordByVault(
+          this.db,
+          {
+            "/$@meta": {
+              mode:
+                this.settings.syncDirection === "incremental_pull_only"
+                  ? "A"
+                  : this.settings.syncDirection === "bidirectional"
+                    ? "B"
+                    : "invalid",
+              triggerSource,
+              startedAt,
+              finishedAt: Date.now(),
+              aborted: "error",
+              error: error instanceof Error ? error.message : String(error),
+            },
           },
-        },
-        this.vaultRandomID,
-        "webdav"
-      );
-      await upsertLastFailedSyncTimeByVault(
-        this.db,
-        this.vaultRandomID,
-        Date.now()
-      );
+          this.vaultRandomID,
+          "webdav"
+        );
+        await upsertLastFailedSyncTimeByVault(
+          this.db,
+          this.vaultRandomID,
+          Date.now()
+        );
+      } catch (receiptError) {
+        if (!stopped()) console.error("NextClaw failure receipt could not be saved",
+          receiptError instanceof Error ? receiptError.stack ?? receiptError.message : String(receiptError));
+      }
+      if (stopped()) return "blocked";
       this.updateLastSyncMsg(triggerSource, "not_syncing", null, Date.now());
       if (triggerSource === "manual" || triggerSource === "dry")
         new Notice(error instanceof Error ? error.message : String(error));
     } finally {
+      if (this.transportBlocked()) {
+        outcome = "blocked";
+        this.syncQueue?.dispose();
+        if (!stopped()) {
+          if (!this.pausedNoticeShown) new Notice(TRANSPORT_PAUSED, 15000);
+          this.pausedNoticeShown = true;
+          this.updateLastSyncMsg(triggerSource, "not_syncing", null, Date.now());
+          if (this.statusBarElement) this.statusBarElement.setText("写入结果未知；同步已暂停");
+        }
+      }
       this.isSyncing = false;
-      if (triggerSource !== "dry") {
+      finish();
+      this.activeSync = undefined;
+      if (!stopped() && triggerSource !== "dry") {
         const retryEnabled = this.settings.syncDirection === "bidirectional" &&
           ((this.settings.autoRunEveryMilliseconds ?? -1) > 0 ||
            (this.settings.syncOnSaveAfterMilliseconds ?? -1) > 0 ||
            (this.settings.initRunAfterMilliseconds ?? -1) > 0);
         this.syncQueue?.finished(outcome === "failed" && !retryEnabled ? "blocked" : outcome);
       }
-      this.syncEvent?.trigger("SYNC_DONE");
+      if (!stopped()) this.syncEvent?.trigger("SYNC_DONE");
     }
     return outcome;
   }
 
   async onload() {
-    this.currSyncMsg = "";
-    this.isSyncing = false;
-    this.hasPendingSyncOnSave = false;
-
-    this.syncEvent = new Events();
-
-    await this.loadSettings();
-
-    // MUST after loadSettings and before prepareDB
-    const profileID: string = this.getCurrProfileID();
-
-    // lang should be load early, but after settings
-    this.i18n = new I18n(this.settings.lang!, async (lang: LangTypeAndAuto) => {
-      this.settings.lang = lang;
-      await this.saveSettings();
-    });
-    const t = (x: TransItemType, vars?: TransVars) => {
-      return this.i18n.t(x, vars);
-    };
-
-    void this.tryToAddIgnoreFile();
-
-    const vaultBasePath = this.getVaultBasePath();
-
-    try {
-      await this.prepareDBAndVaultRandomID(vaultBasePath, profileID);
-    } catch (err) {
-      new Notice(
-        err instanceof Error
-          ? err.message
-          : "error of prepareDBAndVaultRandomID",
-        10 * 1000
-      );
-      throw err;
+    const path = this.getVaultBasePath();
+    if (!hasRetiredLoad(window, path)) {
+      await this.initialize();
+      return;
     }
+    // Native requestUrl has no cancellation API. Do not overlap uncertain old
+    // writes, but do not keep Obsidian's plugin loader awaiting them either.
+    this.initializationWaiting = true;
+    this.isSyncing = false;
+    const failureMessage = "NextClaw Sync：初始化失败，请重新加载插件或重启 Obsidian。";
+    const message = "NextClaw Sync：上一轮同步尚未结束，正在等待。若长时间不恢复，请彻底退出并重新打开 Obsidian。";
+    const ribbon = this.addRibbonIcon(iconNameSyncWait, message, () => new Notice(message, 10000));
+    this.deferredTasks.schedule(() => {
+      if (this.initializationWaiting) new Notice(message, 10000);
+    }, 15000);
+    const check = () => {
+      if (hasRetiredLoad(window, path)) {
+        this.deferredTasks.schedule(check, 1000);
+        return;
+      }
+      ribbon.remove();
+      this.deferredTasks.run(async () => {
+        try {
+          await this.initialize();
+          if (!this.deferredTasks.disposed) {
+            this.initializationWaiting = false;
+            this.requestRecoverySync();
+          }
+        } catch (error) {
+          if (!this.deferredTasks.disposed) new Notice(failureMessage, 10000);
+          throw error;
+        }
+      });
+    };
+    // Polling is owned/cancelled by this load. Awaiting the old promise here
+    // would retain every replacement load forever if the native call hung.
+    this.deferredTasks.schedule(check, 1000);
+  }
 
-    // must AFTER preparing DB
-    this.enableAutoClearOutputToDBHistIfSet();
+  private async initialize() {
+    try {
+      this.currSyncMsg = "";
+      this.isSyncing = false;
+      this.hasPendingSyncOnSave = false;
 
-    // must AFTER preparing DB
-    this.enableAutoClearSyncPlanHist();
+      this.syncEvent = new Events();
 
-    this.syncRibbon = this.addRibbonIcon(
-      iconNameSyncWait,
-      `${this.manifest.name}`,
-      async () => this.syncRun("manual")
-    );
+      if (this.deferredTasks.disposed) return;
+      await this.loadSettings();
+      if (this.deferredTasks.disposed) return;
 
-    this.enableMobileStatusBarIfSet();
+      // MUST after loadSettings and before prepareDB
+      const profileID: string = this.getCurrProfileID();
 
-    // Create Status Bar Item
-    if (
-      (!Platform.isMobile ||
-        (Platform.isMobile && this.settings.enableMobileStatusBar)) &&
-      this.settings.enableStatusBarInfo === true
-    ) {
-      const statusBarItem = this.addStatusBarItem();
-      this.statusBarElement = statusBarItem.createSpan();
-      this.statusBarElement.setAttribute("data-tooltip-position", "top");
+      // lang should be load early, but after settings
+      this.i18n = new I18n(this.settings.lang!, async (lang: LangTypeAndAuto) => {
+        this.settings.lang = lang;
+        await this.saveSettings();
+      });
+      const t = (x: TransItemType, vars?: TransVars) => {
+        return this.i18n.t(x, vars);
+      };
 
-      if (!this.isSyncing) {
-        this.updateLastSyncMsg(
-          undefined,
-          "not_syncing",
-          await getLastSuccessSyncTimeByVault(this.db, this.vaultRandomID),
-          await getLastFailedSyncTimeByVault(this.db, this.vaultRandomID)
+      this.deferredTasks.run(() => this.tryToAddIgnoreFile());
+
+      const vaultBasePath = this.getVaultBasePath();
+
+      try {
+        await this.prepareDBAndVaultRandomID(vaultBasePath, profileID);
+      } catch (err) {
+        if (this.deferredTasks.disposed) return;
+        new Notice(
+          err instanceof Error
+            ? err.message
+            : "error of prepareDBAndVaultRandomID",
+          10 * 1000
+        );
+        throw err;
+      }
+
+      if (this.deferredTasks.disposed) return;
+
+      // must AFTER preparing DB
+      this.enableAutoClearOutputToDBHistIfSet();
+
+      // must AFTER preparing DB
+      this.enableAutoClearSyncPlanHist();
+
+      this.syncRibbon = this.addRibbonIcon(
+        iconNameSyncWait,
+        `${this.manifest.name}`,
+        async () => this.syncRun("manual")
+      );
+
+      this.enableMobileStatusBarIfSet();
+
+      // Create Status Bar Item
+      if (
+        (!Platform.isMobile ||
+          (Platform.isMobile && this.settings.enableMobileStatusBar)) &&
+        this.settings.enableStatusBarInfo === true
+      ) {
+        const statusBarItem = this.addStatusBarItem();
+        this.statusBarElement = statusBarItem.createSpan();
+        this.statusBarElement.setAttribute("data-tooltip-position", "top");
+
+        try {
+          if (!this.isSyncing) {
+            this.pendingDirectoryCount = await getPendingDirectoryCountByVault(this.db, this.vaultRandomID);
+            if (this.deferredTasks.disposed) return;
+            this.updateLastSyncMsg(
+              undefined,
+              "not_syncing",
+              await getLastSuccessSyncTimeByVault(this.db, this.vaultRandomID),
+              await getLastFailedSyncTimeByVault(this.db, this.vaultRandomID)
+            );
+          }
+        } catch (error) {
+          if (this.deferredTasks.disposed) return;
+          throw error;
+        }
+        if (this.deferredTasks.disposed) return;
+        // update statusbar text every 30 seconds
+        const refreshLastSyncMsg = async () => {
+          if (!this.isSyncing) {
+            this.pendingDirectoryCount = await getPendingDirectoryCountByVault(this.db, this.vaultRandomID);
+            if (this.deferredTasks.disposed) return;
+            this.updateLastSyncMsg(
+              undefined,
+              "not_syncing",
+              await getLastSuccessSyncTimeByVault(this.db, this.vaultRandomID),
+              await getLastFailedSyncTimeByVault(this.db, this.vaultRandomID)
+            );
+          }
+        };
+        this.registerInterval(
+          window.setInterval(() => this.deferredTasks.run(refreshLastSyncMsg), 1000 * 30)
         );
       }
-      // update statusbar text every 30 seconds
-      const refreshLastSyncMsg = async () => {
-        if (!this.isSyncing) {
-          this.updateLastSyncMsg(
-            undefined,
-            "not_syncing",
-            await getLastSuccessSyncTimeByVault(this.db, this.vaultRandomID),
-            await getLastFailedSyncTimeByVault(this.db, this.vaultRandomID)
+
+      if (this.deferredTasks.disposed) return;
+
+      this.addCommand({
+        id: "start-sync",
+        name: t("command_startsync"),
+        icon: iconNameSyncWait,
+        callback: async () => {
+          void this.syncRun("manual");
+        },
+      });
+
+      this.addCommand({
+        id: "start-sync-dry-run",
+        name: t("command_drynrun"),
+        icon: iconNameSyncWait,
+        callback: async () => {
+          void this.syncRun("dry");
+        },
+      });
+
+      this.addCommand({
+        id: "export-sync-plans-1-only-change",
+        name: t("command_exportsyncplans_1_only_change"),
+        icon: iconNameLogs,
+        callback: async () => {
+          await exportVaultSyncPlansToFiles(
+            this.db,
+            this.app.vault,
+            this.vaultRandomID,
+            1,
+            true
           );
-        }
-      };
-      this.registerInterval(
-        window.setInterval(() => void refreshLastSyncMsg(), 1000 * 30)
+          new Notice(t("settings_syncplans_notice"));
+        },
+      });
+
+      this.addCommand({
+        id: "export-sync-plans-1",
+        name: t("command_exportsyncplans_1"),
+        icon: iconNameLogs,
+        callback: async () => {
+          await exportVaultSyncPlansToFiles(
+            this.db,
+            this.app.vault,
+            this.vaultRandomID,
+            1,
+            false
+          );
+          new Notice(t("settings_syncplans_notice"));
+        },
+      });
+
+      this.addCommand({
+        id: "export-sync-plans-5",
+        name: t("command_exportsyncplans_5"),
+        icon: iconNameLogs,
+        callback: async () => {
+          await exportVaultSyncPlansToFiles(
+            this.db,
+            this.app.vault,
+            this.vaultRandomID,
+            5,
+            false
+          );
+          new Notice(t("settings_syncplans_notice"));
+        },
+      });
+
+      this.addCommand({
+        id: "export-sync-plans-all",
+        name: t("command_exportsyncplans_all"),
+        icon: iconNameLogs,
+        callback: async () => {
+          await exportVaultSyncPlansToFiles(
+            this.db,
+            this.app.vault,
+            this.vaultRandomID,
+            -1,
+            false
+          );
+          new Notice(t("settings_syncplans_notice"));
+        },
+      });
+
+      this.addSettingTab(new NextclawSyncSettingTab(this.app, this));
+
+      this.syncQueue = new SyncQueue(async () => {
+        if (this.isSyncing) return "blocked";
+        return await this.syncRun("auto_sync_on_save");
+      });
+      this.registerDomEvent(window, "online", () => this.requestRecoverySync());
+      this.registerDomEvent(document, "visibilitychange", () => {
+        if (document.visibilityState === "visible") this.requestRecoverySync();
+      });
+      // Intent is reconstructed from disk and the journal after reload, not mtime
+      // versus a previous completion timestamp. Respect all-auto-off and mode A.
+      this.app.workspace.onLayoutReady(() => this.requestRecoverySync());
+      this.enableAutoSyncIfSet();
+      this.enableInitSyncIfSet();
+      this.toggleSyncOnSaveIfSet();
+
+      await upsertPluginVersionByVault(
+        this.db,
+        this.vaultRandomID,
+        this.manifest.version
       );
+    } catch (error) {
+      if (!this.deferredTasks.disposed) throw error;
     }
-
-    this.addCommand({
-      id: "start-sync",
-      name: t("command_startsync"),
-      icon: iconNameSyncWait,
-      callback: async () => {
-        void this.syncRun("manual");
-      },
-    });
-
-    this.addCommand({
-      id: "start-sync-dry-run",
-      name: t("command_drynrun"),
-      icon: iconNameSyncWait,
-      callback: async () => {
-        void this.syncRun("dry");
-      },
-    });
-
-    this.addCommand({
-      id: "export-sync-plans-1-only-change",
-      name: t("command_exportsyncplans_1_only_change"),
-      icon: iconNameLogs,
-      callback: async () => {
-        await exportVaultSyncPlansToFiles(
-          this.db,
-          this.app.vault,
-          this.vaultRandomID,
-          1,
-          true
-        );
-        new Notice(t("settings_syncplans_notice"));
-      },
-    });
-
-    this.addCommand({
-      id: "export-sync-plans-1",
-      name: t("command_exportsyncplans_1"),
-      icon: iconNameLogs,
-      callback: async () => {
-        await exportVaultSyncPlansToFiles(
-          this.db,
-          this.app.vault,
-          this.vaultRandomID,
-          1,
-          false
-        );
-        new Notice(t("settings_syncplans_notice"));
-      },
-    });
-
-    this.addCommand({
-      id: "export-sync-plans-5",
-      name: t("command_exportsyncplans_5"),
-      icon: iconNameLogs,
-      callback: async () => {
-        await exportVaultSyncPlansToFiles(
-          this.db,
-          this.app.vault,
-          this.vaultRandomID,
-          5,
-          false
-        );
-        new Notice(t("settings_syncplans_notice"));
-      },
-    });
-
-    this.addCommand({
-      id: "export-sync-plans-all",
-      name: t("command_exportsyncplans_all"),
-      icon: iconNameLogs,
-      callback: async () => {
-        await exportVaultSyncPlansToFiles(
-          this.db,
-          this.app.vault,
-          this.vaultRandomID,
-          -1,
-          false
-        );
-        new Notice(t("settings_syncplans_notice"));
-      },
-    });
-
-    this.addSettingTab(new NextclawSyncSettingTab(this.app, this));
-
-    this.syncQueue = new SyncQueue(async () => {
-      if (this.isSyncing) return "blocked";
-      return await this.syncRun("auto_sync_on_save");
-    });
-    this.registerDomEvent(window, "online", () => this.requestRecoverySync());
-    this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState === "visible") this.requestRecoverySync();
-    });
-    // Intent is reconstructed from disk and the journal after reload, not mtime
-    // versus a previous completion timestamp. Respect all-auto-off and mode A.
-    this.app.workspace.onLayoutReady(() => this.requestRecoverySync());
-    this.enableAutoSyncIfSet();
-    this.enableInitSyncIfSet();
-    this.toggleSyncOnSaveIfSet();
-
-    await upsertPluginVersionByVault(
-      this.db,
-      this.vaultRandomID,
-      this.manifest.version
-    );
   }
 
   onunload() {
+    this.nativeWrites?.retire();
+    this.deferredTasks.dispose();
+    this._syncOnSaveEvent2.cancel();
+    retireLoad(window, this.getVaultBasePath(), this.activeSync);
+    this.databaseConnections.dispose();
     this.syncQueue?.dispose();
     this.syncRibbon = undefined;
     if (this.appContainerObserver !== undefined) {
@@ -952,6 +1093,7 @@ export default class NextclawSyncPlugin extends Plugin {
   }
 
   async saveSettings() {
+    if (this.deferredTasks.disposed) return;
     if (this.settings.obfuscateSettingFile) {
       await this.saveData(normalConfigToMessy(this.settings));
     } else {
@@ -984,7 +1126,8 @@ export default class NextclawSyncPlugin extends Plugin {
     const { db, vaultRandomID } = await prepareDBs(
       vaultBasePath,
       "",
-      profileID
+      profileID,
+      this.databaseConnections
     );
     this.db = db;
     this.vaultRandomID = vaultRandomID;
@@ -997,6 +1140,7 @@ export default class NextclawSyncPlugin extends Plugin {
       this.settings.autoRunEveryMilliseconds > 0
     ) {
       this.app.workspace.onLayoutReady(() => {
+        if (this.deferredTasks.disposed) return;
         const intervalID = window.setInterval(() => {
           void this.syncRun("auto");
         }, this.settings.autoRunEveryMilliseconds);
@@ -1007,20 +1151,17 @@ export default class NextclawSyncPlugin extends Plugin {
   }
 
   enableInitSyncIfSet() {
-    if (
-      this.settings.initRunAfterMilliseconds !== undefined &&
-      this.settings.initRunAfterMilliseconds !== null &&
-      this.settings.initRunAfterMilliseconds > 0
-    ) {
+    const delay = this.settings.initRunAfterMilliseconds;
+    if (delay !== undefined && delay !== null && delay > 0) {
       this.app.workspace.onLayoutReady(() => {
-        window.setTimeout(() => {
-          void this.syncRun("auto_once_init");
-        }, this.settings.initRunAfterMilliseconds);
+        if (this.deferredTasks.disposed) return;
+        this.deferredTasks.schedule(() => this.syncRun("auto_once_init"), delay);
       });
     }
   }
 
   requestRecoverySync() {
+    if (this.deferredTasks.disposed || this.initializationWaiting) return;
     if (this.settings.syncDirection !== "bidirectional") return;
     if (
       (this.settings.autoRunEveryMilliseconds ?? -1) <= 0 &&
@@ -1032,6 +1173,7 @@ export default class NextclawSyncPlugin extends Plugin {
   }
 
   async _checkCurrFileModified(caller: "SYNC" | "FILE_CHANGES") {
+    if (this.deferredTasks.disposed) return;
     if (this.syncQueue) {
       if (caller === "FILE_CHANGES") this.syncQueue.request();
       return;
@@ -1050,7 +1192,9 @@ export default class NextclawSyncPlugin extends Plugin {
   _syncOnSaveEvent1 = () => {
     // SYNC_DONE fires inside syncRun, before its finally. Defer so the old
     // run cannot clear the running guard belonging to the new queued run.
-    queueMicrotask(() => void this._checkCurrFileModified("SYNC"));
+    queueMicrotask(() => {
+      if (!this.deferredTasks.disposed) void this._checkCurrFileModified("SYNC");
+    });
   };
 
   // 首次变化后等 3 秒再检查，期间的变化合并为一次（不重置计时）。
@@ -1069,6 +1213,7 @@ export default class NextclawSyncPlugin extends Plugin {
       this.settings.syncOnSaveAfterMilliseconds > 0
     ) {
       this.app.workspace.onLayoutReady(() => {
+        if (this.deferredTasks.disposed) return;
         // listen to sync done
         if (this.syncEvent !== undefined) {
           this.registerEvent(
@@ -1093,6 +1238,7 @@ export default class NextclawSyncPlugin extends Plugin {
 
   enableMobileStatusBarIfSet() {
     this.app.workspace.onLayoutReady(() => {
+      if (this.deferredTasks.disposed) return;
       if (Platform.isMobile && this.settings.enableMobileStatusBar) {
         this.appContainerObserver = changeMobileStatusBar("enable");
       }
@@ -1117,6 +1263,7 @@ export default class NextclawSyncPlugin extends Plugin {
       // 文字每 30 秒才刷新一次，等不到那时候，单独安排一次淡出。
       const remaining = Math.max(SUCCESS_VISIBLE_MS - state.msSinceLastSync, 0);
       this.mobileStatusBarTimer = window.setTimeout(() => {
+        if (this.deferredTasks.disposed) return;
         this.mobileStatusBarTimer = undefined;
         setMobileStatusBarIdle(true);
       }, remaining);
@@ -1159,7 +1306,7 @@ export default class NextclawSyncPlugin extends Plugin {
     lastSuccessSyncMillis: number | null | undefined,
     lastFailedSyncMillis: number | null | undefined
   ) {
-    if (this.statusBarElement === undefined) return;
+    if (this.deferredTasks.disposed || this.statusBarElement === undefined) return;
 
     // console.debug(lastSuccessSyncMillis);
     // console.debug(lastFailedSyncMillis);
@@ -1208,13 +1355,24 @@ export default class NextclawSyncPlugin extends Plugin {
       // TODO: no idea what happened.
     }
 
+    if (this.transportBlocked()) {
+      this.statusBarElement.setText("写入结果未知；同步已暂停");
+      this.statusBarElement.setAttribute("aria-label", TRANSPORT_PAUSED);
+      this.refreshMobileStatusBarVisibility({syncing:false,hasTimestamp:true,isSuccess:false,msSinceLastSync:0});
+      return;
+    }
+    if (syncStatus !== "syncing" && this.pendingDirectoryCount > 0) {
+      const pending = `目录待处理 ${this.pendingDirectoryCount}；未全部收敛`;
+      lastSyncMsg = (isSuccess ? "文件同步成功；" : "同步失败；") + pending;
+      lastSyncLabelMsg = lastSyncMsg + "。目录删除已安全跳过；请查看同步计划中的待处理路径。";
+    }
     this.statusBarElement.setText(lastSyncMsg);
     this.statusBarElement.setAttribute("aria-label", lastSyncLabelMsg);
 
     this.refreshMobileStatusBarVisibility({
       syncing: syncStatus === "syncing",
       hasTimestamp: inputTs > 0,
-      isSuccess,
+      isSuccess: isSuccess && this.pendingDirectoryCount === 0,
       msSinceLastSync: Date.now() - inputTs,
     });
   }
@@ -1232,7 +1390,7 @@ export default class NextclawSyncPlugin extends Plugin {
       `${this.app.vault.configDir}/plugins/${this.manifest.dir}`;
     const pluginConfigDirExists =
       await this.app.vault.adapter.exists(pluginConfigDir);
-    if (!pluginConfigDirExists) {
+    if (this.deferredTasks.disposed || !pluginConfigDirExists) {
       // what happened?
       return;
     }
@@ -1242,7 +1400,7 @@ export default class NextclawSyncPlugin extends Plugin {
     const contentText = "data.json\n";
 
     try {
-      if (!ignoreFileExists) {
+      if (!this.deferredTasks.disposed && !this.transportBlocked() && !ignoreFileExists) {
         await this.app.vault.adapter.write(ignoreFile, contentText);
       }
     } catch {
@@ -1254,10 +1412,12 @@ export default class NextclawSyncPlugin extends Plugin {
     const initClearOutputToDBHistAfterMilliseconds = 1000 * 30;
 
     this.app.workspace.onLayoutReady(() => {
+      if (this.deferredTasks.disposed) return;
       // init run
-      window.setTimeout(() => {
-        void clearAllLoggerOutputRecords(this.db);
-      }, initClearOutputToDBHistAfterMilliseconds);
+      this.deferredTasks.schedule(
+        () => clearAllLoggerOutputRecords(this.db),
+        initClearOutputToDBHistAfterMilliseconds
+      );
     });
   }
 
@@ -1266,14 +1426,16 @@ export default class NextclawSyncPlugin extends Plugin {
     const autoClearSyncPlanHistAfterMilliseconds = 1000 * 60 * 5;
 
     this.app.workspace.onLayoutReady(() => {
+      if (this.deferredTasks.disposed) return;
       // init run
-      window.setTimeout(() => {
-        void clearExpiredSyncPlanRecords(this.db);
-      }, initClearSyncPlanHistAfterMilliseconds);
+      this.deferredTasks.schedule(
+        () => clearExpiredSyncPlanRecords(this.db),
+        initClearSyncPlanHistAfterMilliseconds
+      );
 
       // scheduled run
       const intervalID = window.setInterval(() => {
-        void clearExpiredSyncPlanRecords(this.db);
+        this.deferredTasks.run(() => clearExpiredSyncPlanRecords(this.db));
       }, autoClearSyncPlanHistAfterMilliseconds);
       this.registerInterval(intervalID);
     });

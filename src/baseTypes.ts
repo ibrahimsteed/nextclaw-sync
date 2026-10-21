@@ -17,6 +17,8 @@ export type WebdavDepthType =
   | "manual_infinity";
 
 export interface WebdavConfig {
+  /** Stable candidate only. Persisted experimental values fail closed. */
+  transport?: "native"; // Legacy non-native values are rejected at runtime.
   address: string;
   username: string;
   password: string;

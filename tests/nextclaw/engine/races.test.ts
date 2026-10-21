@@ -167,7 +167,7 @@ describe("source edits during upload", () => {
     assert.equal(text(await h.local.readFile("note.md")),"later");
     assert.equal(text(await h.remote.readFile("note.md")),"first");
     assert.ok(errors.length);assert.equal(h.rec("note.md")?.pendingLocalUpload,true);
-    assert.ok([...h.local.files].some(([k,v])=>k.includes(".sync-conflict-")&&text(v.bytes)==="first"));
+    assert.equal([...h.local.files.keys()].some(k=>k.includes(".sync-conflict-")),false);
   });
 });
 
@@ -178,8 +178,8 @@ describe("deferred directories cannot starve unrelated safe work", () => {
     h.local.put("safe.md","same");h.remote.put("safe.md","same");
     const p=buildPlan(h.input,await h.local.walk(),await h.remote.walk(),Object.values(h.records));
     const errors:Error[]=[];await executePlan(h.input,p,errors);
-    assert.equal(errors.length,12);assert.ok(h.rec("safe.md"));
-    assert.ok(errors.every(e=>e.message.includes("目录删除暂缓")));
+    assert.equal(errors.length,0);assert.ok(h.rec("safe.md"));
+    assert.equal(Object.values(p).filter(x => x.pending === "directory-delete-deferred").length,12);
   });
 });
 
@@ -206,11 +206,13 @@ describe("acknowledged upload followed by a local edit", () => {
         assert.equal(text(await h.local.readFile("note.md")), "later");
         assert.equal(text(await h.remote.readFile("note.md")), "first");
         assert.equal(h.rec("note.md")?.pendingLocalUpload, true);
+        assert.equal([...h.local.files.keys()].some(k => k.includes(".sync-conflict-")), false);
         // No event/pending scheduler state survives into this new engine invocation.
         assert.equal((await runSync({ ...h.input })).ok, true);
         assert.equal(text(await h.local.readFile("note.md")), "later");
         assert.equal(text(await h.remote.readFile("note.md")), "later");
         assert.equal(h.rec("note.md")?.pendingLocalUpload, undefined);
+        assert.equal([...h.local.files.keys()].some(k => k.includes(".sync-conflict-")), false);
         assert.equal((await runSync({ ...h.input })).ok, true);
         assert.equal(h.last()["note.md"].decision, "none");
       });

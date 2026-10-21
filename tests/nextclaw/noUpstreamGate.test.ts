@@ -17,6 +17,6 @@ describe("NextClaw：启动时不经过上游的「同步算法有重大更新�
     const i = mainTs.indexOf("async onload()");
     const j = mainTs.indexOf("async onunload()");
     const onload = mainTs.slice(i, j);
-    assert.match(onload, /\n    this\.enableAutoSyncIfSet\(\);\n    this\.enableInitSyncIfSet\(\);\n    this\.toggleSyncOnSaveIfSet\(\);\n/);
+    assert.match(onload, /\n\s+this\.enableAutoSyncIfSet\(\);\n\s+this\.enableInitSyncIfSet\(\);\n\s+this\.toggleSyncOnSaveIfSet\(\);\n/);
   });
 });

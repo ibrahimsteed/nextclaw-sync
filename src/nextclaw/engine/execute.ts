@@ -1,3 +1,4 @@
+import { NativeWritePaused } from "../nativeWriteJournal";
 import { nanoid } from "nanoid";
 import { assertVersion, equalBytes, SyncConflict } from "./versionGuard";
 import {
@@ -70,6 +71,7 @@ export async function executePlan(
 ) {
   const { fsLocal: localFs, fsRemote: remoteFs } = input;
   let failures = Object.values(plan).filter((p) => p.error).length;
+  let writePaused = false;
   let done = 0;
   const operations = Object.entries(plan).filter(
     ([, p]) => p.decision !== "none" && p.decision !== "error"
@@ -77,9 +79,18 @@ export async function executePlan(
   const total = operations.length;
   const completed = new Set<string>();
   async function run([key, item]: [string, PlanItem]) {
-    if (failures >= 10) return;
+    // A policy skip performs no I/O and is not an exception. Keep the record so
+    // the unresolved deletion remains observable on every later scan.
+    if (folder(key) && ["deleteLocal", "deleteRemote"].includes(item.decision)) {
+      item.pending = "directory-delete-deferred";
+      item.reason += "；目录删除待处理，已安全跳过；未删除目录";
+      completed.add(key);
+      return;
+    }
+    if (writePaused || failures >= 10) return;
     let attemptedBytes: ArrayBuffer | undefined;
     let uploadedBytes: ArrayBuffer | undefined;
+    let localEditAfterAcknowledgedUpload = false;
     try {
       for (const [other, parent] of Object.entries(plan)) {
         if (
@@ -287,6 +298,10 @@ export async function executePlan(
             pendingRecord
           );
           if (!equalBytes(await localFs.readFile(name(l)), uploadedBytes)) {
+            // The guarded PUT returned an acknowledged version and its pending
+            // record is durable. Keep retrying the newer local bytes, without
+            // treating our own uploaded snapshot as another writer's conflict.
+            localEditAfterAcknowledgedUpload = true;
             throw new SyncConflict("上传期间本地再次修改，已记录传输版本，后续编辑待上传");
           }
         }
@@ -306,10 +321,12 @@ export async function executePlan(
         item.decision
       );
     } catch (e) {
+      if (e instanceof NativeWritePaused) writePaused = true;
       const status = (e as { status?: number }).status;
       let recovery = "";
       if (
         attemptedBytes &&
+        !localEditAfterAcknowledgedUpload &&
         (e instanceof SyncConflict || status === 412 || status === 404)
       ) {
         const dot = key.lastIndexOf(".");
@@ -331,11 +348,7 @@ export async function executePlan(
       }
       const error = new Error(`${key}：${errorOf(e).message}${recovery}`);
       errors.push(error);
-      // Deliberately deferred directories must not exhaust the I/O error budget
-      // and starve unrelated record/clear tasks later in this run.
-      if (
-        !(folder(key) && ["deleteLocal", "deleteRemote"].includes(item.decision))
-      ) failures++;
+      failures++;
       item.error = error.message;
     }
   }
@@ -356,7 +369,7 @@ export async function executePlan(
     Array.from(
       { length: Math.min(concurrency, transfers.length) },
       async () => {
-        while (cursor < transfers.length && failures < 10)
+        while (cursor < transfers.length && failures < 10 && !writePaused)
           await run(transfers[cursor++]);
       }
     )
@@ -379,5 +392,5 @@ export async function executePlan(
     await run(op);
   for (const [key, p] of operations)
     if (!completed.has(key) && !p.error)
-      p.reason += "；累计错误达到上限，本项未启动";
+      p.reason += writePaused ? "；写入结果未知，后续操作已暂停" : "；累计错误达到上限，本项未启动";
 }

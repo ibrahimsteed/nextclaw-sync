@@ -1,3 +1,4 @@
+import { dispatchNative, NATIVE_OWNER_HEADER, type NativeWriteJournal } from "./nextclaw/nativeWriteJournal";
 import { etagHeader, SyncConflict } from "./nextclaw/engine/versionGuard";
 import { Queue } from "@fyears/tsqueue";
 import { getReasonPhrase } from "http-status-codes/build/cjs/utils-functions";
@@ -44,9 +45,11 @@ if (VALID_REQURL) {
     async (...args: unknown[]): Promise<Response> => {
       const options = args[0] as RequestOptionsWithState;
       const transformedHeaders = objKeyToLower({ ...options.headers });
+      const ownerToken = transformedHeaders[NATIVE_OWNER_HEADER];
+      delete transformedHeaders[NATIVE_OWNER_HEADER];
+      delete transformedHeaders["x-nextclaw-local-transport"];
       delete transformedHeaders["host"];
       delete transformedHeaders["content-length"];
-
       const reqContentType =
         transformedHeaders["accept"] ?? transformedHeaders["content-type"];
 
@@ -59,7 +62,9 @@ if (VALID_REQURL) {
         throw: false,
       };
 
-      let r = await requestUrl(p);
+      let r = await dispatchNative(ownerToken, p.method!, p.url,
+        transformedHeaders["if-match"] ?? transformedHeaders["if-none-match"] ?? null,
+        () => requestUrl(p));
 
       if (
         r.status === 401 &&
@@ -221,7 +226,8 @@ export class FakeFsWebdav extends FakeFs {
   constructor(
     webdavConfig: WebdavConfig,
     vaultName: string,
-    saveUpdatedConfigFunc: () => Promise<void>
+    saveUpdatedConfigFunc: () => Promise<void>,
+    private readonly writeJournal?: NativeWriteJournal
   ) {
     super();
     this.kind = "webdav";
@@ -249,7 +255,12 @@ export class FakeFsWebdav extends FakeFs {
     const customHeaders = parseCustomHeaders(
       this.webdavConfig.customHeaders ?? ""
     );
-    const headers = { ...cacheHeader, ...customHeaders };
+    const headers: Record<string, string> = { ...cacheHeader, ...customHeaders };
+    for (const key of Object.keys(headers)) if (["x-nextclaw-local-transport", NATIVE_OWNER_HEADER].includes(key.toLowerCase())) delete headers[key];
+    if (this.writeJournal) headers[NATIVE_OWNER_HEADER] = this.writeJournal.token;
+    // Old experimental profiles must not silently change transport semantics.
+    if (this.webdavConfig.transport && this.webdavConfig.transport !== "native")
+      throw new Error("此稳定候选仅支持原生传输；请先核对旧实验配置及未知写入记录");
 
     if (
       this.webdavConfig.username !== "" &&
@@ -658,6 +669,7 @@ export class FakeFsWebdav extends FakeFs {
       password: tryEncodeUsernamePassword(this.webdavConfig.password),
       headers: {
         "Cache-Control": "no-cache",
+        ...(this.writeJournal ? { [NATIVE_OWNER_HEADER]: this.writeJournal.token } : {}),
       },
       authType:
         this.webdavConfig.authType === "digest"
@@ -829,6 +841,10 @@ export class FakeFsWebdav extends FakeFs {
           : { "If-None-Match": "*" }),
       },
     });
+    // Accepted/ambiguous responses must never qualify as an acknowledged PUT,
+    // even if a later read happens to observe the same ETag.
+    if (![200, 201, 204].includes(response.status))
+      throw new SyncConflict("上传未收到明确完成回执，保留本地版本");
     const writtenTag = response.headers.get("etag");
     const stored = await this._statFromRoot(fullPath);
     if (!writtenTag || etagHeader(stored) !== writtenTag)

@@ -25,7 +25,8 @@ export class FakeFsLocal extends FakeFs {
     syncBookmarks: boolean,
     configDir: string,
     pluginID: string,
-    deleteToWhere: "obsidian" | "system"
+    deleteToWhere: "obsidian" | "system",
+    private readonly assertActive: () => void = () => {}
   ) {
     super();
 
@@ -144,7 +145,7 @@ export class FakeFsLocal extends FakeFs {
 
   async mkdir(key: string, mtime?: number, ctime?: number): Promise<Entity> {
     // console.debug(`mkdir: ${key}`);
-    await mkdirpInVault(key, this.vault);
+    await mkdirpInVault(key, this.vault, this.assertActive);
     return await this.stat(key);
   }
 
@@ -154,6 +155,7 @@ export class FakeFsLocal extends FakeFs {
     mtime: number,
     ctime: number
   ): Promise<Entity> {
+    this.assertActive();
     await this.vault.adapter.writeBinary(key, content, {
       mtime: mtime,
       ctime: ctime,
@@ -193,9 +195,11 @@ export class FakeFsLocal extends FakeFs {
         oldText = undefined;
       }
       if (oldText !== undefined && newText !== undefined) {
+        this.assertActive();
         await this.vault.adapter.process(
           key,
           (current) => {
+            this.assertActive();
             if (current !== oldText) throw new SyncConflict();
             return newText;
           },
@@ -223,18 +227,21 @@ export class FakeFsLocal extends FakeFs {
     if (!probe) {
       probe = (async () => {
         const parent = `.trash/nextclaw-probe-${nanoid()}`;
-        await mkdirpInVault(`${parent}/`, this.vault);
+        await mkdirpInVault(`${parent}/`, this.vault, this.assertActive);
         const source = `${parent}/source`,
           target = `${parent}/target`;
         const marker = new TextEncoder().encode("target-must-survive").buffer;
         let rejected = false;
         try {
+          this.assertActive();
           await adapter.writeBinary(
             source,
             new TextEncoder().encode("source").buffer
           );
+          this.assertActive();
           await adapter.writeBinary(target, marker);
           try {
+            this.assertActive();
             await adapter.rename(source, target);
           } catch {
             rejected = true;
@@ -248,13 +255,24 @@ export class FakeFsLocal extends FakeFs {
             );
         } finally {
           for (const file of [source, target])
-            if (await adapter.exists(file)) await adapter.remove(file);
+            if (await adapter.exists(file)) {
+              this.assertActive();
+              await adapter.remove(file);
+            }
+          this.assertActive();
           await adapter.rmdir(parent, false);
         }
       })();
       FakeFsLocal.exclusiveRename.set(adapter, probe);
     }
-    await probe;
+    try {
+      await probe;
+    } catch (error) {
+      // An interrupted probe belongs to the retired load, not the next load.
+      if (FakeFsLocal.exclusiveRename.get(adapter) === probe)
+        FakeFsLocal.exclusiveRename.delete(adapter);
+      throw error;
+    }
   }
 
   private async createExclusive(
@@ -267,9 +285,11 @@ export class FakeFsLocal extends FakeFs {
     // rename behavior before relying on no-clobber publication; fail closed otherwise.
     await this.ensureExclusiveRename();
     const parent = `.trash/nextclaw-staging-${nanoid()}`;
-    await mkdirpInVault(`${parent}/`, this.vault);
+    await mkdirpInVault(`${parent}/`, this.vault, this.assertActive);
     const staged = `${parent}/incoming`;
+    this.assertActive();
     await this.vault.adapter.writeBinary(staged, bytes, { mtime, ctime });
+    this.assertActive();
     try {
       await this.vault.adapter.rename(staged, key);
     } catch (error) {
@@ -277,13 +297,15 @@ export class FakeFsLocal extends FakeFs {
         `新文件未覆盖同名路径，待传内容保留在 ${staged}：${error instanceof Error ? error.message : String(error)}`
       );
     }
+    this.assertActive();
     await this.vault.adapter.rmdir(parent, false);
   }
 
   private async retainForRemoval(key: string, expectedBytes: ArrayBuffer) {
     const parent = `.trash/nextclaw-recovery-${nanoid()}`;
-    await mkdirpInVault(`${parent}/`, this.vault);
+    await mkdirpInVault(`${parent}/`, this.vault, this.assertActive);
     const retained = `${parent}/${key.split("/").pop()!}`;
+    this.assertActive();
     await this.vault.adapter.rename(key, retained);
     const bytes = await this.vault.adapter.readBinary(retained);
     if (!equalBytes(bytes, expectedBytes)) {
@@ -314,15 +336,19 @@ export class FakeFsLocal extends FakeFs {
   }
 
   async rename(key1: string, key2: string): Promise<void> {
+    this.assertActive();
     return await this.vault.adapter.rename(key1, key2);
   }
 
   async rm(key: string): Promise<void> {
     if (this.deleteToWhere === "obsidian") {
+      this.assertActive();
       await this.vault.adapter.trashLocal(key);
     } else {
       // "system"
+      this.assertActive();
       if (!(await this.vault.adapter.trashSystem(key))) {
+        this.assertActive();
         await this.vault.adapter.trashLocal(key);
       }
     }

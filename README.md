@@ -134,3 +134,8 @@ NextClaw Sync started as a fork of
 [Remotely Save](https://github.com/remotely-save/remotely-save) (Apache License
 2.0). The sync engine has been rewritten, and support for services other than
 WebDAV, end-to-end encryption and settings import/export have been removed.
+
+
+### 0.1.13 同步保护说明
+
+目录删除会显示为待处理并安全跳过，不阻塞其它安全文件同步；存在待处理目录时不能视为全部收敛。原生写入结果未知时会持久暂停，重载、重启、等待或读取成功均不会自动解锁；请保留本地文件和记录并联系管理员核对，勿通过清除记录强行恢复。675项回归与Android模拟器短时组合链路已验证，24小时资源稳定性尚未完成；实体Android、iOS和真实OpenClaw验收另行进行。详见[发布说明](RELEASE_NOTES.md)。
