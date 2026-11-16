@@ -32,6 +32,20 @@ function clock() {
   };
 }
 describe("unified follow-up and recovery queue", () => {
+  it("preserves save-only provenance and promotes mixed or failed work to a full run", async () => {
+    const c = clock(), modes: boolean[] = [];
+    const q = new SyncQueue(async saveOnly => { modes.push(saveOnly); return "ok"; }, c);
+    q.request(0, true);
+    await c.tick(0);
+    q.request(0, true);
+    q.request();
+    q.request(0, true);
+    await c.tick(0);
+    q.request(0, true);
+    q.finished("failed");
+    await c.tick(5000);
+    assert.deepEqual(modes, [true, false, false]);
+  });
   it("coalesces while busy and runs once after the owner completes", async () => {
     const c = clock();
     let busy = true,

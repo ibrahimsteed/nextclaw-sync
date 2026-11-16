@@ -211,6 +211,13 @@ export function harness(mode: "A" | "B" = "B") {
       },
     },
   } as unknown as InternalDBs;
+  // Host orchestration fixtures retain the historical metadata engine explicitly.
+  const misc = new Map<string, unknown>(), history = new Map<string, unknown>();
+  const table = (m: Map<string, unknown>) => ({ async keys() { return [...m.keys()]; },
+    async getItem(k: string) { return m.get(k) ?? null; }, async setItem(k: string, v: unknown) { m.set(k, v); },
+    async getItems() { return Object.fromEntries(m); }, async removeItem(k: string) { m.delete(k); } });
+  db.simpleKVForMiscTbl = table(misc) as unknown as InternalDBs["simpleKVForMiscTbl"];
+  db.fileContentHistoryTbl = table(history) as unknown as InternalDBs["fileContentHistoryTbl"];
   const input: SyncInput = {
     mode,
     fsLocal: local,

@@ -20,7 +20,7 @@ function initialization(){
   const code=ts.transpileModule(method.replace(/^private async initialize/,"async function initialize"),{compilerOptions:{target:ts.ScriptTarget.ES2020}}).outputText;
   const run=new Function(...Object.keys(globals),code+"return initialize;")(...Object.values(globals));
   const noop=()=>{};
-  const plugin:any={deferredTasks:new DeferredTasks({setTimeout(){return 1;},clearTimeout(){}}),settings:{enableMobileStatusBar:false,enableStatusBarInfo:false},manifest:{name:"test",version:"0.1.12"},app:{workspace:{onLayoutReady:noop}},loadSettings:async()=>{},getCurrProfileID:()=>"p",getVaultBasePath:()=>"fixture",tryToAddIgnoreFile:noop,prepareDBAndVaultRandomID:async()=>{},enableAutoClearOutputToDBHistIfSet:noop,enableAutoClearSyncPlanHist:noop,enableMobileStatusBarIfSet:noop,addRibbonIcon:noop,addCommand:noop,addSettingTab:noop,registerDomEvent:noop,enableAutoSyncIfSet:noop,enableInitSyncIfSet:noop,toggleSyncOnSaveIfSet:noop};
+  const plugin:any={deferredTasks:new DeferredTasks({setTimeout(){return 1;},clearTimeout(){}}),settings:{enableMobileStatusBar:false,enableStatusBarInfo:false},manifest:{name:"test",version:"0.1.12"},app:{vault:{on:noop},workspace:{onLayoutReady:noop}},loadSettings:async()=>{},getCurrProfileID:()=>"p",getVaultBasePath:()=>"fixture",tryToAddIgnoreFile:noop,prepareDBAndVaultRandomID:async()=>{},enableAutoClearOutputToDBHistIfSet:noop,enableAutoClearSyncPlanHist:noop,enableMobileStatusBarIfSet:noop,addRibbonIcon:noop,addCommand:noop,addSettingTab:noop,registerDomEvent:noop,registerEvent:noop,enableAutoSyncIfSet:noop,enableInitSyncIfSet:noop,toggleSyncOnSaveIfSet:noop};
   return {plugin,started,fail,run:()=>run.call(plugin)};
 }
 describe("load initialization closing race",()=>{

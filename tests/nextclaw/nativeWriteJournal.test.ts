@@ -2,7 +2,7 @@ import { strict as assert } from "assert";
 import { NativeWriteJournal, NativeWritePaused, dispatchNative, terminalReceipt } from "../../src/nextclaw/nativeWriteJournal";
 import { mutationPending } from "../../src/nextclaw/writeQuarantine";
 import { SyncQueue } from "../../src/nextclaw/syncQueue";
-import { runSync } from "../../src/nextclaw/syncEngine";
+import { runLegacySync as runSync } from "../../src/nextclaw/engine/legacy";
 import { harness } from "./engine/helpers";
 function setup() {
   const entries = new Map<string, string>();

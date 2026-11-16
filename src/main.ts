@@ -1,3 +1,5 @@
+import { assertContentResetSafe, checkVaultStages, ContentStagePaused, contentScope } from "./nextclaw/content/runtime";
+import type { ContentRuntime, ContentSummary } from "./nextclaw/engine/model";
 import { NativeWriteJournal, NativeWritePaused } from "./nextclaw/nativeWriteJournal";
 import { mutationPending, TRANSPORT_PAUSED } from "./nextclaw/writeQuarantine";
 import { fence, hasRetiredLoad, retireLoad } from "./nextclaw/loadFence";
@@ -14,6 +16,7 @@ import {
   Platform,
   Plugin,
   setIcon,
+  type TAbstractFile,
 } from "obsidian";
 import { runSync } from "./nextclaw/syncEngine";
 import type { NextclawSyncSettings, SyncTriggerSourceType } from "./baseTypes";
@@ -169,13 +172,15 @@ const getStatusBarShortMsgFromSyncSource = (
 export default class NextclawSyncPlugin extends Plugin {
   private readonly databaseConnections = new IdbConnectionPool();
   private readonly deferredTasks = new DeferredTasks();
+  private renameIntents: (NonNullable<ContentRuntime["renames"]>[number] & { file: TAbstractFile })[] = [];
   private activeSync?: Promise<void>;
   private pendingDirectoryCount = 0;
+  private pendingContent: ContentSummary = { pending: 0, conflicts: 0, blocked: false };
   private nativeWrites?: NativeWriteJournal;
   private pausedNoticeShown = false;
   private transportStorageKey() { return `nextclaw-uncertain-write:${this.getVaultBasePath()}`; }
   private transportBlocked() {
-    try { return this.nativeWrites ? this.nativeWrites.blocked() : mutationPending(window.localStorage, this.transportStorageKey()); }
+    try { return this.pendingContent?.blocked || (this.nativeWrites ? this.nativeWrites.blocked() : mutationPending(window.localStorage, this.transportStorageKey())); }
     catch { return true; } // Storage unavailable: do not dispatch unjournalled writes.
   }
 
@@ -205,8 +210,10 @@ export default class NextclawSyncPlugin extends Plugin {
   passwordNoticeShown = false;
 
   async syncRun(
-    triggerSource: SyncTriggerSourceType = "manual"
+    triggerSource: SyncTriggerSourceType = "manual",
+    saveOnly = false
   ): Promise<"ok" | "failed" | "blocked"> {
+    const isSave = saveOnly && triggerSource === "auto_sync_on_save";
     if (this.deferredTasks.disposed || this.initializationWaiting) return "blocked";
     if (this.transportBlocked?.()) {
       this.syncQueue?.dispose();
@@ -215,7 +222,7 @@ export default class NextclawSyncPlugin extends Plugin {
       return "blocked";
     }
     if (this.isSyncing) {
-      if (triggerSource !== "dry") this.syncQueue?.request(3000);
+      if (triggerSource !== "dry") this.syncQueue?.request(3000, isSave);
       if (triggerSource === "manual" || triggerSource === "dry")
         new Notice(
           this.i18n.t("syncrun_alreadyrunning", {
@@ -290,6 +297,15 @@ export default class NextclawSyncPlugin extends Plugin {
       };
 
       const profileID = this.getCurrProfileID();
+      await checkVaultStages(this.db, this.vaultRandomID, assertLocalActive, () =>
+        this.settings.syncDirection === "bidirectional" && !this.settings.nextclawPendingSwitchToB && !this.settings.nextclawPendingRecordReset
+          ? contentScope({ fsRemote, profileID, vaultRandomID: this.vaultRandomID, configDir: this.app.vault.configDir })
+          : undefined).catch(e => {
+        if (e instanceof ContentStagePaused) this.pendingContent = { pending: 1, conflicts: 0, blocked: true };
+        throw e;
+      });
+      if (this.settings.nextclawPendingSwitchToB || this.settings.nextclawPendingRecordReset)
+        await assertContentResetSafe(this.db, this.vaultRandomID, assertLocalActive);
 
       const getProtectError = (
         protectModifyPercentage: number,
@@ -459,10 +475,16 @@ export default class NextclawSyncPlugin extends Plugin {
         s: SyncTriggerSourceType,
         step: number,
         everythingOk: boolean,
-        pendingDirectories = 0
+        pendingDirectories = 0,
+        content?: ContentSummary
       ) => {
         if (stopped()) return;
         const previousPending = this.pendingDirectoryCount;
+        if (step === 8 && s !== "dry") {
+          this.pendingContent = content ?? { pending: 0, conflicts: 0, blocked: false };
+          await this.db.simpleKVForMiscTbl.setItem(`content-summary:${this.vaultRandomID}`, this.pendingContent);
+          if (stopped()) return;
+        }
         if (step === 8 && s !== "dry" && (everythingOk || pendingDirectories > 0)) {
           await upsertPendingDirectoryCountByVault(this.db, this.vaultRandomID, pendingDirectories);
           if (stopped()) return;
@@ -604,6 +626,7 @@ export default class NextclawSyncPlugin extends Plugin {
 
       const result = await runSync({
         mode,
+        androidSaveOnly: isSave && Platform.isAndroidApp ? true : undefined,
         fsLocal,
         fsRemote,
         db: this.db,
@@ -620,6 +643,12 @@ export default class NextclawSyncPlugin extends Plugin {
         ),
         protectModifyPercentage: this.settings.protectModifyPercentage ?? 100,
         concurrency: this.settings.concurrency ?? 5,
+        contentRuntime: {
+          pool: this.databaseConnections, journal: this.nativeWrites,
+          assertActive: assertLocalActive,
+          requestRerun: saveBatch => { assertLocalActive(); this.syncQueue?.request(0, isSave && saveBatch === true); },
+          renames: this.renameIntents?.slice(),
+        },
         callbacks: {
           protectError: getProtectError,
           markIsSyncing: markIsSyncingFunc,
@@ -632,7 +661,8 @@ export default class NextclawSyncPlugin extends Plugin {
       });
 
       if (stopped()) return "blocked";
-      outcome = result.ok ? "ok" : "failed";
+      if (result.contentSummary) this.pendingContent = result.contentSummary;
+      outcome = result.contentSummary?.blocked ? "blocked" : result.ok ? "ok" : "failed";
 
       const reloadDeps = {
         settings: this.settings,
@@ -649,7 +679,7 @@ export default class NextclawSyncPlugin extends Plugin {
           pending: this.settings.nextclawReloadAfterFirstBSync,
           mode,
           triggerSource,
-          ok: result.ok,
+          ok: result.fullyConverged,
         })
       ) {
         // 引擎结束时已把 isSyncing 复位；这里重新置位，挡住提示等待期间的新同步
@@ -840,6 +870,9 @@ export default class NextclawSyncPlugin extends Plugin {
         try {
           if (!this.isSyncing) {
             this.pendingDirectoryCount = await getPendingDirectoryCountByVault(this.db, this.vaultRandomID);
+            this.pendingContent = (await this.db.simpleKVForMiscTbl.getItem<ContentSummary>(`content-summary:${this.vaultRandomID}`)) ?? { pending: 0, conflicts: 0, blocked: false };
+            try { await checkVaultStages(this.db, this.vaultRandomID, () => { if (this.deferredTasks.disposed) throw new Error("retired"); }); }
+            catch (e) { if (e instanceof ContentStagePaused) this.pendingContent = { pending: 1, conflicts: 0, blocked: true }; else throw e; }
             if (this.deferredTasks.disposed) return;
             this.updateLastSyncMsg(
               undefined,
@@ -857,6 +890,9 @@ export default class NextclawSyncPlugin extends Plugin {
         const refreshLastSyncMsg = async () => {
           if (!this.isSyncing) {
             this.pendingDirectoryCount = await getPendingDirectoryCountByVault(this.db, this.vaultRandomID);
+            this.pendingContent = (await this.db.simpleKVForMiscTbl.getItem<ContentSummary>(`content-summary:${this.vaultRandomID}`)) ?? { pending: 0, conflicts: 0, blocked: false };
+            try { await checkVaultStages(this.db, this.vaultRandomID, () => { if (this.deferredTasks.disposed) throw new Error("retired"); }); }
+            catch (e) { if (e instanceof ContentStagePaused) this.pendingContent = { pending: 1, conflicts: 0, blocked: true }; else throw e; }
             if (this.deferredTasks.disposed) return;
             this.updateLastSyncMsg(
               undefined,
@@ -957,9 +993,9 @@ export default class NextclawSyncPlugin extends Plugin {
 
       this.addSettingTab(new NextclawSyncSettingTab(this.app, this));
 
-      this.syncQueue = new SyncQueue(async () => {
+      this.syncQueue = new SyncQueue(async (saveOnly) => {
         if (this.isSyncing) return "blocked";
-        return await this.syncRun("auto_sync_on_save");
+        return await this.syncRun("auto_sync_on_save", saveOnly);
       });
       this.registerDomEvent(window, "online", () => this.requestRecoverySync());
       this.registerDomEvent(document, "visibilitychange", () => {
@@ -968,6 +1004,7 @@ export default class NextclawSyncPlugin extends Plugin {
       // Intent is reconstructed from disk and the journal after reload, not mtime
       // versus a previous completion timestamp. Respect all-auto-off and mode A.
       this.app.workspace.onLayoutReady(() => this.requestRecoverySync());
+      this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onVaultRename(file, oldPath)));
       this.enableAutoSyncIfSet();
       this.enableInitSyncIfSet();
       this.toggleSyncOnSaveIfSet();
@@ -986,6 +1023,7 @@ export default class NextclawSyncPlugin extends Plugin {
     this.nativeWrites?.retire();
     this.deferredTasks.dispose();
     this._syncOnSaveEvent2.cancel();
+    this.renameIntents = [];
     retireLoad(window, this.getVaultBasePath(), this.activeSync);
     this.databaseConnections.dispose();
     this.syncQueue?.dispose();
@@ -1175,7 +1213,7 @@ export default class NextclawSyncPlugin extends Plugin {
   async _checkCurrFileModified(caller: "SYNC" | "FILE_CHANGES") {
     if (this.deferredTasks.disposed) return;
     if (this.syncQueue) {
-      if (caller === "FILE_CHANGES") this.syncQueue.request();
+      if (caller === "FILE_CHANGES") this.syncQueue.request(0, true);
       return;
     }
     const currentFile = this.app.workspace.getActiveFile();
@@ -1186,7 +1224,7 @@ export default class NextclawSyncPlugin extends Plugin {
     if (caller === "FILE_CHANGES") this.hasPendingSyncOnSave = true;
     if (this.isSyncing || !this.hasPendingSyncOnSave) return;
     this.hasPendingSyncOnSave = false;
-    await this.syncRun("auto_sync_on_save");
+    await this.syncRun("auto_sync_on_save", true);
   }
 
   _syncOnSaveEvent1 = () => {
@@ -1205,6 +1243,40 @@ export default class NextclawSyncPlugin extends Plugin {
     1000 * 3,
     false
   );
+
+  private onVaultRename(file: TAbstractFile, oldPath: string) {
+    if (this.deferredTasks.disposed) return;
+    const settings = this.settings;
+    if ((settings.syncOnSaveAfterMilliseconds ?? -1) > 0) this._syncOnSaveEvent2();
+    if (!("extension" in file) || oldPath === file.path || settings.syncDirection !== "bidirectional" ||
+        settings.nextclawPendingSwitchToB || settings.nextclawPendingRecordReset) return;
+    const target = file.path;
+    try {
+      const binding = () => contentScope({
+        fsRemote: getClient(this.settings, this.app.vault.getName(), async () => {}, this.nativeWrites),
+        profileID: this.getCurrProfileID(), vaultRandomID: this.vaultRandomID, configDir: this.app.vault.configDir,
+      });
+      const scope = binding();
+      const previous = this.renameIntents.find(i => i.scope === scope && i.file === file && i.target === oldPath);
+      const source = previous?.source ?? oldPath;
+      this.renameIntents = this.renameIntents.filter(i => i.scope === scope && i !== previous &&
+        (i.source !== source || i.target !== target));
+      if (source === target) return;
+      const intent = { scope, source, target, file,
+        current: () => {
+          if (this.deferredTasks.disposed || this.settings.syncDirection !== "bidirectional" ||
+              this.settings.nextclawPendingSwitchToB || this.settings.nextclawPendingRecordReset ||
+              !this.renameIntents.includes(intent) || file.path !== target ||
+              this.app.vault.getAbstractFileByPath(target) !== file) return false;
+          try { return binding() === scope; } catch { return false; }
+        },
+        settle: () => { this.renameIntents = this.renameIntents.filter(value => value !== intent); },
+      };
+      this.renameIntents.push(intent);
+    } catch {
+      // Incomplete settings leave the pair to the conservative discovery policy.
+    }
+  }
 
   toggleSyncOnSaveIfSet() {
     if (
@@ -1225,14 +1297,12 @@ export default class NextclawSyncPlugin extends Plugin {
         this.registerEvent(this.app.vault.on("modify", this._syncOnSaveEvent2));
         this.registerEvent(this.app.vault.on("create", this._syncOnSaveEvent2));
         this.registerEvent(this.app.vault.on("delete", this._syncOnSaveEvent2));
-        this.registerEvent(this.app.vault.on("rename", this._syncOnSaveEvent2));
       });
     } else {
       this.syncEvent?.off("SYNC_DONE", this._syncOnSaveEvent1);
       this.app.vault.off("modify", this._syncOnSaveEvent2);
       this.app.vault.off("create", this._syncOnSaveEvent2);
       this.app.vault.off("delete", this._syncOnSaveEvent2);
-      this.app.vault.off("rename", this._syncOnSaveEvent2);
     }
   }
 
@@ -1361,9 +1431,14 @@ export default class NextclawSyncPlugin extends Plugin {
       this.refreshMobileStatusBarVisibility({syncing:false,hasTimestamp:true,isSuccess:false,msSinceLastSync:0});
       return;
     }
+    if (syncStatus !== "syncing" && (this.pendingContent?.pending ?? 0) > 0) {
+      lastSyncMsg = `${isSuccess ? "安全任务已同步" : "同步失败"}；内容待处理 ${this.pendingContent.pending}，其中冲突 ${this.pendingContent.conflicts}；未全部收敛`;
+      lastSyncLabelMsg = lastSyncMsg + "。请查看同步计划；内容、删除或存储限额待处理不会被隐藏为全部完成。";
+    }
     if (syncStatus !== "syncing" && this.pendingDirectoryCount > 0) {
       const pending = `目录待处理 ${this.pendingDirectoryCount}；未全部收敛`;
-      lastSyncMsg = (isSuccess ? "文件同步成功；" : "同步失败；") + pending;
+      lastSyncMsg = (isSuccess ? "文件同步成功；" : "同步失败；") + pending +
+        ((this.pendingContent?.pending ?? 0) > 0 ? `；内容待处理 ${this.pendingContent.pending}，其中冲突 ${this.pendingContent.conflicts}` : "");
       lastSyncLabelMsg = lastSyncMsg + "。目录删除已安全跳过；请查看同步计划中的待处理路径。";
     }
     this.statusBarElement.setText(lastSyncMsg);
@@ -1372,7 +1447,7 @@ export default class NextclawSyncPlugin extends Plugin {
     this.refreshMobileStatusBarVisibility({
       syncing: syncStatus === "syncing",
       hasTimestamp: inputTs > 0,
-      isSuccess: isSuccess && this.pendingDirectoryCount === 0,
+      isSuccess: isSuccess && this.pendingDirectoryCount === 0 && !(this.pendingContent?.pending),
       msSinceLastSync: Date.now() - inputTs,
     });
   }

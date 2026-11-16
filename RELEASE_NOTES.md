@@ -1,15 +1,12 @@
-# 0.1.13 — 同步生命周期、冲突保留与未知写入隔离
+# NextClaw Sync 0.2.1
 
-- 修复同步中卸载、反复重载时数据库连接与延迟回调的释放和归属，防止已卸载实例继续修改文件。
-- 修复上传已明确成功后继续编辑时，尾写被重复保存为冲突副本的问题；保留待同步状态并自动补跑，真正双端冲突仍保留双方内容。
-- 目录删除继续安全暂缓，改为可见的待处理状态，不占致命错误预算、不阻塞其它安全文件同步；“有待处理目录”不表示全部收敛。
-- 原生变更请求发送前持久登记。无法确认写入结果时暂停后续写入及自动重试；等待、读取成功、重载或重启都不会自动解除。此时请保留本地文件及记录并联系管理员核对，不要通过删除记录强行恢复。
-- 优化诊断日志，避免日志对象额外保留已卸载的插件实例。
+- Two-way sync uses file contents to distinguish edits from unchanged files. It can merge non-overlapping Markdown edits and preserves overlapping edits with conflict markers for review.
+- File deletions check the last synced version. An edit on the other side is preserved. Directory deletions and suspected renames remain pending. An unresolved rename collision can defer deletions of other files in the same vault.
+- Android save-triggered sync skips repeated downloads for files verified clean by remote file ID, strong ETag, and a local content hash. Periodic sync still verifies remote contents. Android does not automatically send WebDAV `MOVE` requests for renames.
+- An unknown native write result keeps subsequent writes paused across plugin reload and app restart. Preserve the files and sync records for investigation.
 
-默认使用原生传输；不提供实验性浏览器传输或测试恢复入口。
+## Verification and limits
 
-验证：675项插件回归、类型检查、构建及lint；固定候选在Android模拟器、真实Obsidian/Copilot、官方Nextcloud Desktop和专用Nextcloud完成连续三轮短矩阵，覆盖连续编辑、触发重叠、延迟上传、两端冲突及普通断网恢复，三端文件/哈希与冲突副本一致、末尾两次计划零差异。后端为模拟Gateway与文件写入脚本，非真实OpenClaw、实体Android或iOS验收。
+Android testing used stock Obsidian in an emulator with an isolated Nextcloud vault and Nextcloud Files Desktop as a sync peer. It covered saved edits, periodic discovery, deletion and rename protection, and persistence of an unknown-write pause across reload and restart.
 
-**24小时长测尚未通过，不能据短时样本保证长期资源稳定。** 先前长测因驱动或宿主时钟证据门禁暂停，旧结果未拼接为通过；本版如实保留此限制。结果未知导致的暂停属于数据保护，不算自动恢复成功。目录自动删除及生产恢复UI不在本版范围。
-
-三个附件由GitHub Actions构建并提供构建来源证明；0.1.12 Release及本地回退包保留。
+A physical iPad was tested for first sync, unchanged saves, a single-note edit, Obsidian restart recovery, periodic discovery, file deletion, deletion competing with an edit, and suspected-rename handling for a rename initiated on the iPad. The iPad lost-response `PUT` scenario remains unverified. The Android download optimization was measured on Android only. This release has no new desktop end-to-end verification or 24-hour stability result.

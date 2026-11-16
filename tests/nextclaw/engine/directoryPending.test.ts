@@ -1,6 +1,6 @@
 import { strict as assert } from "assert";
 import { harness, record, text } from "./helpers";
-import { runSync } from "../../../src/nextclaw/syncEngine";
+import { runLegacySync as runSync } from "../../../src/nextclaw/engine/legacy";
 import { SyncQueue } from "../../../src/nextclaw/syncQueue";
 
 function pendingFixture() {

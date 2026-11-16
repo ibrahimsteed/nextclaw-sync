@@ -1,5 +1,5 @@
 import { strict as assert } from "assert";
-import { runSync } from "../../src/nextclaw/syncEngine";
+import { runLegacySync as runSync } from "../../src/nextclaw/engine/legacy";
 import { harness, text } from "./engine/helpers";
 
 const list = ".obsidian/community-plugins.json";

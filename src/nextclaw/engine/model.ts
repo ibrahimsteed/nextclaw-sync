@@ -4,6 +4,7 @@ import type { InternalDBs, NextclawSyncRecord } from "../../localdb";
 
 export type State = "unchanged" | "modified" | "deleted" | "new" | "absent";
 export type Decision =
+  | "content"
   | "none"
   | "record"
   | "clear"
@@ -18,6 +19,9 @@ export interface PlanItem {
   local?: Entity;
   remote?: Entity;
   record?: NextclawSyncRecord;
+  content?: import("../content/decision").ContentPlan;
+  contentPending?: string;
+  move?: { source: string; target: string };
   decision: Decision;
   reason: string;
   change: boolean;
@@ -30,7 +34,7 @@ export interface SyncCallbacks {
   markIsSyncing(value: boolean): Callback;
   notify(source: SyncTriggerSourceType, step: number): Callback;
   ribbon(source: SyncTriggerSourceType, step: number): Callback;
-  statusBar(source: SyncTriggerSourceType, step: number, ok: boolean, pendingDirectories?: number): Callback;
+  statusBar(source: SyncTriggerSourceType, step: number, ok: boolean, pendingDirectories?: number, content?: ContentSummary): Callback;
   progress(
     source: SyncTriggerSourceType,
     done: number,
@@ -41,7 +45,18 @@ export interface SyncCallbacks {
   errNotify(source: SyncTriggerSourceType, error: Error): Callback;
   protectError(pct: number, count: number, total: number): string;
 }
+export interface ContentSummary { pending: number; conflicts: number; blocked: boolean; }
+export interface ContentRuntime {
+  pool: import("../../idbStore").IdbConnectionPool;
+  journal: import("../nativeWriteJournal").NativeWriteJournal;
+  assertActive(): void;
+  requestRerun(saveOnly?: true): void;
+  renames?: readonly (LocalRename & { current(this: void): boolean; settle(): void })[];
+}
+export interface LocalRename { scope: string; source: string; target: string }
 export interface SyncInput {
+  contentRuntime?: ContentRuntime;
+  androidSaveOnly?: true;
   mode: "A" | "B";
   fsLocal: FakeFs;
   fsRemote: FakeFs;
@@ -59,6 +74,8 @@ export interface SyncInput {
 }
 export interface SyncResult {
   ok: boolean;
+  contentSummary?: ContentSummary;
+  pendingContent?: { path: string; reason: string }[];
   fullyConverged: boolean;
   pendingDirectories: string[];
   counts: Partial<Record<Decision, number>>;

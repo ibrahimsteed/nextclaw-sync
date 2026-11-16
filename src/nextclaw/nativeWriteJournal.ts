@@ -2,7 +2,7 @@ import { nanoid } from "nanoid";
 import { mutationPending, TRANSPORT_PAUSED } from "./writeQuarantine";
 
 type Store = Pick<Storage, "getItem" | "setItem" | "removeItem">;
-type Operation = { id: string; method: string; path: string; expected: string | null; at: number };
+type Operation = { id: string; method: string; path: string; expected: string | null; at: number; destination?: string; overwrite?: "F" };
 type Journal = { version: 1; owner: string; operations: Operation[] };
 export const NATIVE_OWNER_HEADER = "x-nextclaw-native-owner";
 const owners = new Map<string, NativeWriteJournal>();
@@ -56,12 +56,21 @@ export class NativeWriteJournal {
     return raw === null ? { version: 1, owner: this.token, operations: [] } : JSON.parse(raw) as Journal;
   }
   async send<T extends { status: number }>(
-    method: string, url: string, expected: string | null, send: () => Promise<T>
+    method: string, url: string, expected: string | null, send: () => Promise<T>, guardedDestination?: string
   ): Promise<T> {
     if (this.blocked()) throw new NativeWritePaused();
     const id = nanoid();
     // Never persist credentials, query strings, headers or file bodies.
-    const op: Operation = Object.freeze({ id, method: method.toUpperCase(), path: new URL(url).pathname, expected, at: Date.now() });
+    const source = new URL(url), verb = method.toUpperCase();
+    let destination: string | undefined;
+    if (guardedDestination !== undefined) {
+      const target = new URL(guardedDestination);
+      if (verb !== "MOVE" || !expected || target.origin !== source.origin || target.username || target.password ||
+        target.search || target.hash || target.pathname === source.pathname) throw new Error("invalid-guarded-move-destination");
+      destination = target.pathname;
+    }
+    const op: Operation = Object.freeze({ id, method: verb, path: source.pathname, expected, at: Date.now(),
+      ...(destination === undefined ? {} : { destination, overwrite: "F" as const }) });
     try {
       const journal = this.load();
       journal.operations.push(op);
@@ -72,7 +81,7 @@ export class NativeWriteJournal {
     } catch { this.uncertain = true; throw new NativeWritePaused(); }
     try {
       const response = await send();
-      if (!terminalReceipt(method, response.status)) throw new NativeWritePaused();
+      if (!terminalReceipt(method, response.status) || destination !== undefined && response.status === 204) throw new NativeWritePaused();
       // A receipt can settle only the exact registration, including after unload.
       const journal = this.load();
       if (journal.version !== 1 || journal.owner !== this.token ||
@@ -105,11 +114,11 @@ export class NativeWriteJournal {
 /** Native request dispatch, shared by every WebDAV mutation including MKCOL. */
 export async function dispatchNative<T extends { status: number }>(
   token: string | undefined, method: string, url: string,
-  expected: string | null, send: () => Promise<T>
+  expected: string | null, send: () => Promise<T>, guardedDestination?: string
 ): Promise<T> {
   const owner = token ? owners.get(token) : undefined;
   if (token && (!owner || owner.blocked())) throw new NativeWritePaused();
   if (!isMutation(method)) return send();
   if (!owner) throw new NativeWritePaused();
-  return owner.send(method, url, expected, send);
+  return owner.send(method, url, expected, send, guardedDestination);
 }

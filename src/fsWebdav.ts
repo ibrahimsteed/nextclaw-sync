@@ -1,5 +1,6 @@
-import { dispatchNative, NATIVE_OWNER_HEADER, type NativeWriteJournal } from "./nextclaw/nativeWriteJournal";
-import { etagHeader, SyncConflict } from "./nextclaw/engine/versionGuard";
+import { davContentProperties } from "./nextclaw/content/identity";
+import { dispatchNative, terminalReceipt, NATIVE_OWNER_HEADER, NativeWritePaused, type NativeWriteJournal } from "./nextclaw/nativeWriteJournal";
+import { etagHeader, isOrdinaryMovePath, isStrongMoveEtag, SyncConflict } from "./nextclaw/engine/versionGuard";
 import { Queue } from "@fyears/tsqueue";
 import { getReasonPhrase } from "http-status-codes/build/cjs/utils-functions";
 import { Platform, type RequestUrlParam, requestUrl } from "obsidian";
@@ -21,6 +22,10 @@ import {
   headerValueToText,
   splitFileSizeToChunkRanges,
 } from "./misc";
+
+// Nextcloud omits optional identities from allprop (including allprop+include).
+// Ask explicitly while retaining the standard fields needed by the adapter.
+const DAV_CONTENT_PROPFIND = '<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:getetag/><d:getcontenttype/><d:displayname/><oc:fileid/><oc:checksums/></d:prop></d:propfind>';
 
 /** 字符串是否只含 ISO-8859-1 字符（可直接放进 HTTP 头）。 */
 function onlyLatin1(str: string) {
@@ -62,9 +67,13 @@ if (VALID_REQURL) {
         throw: false,
       };
 
+      const guardedMove = p.method?.toUpperCase() === "MOVE" && transformedHeaders.overwrite === "F" &&
+        Object.prototype.hasOwnProperty.call(transformedHeaders, "if-match");
+      if (guardedMove && (!isStrongMoveEtag(transformedHeaders["if-match"]) || !transformedHeaders.destination))
+        throw new SyncConflict("受保护改名缺少源版本或目标");
       let r = await dispatchNative(ownerToken, p.method!, p.url,
         transformedHeaders["if-match"] ?? transformedHeaders["if-none-match"] ?? null,
-        () => requestUrl(p));
+        () => requestUrl(p), guardedMove ? transformedHeaders.destination : undefined);
 
       if (
         r.status === 401 &&
@@ -163,6 +172,7 @@ const fromWebdavItemToEntity = (x: FileStat, remoteBaseDir: string): Entity => {
     key: key,
     keyRaw: key,
     etag: x.etag ?? undefined,
+    ...davContentProperties((x as FileStat & { props?: unknown }).props),
     mtimeSvr: mtimeSvr,
     mtimeCli: mtimeSvr, // TODO: no universal way to set mtime in webdav
     size: x.size,
@@ -243,7 +253,7 @@ export class FakeFsWebdav extends FakeFs {
     this.nextcloudUploadServerAddress = "";
   }
 
-  async _init() {
+  async _init(allowMissingRoot = false) {
     // init client if not inited
     if (this.client !== undefined && this.vaultFolderExists) {
       return;
@@ -290,9 +300,8 @@ export class FakeFsWebdav extends FakeFs {
         // console.info("remote vault folder exits!");
         this.vaultFolderExists = true;
       } else {
-        throw new Error(
-          `Remote root directory does not exist: /${this.remoteBaseDir}/`
-        );
+        if (allowMissingRoot) return;
+        throw Object.assign(new Error(`Remote root directory does not exist: /${this.remoteBaseDir}/`), { code: "CONTENT_ROOT_MISSING", status: 404 });
       }
     }
 
@@ -420,15 +429,16 @@ export class FakeFsWebdav extends FakeFs {
         const subContents = [] as FileStat[];
         for (const singleChunk of itemsToFetchChunks) {
           const r = singleChunk.map(async (x) => {
-            let k = await this.client.getDirectoryContents(x, {
+            const detail = await this.client.getDirectoryContents(x, {
               deep: false,
-              details: false /* no need for verbose details here */,
+              details: true,
+              data: DAV_CONTENT_PROPFIND,
               // TODO: to support .obsidian,
               // we need to load all files including dot,
               // anyway to reduce the resources?
               // glob: "/**" /* avoid dot files by using glob */,
             });
-            k = k.filter((sub) => stripLeadingPath(sub.filename) !== x);
+            const k = (Array.isArray(detail) ? detail as FileStat[] : detail.data).filter((sub) => stripLeadingPath(sub.filename) !== x);
             return k;
           });
           const r3 = await Promise.all(r);
@@ -457,17 +467,19 @@ export class FakeFsWebdav extends FakeFs {
       }
     } else {
       // the remote supports infinity propfind
-      contents = await this.client.getDirectoryContents(
+      const detail = await this.client.getDirectoryContents(
         `/${this.remoteBaseDir}`,
         {
           deep: true,
-          details: false /* no need for verbose details here */,
+          details: true,
+              data: DAV_CONTENT_PROPFIND,
           // TODO: to support .obsidian,
           // we need to load all files including dot,
           // anyway to reduce the resources?
           // glob: "/**" /* avoid dot files by using glob */,
         }
       );
+      contents = Array.isArray(detail) ? detail : detail.data;
     }
 
     const result = contents
@@ -483,9 +495,9 @@ export class FakeFsWebdav extends FakeFs {
   }
 
   async _statFromRoot(key: string): Promise<Entity> {
-    const res = (await this.client.stat(key, {
-      details: false,
-    })) as FileStat;
+    const detail = await this.client.stat(key, { details: true,
+      data: DAV_CONTENT_PROPFIND });
+    const res = "data" in detail ? detail.data : detail;
     return fromWebdavItemToEntity(res, this.remoteBaseDir);
   }
 
@@ -821,6 +833,43 @@ export class FakeFsWebdav extends FakeFs {
     return await this.stat(origKey);
   }
 
+  contentBinding() {
+    const url = new URL(this.webdavConfig.address);
+    if (url.username || url.password || url.search || url.hash) throw new Error("内容服务器地址不得包含认证信息或查询参数");
+    return { origin: url.origin, account: this.webdavConfig.username,
+      remoteRoot: `${url.pathname.replace(/\/+$/, "")}/${this.remoteBaseDir}`,
+      nativeManaged: VALID_REQURL, journalToken: this.writeJournal?.token };
+  }
+  contentEndpoint(key: string) {
+    this.contentBinding();
+    return this.webdavConfig.address.replace(/\/+$/, "") + "/" +
+      getWebdavPath(key, this.remoteBaseDir).replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/");
+  }
+  async readContent(key: string, expected: Entity) {
+    await this._init();
+    const response = await this.client.customRequest(getWebdavPath(key, this.remoteBaseDir), {
+      method: "GET", headers: { "If-Match": etagHeader(expected) },
+    });
+    const etag = response.headers.get("etag");
+    if (response.status !== 200 || etag !== etagHeader(expected)) throw new SyncConflict("条件读取的响应版本不匹配");
+    return { bytes: await response.arrayBuffer(), etag };
+  }
+  async putContent(key: string, bytes: ArrayBuffer, expected: string | null) {
+    await this._init();
+    try {
+      const response = await this.client.customRequest(getWebdavPath(key, this.remoteBaseDir), {
+        method: "PUT", data: bytes,
+        headers: { "Content-Type": "application/octet-stream", ...(expected ? { "If-Match": expected } : { "If-None-Match": "*" }) },
+      });
+      return { status: response.status, etag: response.headers.get("etag") ?? undefined };
+    } catch (e) {
+      const status = (e as { status?: number }).status;
+      // The real request layer has already settled this explicit rejection. Never synthesize success.
+      if (status !== undefined && terminalReceipt("PUT", status)) return { status };
+      throw e;
+    }
+  }
+
   async writeFileGuarded(
     key: string,
     content: ArrayBuffer,
@@ -860,6 +909,58 @@ export class FakeFsWebdav extends FakeFs {
       method: "DELETE",
       headers: { "If-Match": etagHeader(expected) },
     });
+  }
+
+  async checkContentRootParent() {
+    await this._init(true);
+    const root = `/${this.remoteBaseDir.replace(/^\/+|\/+$/g, "")}`;
+    const parent = root.slice(0, root.lastIndexOf("/")) || "/";
+    // Never create missing ancestors or silently switch to another configured root.
+    const detail = await this.client.stat(parent, { details: true });
+    const p = "data" in detail ? detail.data : detail;
+    if (p.type !== "directory") throw new Error("root-parent-is-not-directory");
+  }
+  async restoreContentRoot() {
+    await this._init(true);
+    const root = `/${this.remoteBaseDir.replace(/^\/+|\/+$/g, "")}`;
+    const r = await this.client.customRequest(root, { method: "MKCOL" });
+    if (r.status === 201) this.vaultFolderExists = true;
+    return { status: r.status };
+  }
+
+  async deleteContent(key: string, expected: Entity) {
+    if (key === "/" || key.endsWith("/")) throw new SyncConflict("目录删除暂缓");
+    await this._init();
+    try {
+      const r = await this.client.customRequest(getWebdavPath(key, this.remoteBaseDir), {
+        method: "DELETE", headers: { "If-Match": etagHeader(expected) },
+      });
+      return { status: r.status };
+    } catch (e) {
+      const status = (e as { status?: number }).status;
+      if (status !== undefined && terminalReceipt("DELETE", status)) return { status };
+      throw e;
+    }
+  }
+
+  async moveContent(source: string, target: string, expected: string): Promise<{ status: number }> {
+    if (!isOrdinaryMovePath(source) || !isOrdinaryMovePath(target) || source.toLowerCase() === target.toLowerCase() ||
+      !isStrongMoveEtag(expected))
+      throw new SyncConflict("缺少普通文件改名、源版本或原生写入所有者的证据");
+    if (!VALID_REQURL || !this.writeJournal || this.writeJournal.blocked()) throw new NativeWritePaused();
+    const url = this.contentEndpoint(source);
+    const destination = this.contentEndpoint(target);
+    await this._init();
+    try {
+      const r = await this.client.customRequest(getWebdavPath(source, this.remoteBaseDir), {
+        url, method: "MOVE", headers: { Destination: destination, "If-Match": expected, Overwrite: "F" },
+      });
+      return { status: r.status };
+    } catch (e) {
+      const status = (e as { status?: number }).status;
+      if (status !== undefined && terminalReceipt("MOVE", status) && status !== 204) return { status };
+      throw e;
+    }
   }
 
   async readFile(key: string, expected?: Entity): Promise<ArrayBuffer> {

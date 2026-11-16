@@ -188,7 +188,7 @@ describe("NextClaw：切换后重新加载——main.ts 接线", () => {
     const iReload = m.indexOf("await reloadAfterFirstBSync(");
     assert.ok(iSync < iShould && iShould < iReload);
     const call = m.slice(iShould, iReload);
-    assert.match(call, /ok: result\.ok/);
+    assert.match(call, /ok: result\.fullyConverged/);
     assert.match(call, /pending: this\.settings\.nextclawReloadAfterFirstBSync/);
     assert.match(call, /triggerSource/);
     assert.match(call, /mode/);

@@ -17,7 +17,7 @@ export const sameVersion = (a: Entity, b: Entity) =>
   (a.mtimeSvr ?? a.mtimeCli) === (b.mtimeSvr ?? b.mtimeCli) &&
   (!a.etag || a.etag === b.etag);
 export async function assertVersion(
-  fs: FakeFs,
+  fs: Pick<FakeFs, "stat">,
   key: string,
   expected: Entity | null
 ) {
@@ -39,3 +39,12 @@ export function etagHeader(entity: Entity) {
     throw new SyncConflict("服务器没有提供强 ETag，拒绝无条件覆盖或删除");
   return value.startsWith('"') ? value : `"${value}"`;
 }
+
+export function isOrdinaryMovePath(path: string) {
+  // eslint-disable-next-line no-control-regex -- WebDAV MOVE paths must reject control characters.
+  return path === path.normalize("NFC") && !/[\\\u0000-\u001f]/.test(path) &&
+    path.split("/").every(component => component && component !== "." && component !== "..");
+}
+
+export const isStrongMoveEtag = (value: unknown): value is string =>
+  typeof value === "string" && /^"[\x21\x23-\x7e]+"$/.test(value);
