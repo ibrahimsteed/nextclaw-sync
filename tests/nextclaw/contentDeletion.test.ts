@@ -1,4 +1,5 @@
 import { strict as assert } from "assert";
+import { IDBFactory } from "fake-indexeddb";
 import { environment } from "./contentEntry.test";
 import { runSync } from "../../src/nextclaw/syncEngine";
 import { assertContentResetSafe, checkVaultStages, contentRuntime } from "../../src/nextclaw/content/runtime";
@@ -96,8 +97,35 @@ describe("P2 actual IndexedDB and complete sync entry",function(){
   }finally{t.stop();}
  });
 
- it("remote deletion above twenty and twenty percent still uses per-file trash and preserves a safe edit",async()=>{
-  const t=await scene();try{for(let i=0;i<25;i++){t.local.put(`n${i}.md`,"base");t.remote.put(`n${i}.md`,"base");t.remote.files.get(`n${i}.md`)!.entity.remoteFileId=String(i+100);}t.local.put("safe.md","before");t.remote.put("safe.md","before");assert.equal((await runSync(t.input)).fullyConverged,true);for(let i=0;i<25;i++)t.remote.files.delete(`n${i}.md`);t.local.put("safe.md","after");const r=await runSync(t.input);assert.equal(r.fullyConverged,true,JSON.stringify(r));assert.equal(t.local.trash.size,25);assert.equal(text(await t.remote.readFile("safe.md")),"after");assert.equal(t.deletes(),0);}finally{t.stop();}
+ it("remote deletion above twenty and twenty percent still uses per-file trash and preserves a safe edit", async () => {
+  // Keep the full-store scans independent of records left by other test vaults.
+  const previousFactory = globalThis.indexedDB;
+  globalThis.indexedDB = new IDBFactory();
+  try {
+   const t = await scene();
+   try {
+    const paths = Array.from({ length: 25 }, (_, index) => `n${index}.md`);
+    for (const [index, path] of paths.entries()) {
+     t.local.put(path, "base");
+     t.remote.put(path, "base");
+     t.remote.files.get(path)!.entity.remoteFileId = String(index + 100);
+    }
+    t.local.put("safe.md", "before");
+    t.remote.put("safe.md", "before");
+    assert.equal((await runSync(t.input)).fullyConverged, true);
+    for (const path of paths) t.remote.files.delete(path);
+    t.local.put("safe.md", "after");
+    const result = await runSync(t.input);
+    assert.equal(result.fullyConverged, true, JSON.stringify(result));
+    assert.equal(t.local.trash.size, 25);
+    assert.equal(text(await t.remote.readFile("safe.md")), "after");
+    assert.equal(t.deletes(), 0);
+   } finally {
+    t.stop();
+   }
+  } finally {
+   globalThis.indexedDB = previousFactory;
+  }
  });
  it("scope mismatch or missing parent refuses root reconstruction before any MKCOL intent",async()=>{
   for(const wrongScope of[false,true]){const t=await scene();try{await t.base();const originalScope=contentRuntime(t.input).scope;t.remote.root=false;t.remote.files.clear();let restores=0;t.remote.restoreContentRoot=async()=>{restores++;return{status:201};};t.remote.checkContentRootParent=async()=>{if(!wrongScope)throw Error("parent missing");};if(wrongScope)t.remote.contentBinding=()=>({origin:"https://synthetic.invalid",account:"other",remoteRoot:"/vault",nativeManaged:false,journalToken:t.journal.token});const r=await runSync(t.input);assert.equal(r.ok,false);assert.ok(r.errors.some(e=>e.message.includes(wrongScope?"root-reseed-requires-bound-clean-scope":"parent missing")));assert.equal(restores,0);assert.equal(t.entries.size,0);assert.ok(t.local.files.has("note.md"));assert.equal((await t.db.fileContentHistoryTbl.keys()).filter(k=>{try{const a=JSON.parse(k);return a[0]==="nextclaw-content-root"&&a[2]===originalScope;}catch{return false;}}).length,0);}finally{t.stop();}}

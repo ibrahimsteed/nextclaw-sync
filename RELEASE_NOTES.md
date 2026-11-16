@@ -1,4 +1,4 @@
-# NextClaw Sync 0.2.1
+# NextClaw Sync 0.2.2
 
 - Two-way sync uses file contents to distinguish edits from unchanged files. It can merge non-overlapping Markdown edits and preserves overlapping edits with conflict markers for review.
 - File deletions check the last synced version. An edit on the other side is preserved. Directory deletions and suspected renames remain pending. An unresolved rename collision can defer deletions of other files in the same vault.
