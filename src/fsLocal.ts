@@ -170,12 +170,14 @@ export class FakeFsLocal extends FakeFs {
     ctime: number,
     expected: Entity | null,
     expectedBytes?: ArrayBuffer,
-    assertCurrent: () => void = () => {}
+    assertCurrent: () => void = () => {},
+    verifyStagedCreate?: () => Promise<void>
   ): Promise<Entity> {
+    if (expected && verifyStagedCreate) throw new SyncConflict("暂存提交检查仅适用于新建");
     assertCurrent();
     await assertVersion(this, key, expected);
     if (!expected) {
-      assertCurrent(); await this.createExclusive(key, content, mtime, ctime, assertCurrent);
+      assertCurrent(); await this.createExclusive(key, content, mtime, ctime, assertCurrent, verifyStagedCreate);
     } else {
       if (!expectedBytes) throw new SyncConflict("缺少本地版本快照");
       let oldText: string | undefined, newText: string | undefined;
@@ -282,7 +284,8 @@ export class FakeFsLocal extends FakeFs {
     bytes: ArrayBuffer,
     mtime: number,
     ctime: number,
-    assertCurrent: () => void = () => {}
+    assertCurrent: () => void = () => {},
+    verifyStagedCreate?: () => Promise<void>
   ) {
     // Android copy overwrites despite its SDK contract. Probe the real host's
     // rename behavior before relying on no-clobber publication; fail closed otherwise.
@@ -293,6 +296,10 @@ export class FakeFsLocal extends FakeFs {
     this.assertActive(); assertCurrent();
     await this.vault.adapter.writeBinary(staged, bytes, { mtime, ctime });
     this.assertActive(); assertCurrent();
+    if (verifyStagedCreate) {
+      await verifyStagedCreate();
+      this.assertActive(); assertCurrent();
+    }
     try {
       await this.vault.adapter.rename(staged, key);
     } catch (error) {

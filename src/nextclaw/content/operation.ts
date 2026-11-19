@@ -2,10 +2,10 @@ import { nanoid } from "nanoid";
 import { inConfig } from "../engine/model";
 import { SyncConflict } from "../engine/versionGuard";
 import { NativeWriteJournal } from "../nativeWriteJournal";
-import { hashBytes, NOTE_LIMIT, type ContentRecord } from "./identity";
+import { hashBytes, type ContentRecord } from "./identity";
 import { strongEtag, type ConflictRegistration } from "./migration";
 import { mergeContent } from "./merge";
-import { ContentStore, type ContentReservation } from "./store";
+import { ContentStore, isAttachmentRef, type ContentReservation } from "./store";
 import type { ContentPlan } from "./decision";
 import { markerState } from "./markers";
 
@@ -38,6 +38,7 @@ export interface ContentOperation {
   action: ContentPlan["action"]; previous: Checkpoint;
   localRef?: string; remoteRef?: string; baseRef?: string; outputRef: string;
   localHash?: string; remoteHash?: string; outputHash: string; expectedEtag?: string;
+  attachmentFileId?: string;
   outputKind: "clean" | "conflict"; originalUpload: boolean;
   receipt?: { intentHash: string; operation: string; owner: string; outputHash: string; expectedEtag?: string; status: number; etag: string };
   conflict?: ConflictRegistration;
@@ -61,6 +62,7 @@ const success = (status: number) => [200, 201, 204].includes(status);
 export const operationIntentHash = (o: ContentOperation) => hashBytes(new TextEncoder().encode(JSON.stringify([
   o.version, o.id, o.scope, o.path, o.owner, o.action, o.previous, o.localRef, o.remoteRef,
   o.baseRef, o.outputRef, o.localHash, o.remoteHash, o.outputHash, o.expectedEtag, o.outputKind, o.originalUpload, o.supersedes ?? [],
+  ...(o.attachmentFileId === undefined ? [] : [o.attachmentFileId]),
 ])).buffer);
 const settled = (o: ContentOperation) => ["committed", "rejected", "rediscover", "archived"].includes(o.phase);
 /** Default B content executor; never exposes a journal unlock. */
@@ -82,7 +84,7 @@ export class ContentExecutor {
   private async view(side: "local" | "remote", prefetched?: ContentView): Promise<VerifiedView | undefined> {
     this.guard(); const v = await (side === "local" ? this.io.readLocal() : prefetched ?? this.io.readRemote()); this.guard();
     if (!v) return;
-    if (v.bytes.byteLength > NOTE_LIMIT) throw new Error("content-limit-pending");
+    if (v.bytes.byteLength > this.bodies.fileLimit) throw new Error("content-limit-pending");
     const bytes = v.bytes.slice(0), etag = v.etag, hash = await hashBytes(bytes); this.guard();
     if (side === "remote" && !strongEtag(etag)) throw new Error("strong-remote-version-required");
     return { bytes, hash, etag, remoteFileId: v.remoteFileId };
@@ -110,7 +112,8 @@ export class ContentExecutor {
     try { this.guard(); return await work(); }
     catch (e) {
       return { status: !this.ownerActive() ? "pending" : this.journal.blocked() ? "blocked-unknown-write" :
-        e instanceof SyncConflict || (e instanceof Error && e.message === "content-limit-pending") ? "pending" : "failed",
+        e instanceof SyncConflict || (e instanceof Error &&
+          ["content-limit-pending", "attachment-storage-quota-pending"].includes(e.message)) ? "pending" : "failed",
         reason: e instanceof Error ? e.message : "content-operation-failed" };
     } finally {
       lock.paths.delete(this.path);
@@ -119,6 +122,8 @@ export class ContentExecutor {
     }
   }
   async execute(plan: ContentPlan, group?: InitialDownloadGroup): Promise<ContentOutcome> {
+    if (this.bodies.attachment && (!group || plan.action !== "download-create"))
+      return { status: "pending", reason: "attachment-import-create-only" };
     if (group && (!this.prefetchedDownload || plan.action !== "download-create" ||
       plan.expected?.localHash !== undefined || plan.expected?.baseRef !== undefined))
       return { status: "pending", reason: "initial-download-admission-changed" };
@@ -134,6 +139,8 @@ export class ContentExecutor {
       const prefetched = plan.action === "download-create" && !local && !plan.expected.baseRef
         ? this.prefetchedDownload : undefined;
       const remote = await this.view("remote", prefetched);
+      if (this.bodies.attachment && !remote?.remoteFileId)
+        return { status: "pending", reason: "attachment-identity-missing" };
       if (local?.hash !== plan.expected.localHash || remote?.hash !== plan.expected.remoteHash || remote?.etag !== plan.expected.remoteEtag)
         return { status: "pending", reason: "rediscover-actual-bytes" };
       const previous = structuredClone(await this.io.checkpoint()); this.guard();
@@ -166,6 +173,7 @@ export class ContentExecutor {
         owner: this.journal.token, intentHash: "", dispatchStarted: false, phase: "inputs-durable", action: plan.action, previous, localRef, remoteRef,
         baseRef: previous.content?.status === "deleted" ? undefined : plan.expected.baseRef, outputRef, localHash: local?.hash, remoteHash: remote?.hash,
         outputHash: await hashBytes(merge.bytes), expectedEtag: remote?.etag, outputKind: merge.kind,
+        ...(this.bodies.attachment ? { attachmentFileId: remote!.remoteFileId } : {}),
         originalUpload: ["upload", "upload-create", "resolve-local"].includes(plan.action) };
       operation.intentHash = await operationIntentHash(operation); this.guard();
       await this.save(operation);
@@ -210,6 +218,9 @@ export class ContentExecutor {
     if (o.scope !== this.scope || o.path !== this.path || !o.id || !o.owner ||
       o.originalUpload !== ["upload", "upload-create", "resolve-local"].includes(o.action) ||
       !["clean", "conflict"].includes(o.outputKind)) throw new Error("invalid-operation-binding");
+    if (isAttachmentRef(o.outputRef) ?
+        !this.bodies.attachment || typeof o.attachmentFileId !== "string" || !o.attachmentFileId || o.action !== "download-create" :
+        o.attachmentFileId !== undefined || this.bodies.attachment) throw new Error("invalid-attachment-operation");
     for (const [ref, hash] of [[o.localRef, o.localHash], [o.remoteRef, o.remoteHash]] as const) {
       if ((ref === undefined) !== (hash === undefined)) throw new Error("invalid-operation-input");
       if (ref) {
@@ -225,7 +236,8 @@ export class ContentExecutor {
     if (output.hash !== o.outputHash || output.kind !== "merge-input") throw new Error("invalid-operation-output");
     const remote = prefetched ?? await this.view("remote"), local = await this.view("local");
     const expectedEtag = sendsRemote ? o.receipt!.etag : o.expectedEtag;
-    if (remote?.hash !== output.hash || remote?.etag !== expectedEtag) {
+    if (remote?.hash !== output.hash || remote?.etag !== expectedEtag ||
+        (o.attachmentFileId && o.attachmentFileId !== remote.remoteFileId)) {
       o.phase = "rediscover"; await this.save(o);
       return { status: "pending", reason: "remote-changed-after-ack", operation: o.id };
     }

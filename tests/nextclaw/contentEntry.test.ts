@@ -4,7 +4,8 @@ import { prepareDBs, type NextclawSyncRecord } from "../../src/localdb";
 import { IdbConnectionPool } from "../../src/idbStore";
 import { NativeWriteJournal } from "../../src/nextclaw/nativeWriteJournal";
 import { runSync } from "../../src/nextclaw/syncEngine";
-import { ContentStore } from "../../src/nextclaw/content/store";
+import { ContentStore, isAttachmentRef } from "../../src/nextclaw/content/store";
+import { ATTACHMENT_LIMIT, ATTACHMENT_PROFILE_LIMIT, NOTE_LIMIT, PROFILE_LIMIT } from "../../src/nextclaw/content/identity";
 import { contentRuntime, assertContentResetSafe, checkVaultStages } from "../../src/nextclaw/content/runtime";
 import { mainHarness } from "./engine/mainHarness";
 import { harness } from "./engine/helpers";
@@ -14,8 +15,11 @@ import type { Entity } from "../../src/baseTypes";
 import type { SyncInput } from "../../src/nextclaw/syncEngine";
 class Local extends MemoryFs {
   current = () => {};
-  override async writeFileGuarded(k: string, b: ArrayBuffer, m: number, c: number, e: Entity | null, before?: ArrayBuffer, current = () => {}) {
-    current(); this.current(); return super.writeFileGuarded(k, b, m, c, e, before);
+  override async writeFileGuarded(k: string, b: ArrayBuffer, m: number, c: number, e: Entity | null, before?: ArrayBuffer,
+    current = () => {}, verifyStagedCreate?: () => Promise<void>) {
+    current(); this.current();
+    if (verifyStagedCreate) await verifyStagedCreate();
+    current(); return super.writeFileGuarded(k, b, m, c, e, before);
   }
 }
 class Remote extends MemoryFs {
@@ -65,6 +69,199 @@ describe("Android first B download", () => {
     t.input.androidInitialDownload = true;
     return { ...t, paths, seed };
   }
+
+  function seedAttachment(t: Awaited<ReturnType<typeof fixture>>, path: string, size: number) {
+    t.seed(path, "fixture");
+    const row = t.remote.files.get(path)!;
+    const body = new Uint8Array(size);
+    body.set(path.endsWith(".gif") ? [71, 73, 70, 56, 57, 97] : [137, 80, 78, 71, 13, 10, 26, 10]);
+    row.bytes = body.buffer;
+    row.entity.size = row.entity.sizeRaw = size;
+    return body.buffer;
+  }
+
+  it("resumes the four capacity holds from an existing B sweep and verifies imports after reload", async () => {
+    const t = await fixture(0);
+    const sizes = { "demo.gif": 10843290, "one.png": 1653277, "two.png": 1317257, "three.png": 1392586 };
+    const files = new Map(Object.entries(sizes).map(([path, size]) => [path, seedAttachment(t, path, size)]));
+    const runtime = contentRuntime(t.input);
+    const schedule = `content-batch:${runtime.scope}`;
+    await t.db.simpleKVForMiscTbl.setItem(schedule, {
+      version: 1, remaining: [], completed: [],
+      issues: [...files.keys()].map(path => ({ path, reason: "content-limit-pending" })),
+    });
+    const fetch = t.remote.readContent.bind(t.remote);
+    let live = 0, peak = 0;
+    t.remote.readContent = async (...args) => {
+      peak = Math.max(peak, ++live);
+      try { return await fetch(...args); }
+      finally { live--; }
+    };
+    try {
+      const imported = await runSync(t.input);
+      assert.equal(imported.fullyConverged, true, JSON.stringify(imported.pendingContent));
+      assert.equal(peak, 1);
+      for (const [path, body] of files) {
+        assert.deepEqual(await t.local.readFile(path), body);
+        assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+      }
+      t.local.calls.length = 0;
+      t.journal.retire();
+      const reopened = new NativeWriteJournal({ getItem: k => t.entries.get(k) ?? null,
+        setItem: (k, v) => { t.entries.set(k, v); }, removeItem: k => { t.entries.delete(k); } }, crypto.randomUUID());
+      const oldBinding = t.remote.contentBinding.bind(t.remote);
+      t.remote.contentBinding = () => ({ ...oldBinding(), journalToken: reopened.token });
+      try {
+        const input = { ...t.input, androidInitialDownload: undefined,
+          contentRuntime: { ...t.input.contentRuntime!, journal: reopened } };
+        assert.equal((await runSync({ ...input, androidFirstBRecovery: true, triggerSource: "auto_sync_on_save" })).fullyConverged, true);
+        let settled = await runSync(input);
+        for (let i = 1; !settled.fullyConverged && i < files.size; i++) {
+          assert.ok(settled.pendingContent?.every(item => item.reason === "正文批次待续跑"));
+          settled = await runSync(input);
+        }
+        assert.equal(settled.fullyConverged, true, JSON.stringify(settled.pendingContent));
+        assert.deepEqual(t.local.writes(), []);
+        assert.equal(t.remote.puts, 0);
+      } finally { reopened.retire(); }
+    } finally { t.stop(); }
+  });
+
+  it("charges attachment bodies separately and rejects a declared file above 50 MiB before GET", async () => {
+    const t = await fixture(0);
+    try {
+      const rt = contentRuntime(t.input);
+      const note = new ArrayBuffer(NOTE_LIMIT);
+      for (let i = 0; i < PROFILE_LIMIT / NOTE_LIMIT; i++) {
+        await rt.bodies.put(`page-${i}.md`, note, "clean-base");
+      }
+      await assert.rejects(rt.bodies.ensureCapacity(1), /content-limit-pending/);
+      const bytes = seedAttachment(t, "image.gif", 6 * 1024 * 1024);
+      const ref = await rt.attachments.put("image.gif", bytes, "clean-base");
+      assert.ok(isAttachmentRef(ref));
+      assert.deepEqual((await rt.bodies.read(ref, "image.gif")).bytes, bytes);
+      await rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - bytes.byteLength);
+      await assert.rejects(rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - bytes.byteLength + 1), /content-limit-pending/);
+      await assert.rejects(rt.bodies.ensureCapacity(1), /content-limit-pending/);
+      t.remote.files.delete("image.gif");
+      seedAttachment(t, "too-big.gif", 8);
+      const row = t.remote.files.get("too-big.gif")!;
+      row.entity.size = row.entity.sizeRaw = ATTACHMENT_LIMIT + 1;
+      t.remote.calls.length = 0;
+      const result = await runSync(t.input);
+      assert.deepEqual(result.pendingContent, [{ path: "too-big.gif", reason: "attachment-file-limit-pending" }]);
+      assert.equal(t.remote.calls.some(c => c.op === "readFile" && c.key === "too-big.gif"), false);
+      assert.deepEqual(t.local.writes(), []);
+    } finally { t.stop(); }
+  });
+
+  it("commits an attachment exactly at the independent 50 MiB limit", async function () {
+    this.timeout(20_000);
+    const t = await fixture(0);
+    const path = "boundary.gif";
+    const expected = seedAttachment(t, path, ATTACHMENT_LIMIT);
+    try {
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, true, JSON.stringify(result.pendingContent));
+      assert.deepEqual(t.local.files.get(path)?.bytes, expected);
+      assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
+  it("rejects a changed remote version after the attachment operation is durable", async () => {
+    const t = await fixture(0);
+    const path = "changed.gif";
+    seedAttachment(t, path, 6 * 1024 * 1024);
+    const history = t.db.fileContentHistoryTbl;
+    const persist = history.setItem.bind(history);
+    let changedAfterStaging = false;
+    history.setItem = async (key, value) => {
+      const result = await persist(key, value);
+      const operation = value as { path?: string; phase?: string } | null;
+      if (operation?.path === path && operation.phase === "local-verified") {
+        t.remote.files.get(path)!.entity.etag = '"changed"';
+        changedAfterStaging = true;
+      }
+      return result;
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(changedAfterStaging, true);
+      assert.deepEqual(result.pendingContent?.map(item => item.path), [path]);
+      assert.equal(t.local.files.has(path), false);
+      assert.equal(await t.rec(path), null);
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
+  it("keeps an attachment destination that appears at guarded publication", async () => {
+    const t = await fixture(0);
+    const path = "occupied.png";
+    seedAttachment(t, path, 5 * 1024 * 1024);
+    t.local.current = () => { if (!t.local.files.has(path)) t.local.put(path, "occupied bytes"); };
+    try {
+      const result = await runSync(t.input);
+      assert.deepEqual(result.pendingContent?.map(item => item.path), [path]);
+      assert.equal(text(await t.local.readFile(path)), "occupied bytes");
+      assert.equal(await t.rec(path), null);
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
+  it("keeps a WebView quota failure pending without publishing or queuing an immediate rerun", async () => {
+    const t = await fixture(0);
+    const path = "no-space.gif";
+    seedAttachment(t, path, 5 * 1024 * 1024);
+    const history = t.db.fileContentHistoryTbl;
+    const persist = history.setItem.bind(history);
+    history.setItem = async (key, data) => {
+      if (isAttachmentRef(key)) throw new DOMException("quota", "QuotaExceededError");
+      return persist(key, data);
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.deepEqual(result.pendingContent, [{ path, reason: "attachment-storage-quota-pending" }]);
+      assert.equal(result.errors.length, 0);
+      assert.equal(t.local.files.has(path), false);
+      assert.equal(t.reruns(), 0);
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
+  it("recovers a published attachment after retiring before its checkpoint without rewriting data", async () => {
+    const t = await fixture(0);
+    const path = "handoff.gif";
+    const body = seedAttachment(t, path, 5 * 1024 * 1024);
+    let retired = false;
+    t.input.contentRuntime!.assertActive = () => { if (retired) throw new Error("retired"); };
+    const write = t.local.writeFileGuarded.bind(t.local);
+    t.local.writeFileGuarded = async (...args) => {
+      const result = await write(...args);
+      retired = true;
+      return result;
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, false);
+      assert.deepEqual(await t.local.readFile(path), body);
+      assert.equal(await t.rec(path), null);
+      t.journal.retire();
+      const reopened = new NativeWriteJournal({ getItem: k => t.entries.get(k) ?? null,
+        setItem: (k, v) => { t.entries.set(k, v); }, removeItem: k => { t.entries.delete(k); } }, crypto.randomUUID());
+      const oldBinding = t.remote.contentBinding.bind(t.remote);
+      t.remote.contentBinding = () => ({ ...oldBinding(), journalToken: reopened.token });
+      t.local.calls.length = 0;
+      try {
+        const input = { ...t.input, contentRuntime: { ...t.input.contentRuntime!, assertActive: t.guard, journal: reopened } };
+        const recovered = await runSync(input);
+        assert.deepEqual(recovered.pendingContent, [{ path, reason: "操作已确认，待重新扫描" }]);
+        assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+        assert.equal((await runSync(input)).fullyConverged, true);
+        assert.deepEqual(t.local.writes(), []);
+        assert.equal(t.remote.puts, 0);
+      } finally { reopened.retire(); }
+    } finally { t.stop(); }
+  });
 
   it("downloads beyond a normal batch with one full scan and at most four concurrent GETs", async () => {
     const t = await fixture(35);

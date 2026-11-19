@@ -4,6 +4,18 @@ import { assertVersion, equalBytes, etagHeader, SyncConflict } from "../engine/v
 
 export const NOTE_LIMIT = 4 * 1024 * 1024;
 export const PROFILE_LIMIT = 32 * 1024 * 1024;
+export const ATTACHMENT_LIMIT = 50 * 1024 * 1024;
+export const ATTACHMENT_PROFILE_LIMIT = 1000 * 1024 * 1024;
+
+export const isAttachmentPath = (path: string) => /\.(gif|png)$/i.test(path);
+
+export function matchesAttachmentSignature(path: string, bytes: ArrayBuffer) {
+  const prefix = new Uint8Array(bytes, 0, Math.min(bytes.byteLength, 8));
+  if (/\.png$/i.test(path)) {
+    return [137, 80, 78, 71, 13, 10, 26, 10].every((byte, i) => prefix[i] === byte);
+  }
+  return /\.gif$/i.test(path) && /^GIF8[79]a$/.test(String.fromCharCode(...prefix.subarray(0, 6)));
+}
 export type ContentStatus = "unbased" | "clean" | "content-conflict" | "migration-pending" | "merge-pending" | "deleted";
 export interface ContentRecord {
   version: 1;

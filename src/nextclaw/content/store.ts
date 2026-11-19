@@ -1,6 +1,11 @@
 import { jsonArrayKeyRange, type IdbStore } from "../../idbStore";
 import { nanoid } from "nanoid";
-import { hashBytes, isHash, NOTE_LIMIT, PROFILE_LIMIT } from "./identity";
+import { ATTACHMENT_LIMIT, ATTACHMENT_PROFILE_LIMIT, hashBytes, isHash,
+  matchesAttachmentSignature, NOTE_LIMIT, PROFILE_LIMIT } from "./identity";
+
+export const CONTENT_BODY = "nextclaw-content";
+export const ATTACHMENT_BODY = "nextclaw-attachment";
+export const isAttachmentRef = (ref: string | undefined) => ref?.startsWith(`["${ATTACHMENT_BODY}",1,`) === true;
 export interface ContentTable {
   keys(): Promise<string[]>;
   iterate?: IdbStore["iterate"];
@@ -20,29 +25,39 @@ const reservations = new WeakMap<ContentTable, Map<string, ReservationState>>();
 export class ContentStore {
   constructor(private readonly table: ContentTable, readonly scope: string,
     private readonly assertOwner: () => void,
-    private readonly limits = { note: NOTE_LIMIT, profile: PROFILE_LIMIT }) {
+    private readonly limits = { note: NOTE_LIMIT, profile: PROFILE_LIMIT },
+    readonly attachment = false) {
     if (!scope || !Number.isSafeInteger(limits.note) || limits.note < 1 ||
       !Number.isSafeInteger(limits.profile) || limits.profile < limits.note)
       throw new Error("Invalid content storage limits");
   }
-  private key(path: string, generation: string) {
-    return JSON.stringify(["nextclaw-content", 1, this.scope, path, generation]);
+  attachmentStore() {
+    return new ContentStore(this.table, this.scope, this.assertOwner,
+      { note: ATTACHMENT_LIMIT, profile: ATTACHMENT_PROFILE_LIMIT }, true);
   }
-  private owns(key: string): boolean {
+  get fileLimit() { return this.limits.note; }
+  private get namespace() { return this.attachment ? ATTACHMENT_BODY : CONTENT_BODY; }
+  private key(path: string, generation: string, namespace = this.namespace) {
+    return JSON.stringify([namespace, 1, this.scope, path, generation]);
+  }
+  private owns(key: string, namespace = this.namespace): boolean {
     try {
       const a: unknown = JSON.parse(key);
-      return Array.isArray(a) && a.length === 5 && a[0] === "nextclaw-content" && a[1] === 1 &&
+      return Array.isArray(a) && a.length === 5 && a[0] === namespace && a[1] === 1 &&
         a[2] === this.scope && typeof a[3] === "string" && typeof a[4] === "string";
     } catch { return false; }
   }
   async read(ref: string, path: string): Promise<BodyObject> {
     this.assertOwner();
-    if (!this.owns(ref)) throw new Error("Content reference scope mismatch");
+    const attachment = isAttachmentRef(ref);
+    const namespace = attachment ? ATTACHMENT_BODY : CONTENT_BODY;
+    if (!this.owns(ref, namespace)) throw new Error("Content reference scope mismatch");
     const body = await this.table.getItem<BodyObject>(ref); this.assertOwner();
     if (!body || body.version !== 1 || body.scope !== this.scope || body.path !== path ||
       !["clean-base", "merge-input"].includes(body.kind) ||
-      typeof body.generation !== "string" || ref !== this.key(path, body.generation) ||
-      !(body.bytes instanceof ArrayBuffer) || body.bytes.byteLength > this.limits.note || !isHash(body.hash))
+      typeof body.generation !== "string" || ref !== this.key(path, body.generation, namespace) ||
+      !(body.bytes instanceof ArrayBuffer) || body.bytes.byteLength > (attachment ? ATTACHMENT_LIMIT : this.attachment ? NOTE_LIMIT : this.limits.note) ||
+      (attachment && !matchesAttachmentSignature(path, body.bytes)) || !isHash(body.hash))
       throw new Error("Missing or invalid content object");
     const copy = { ...body, bytes: body.bytes.slice(0) };
     if (await hashBytes(copy.bytes) !== copy.hash) throw new Error("Corrupt content object");
@@ -58,7 +73,7 @@ export class ContentStore {
       used += obj.bytes.byteLength;
     };
     if (this.table.iterate) {
-      await this.table.iterate(count, jsonArrayKeyRange(["nextclaw-content", 1, this.scope]));
+      await this.table.iterate(count, jsonArrayKeyRange([this.namespace, 1, this.scope]));
     } else {
       for (const key of await this.table.keys()) {
         this.assertOwner();
@@ -81,6 +96,13 @@ export class ContentStore {
     if (!Number.isSafeInteger(additionalBytes) || additionalBytes < 0) throw new Error("invalid-content-reservation");
     if (reservations.get(this.table)?.has(this.scope) || await this.usedBytes() + additionalBytes > this.limits.profile)
       throw new Error("content-limit-pending");
+    if (this.attachment && typeof navigator !== "undefined" && navigator.storage?.estimate) {
+      const estimate = await navigator.storage.estimate().catch(() => undefined);
+      this.assertOwner();
+      if (estimate?.quota !== undefined && estimate.usage !== undefined &&
+          estimate.quota > 0 && estimate.quota - estimate.usage < additionalBytes)
+        throw new Error("attachment-storage-quota-pending");
+    }
   }
   async reserveCapacity(budgets: ReadonlyMap<string, number>): Promise<ContentReservation> {
     const remaining = new Map(budgets);
@@ -116,6 +138,8 @@ export class ContentStore {
   }
   async put(path: string, bytes: ArrayBuffer, kind: BodyObject["kind"], reservation?: ContentReservation): Promise<string> {
     if (bytes.byteLength > this.limits.note) throw new Error("content-limit-pending");
+    if (this.attachment && !matchesAttachmentSignature(path, bytes))
+      throw new Error("attachment-signature-mismatch");
     const copy = bytes.slice(0);
     return this.enqueue(async () => {
       if (reservation) {
@@ -126,7 +150,14 @@ export class ContentStore {
       const generation = nanoid(), ref = this.key(path, generation);
       const body: BodyObject = { version: 1, scope: this.scope, path, generation, kind,
         bytes: copy, hash: await hashBytes(copy) };
-      this.assertOwner(); await this.table.setItem(ref, body); this.assertOwner();
+      this.assertOwner();
+      try { await this.table.setItem(ref, body); }
+      catch (error) {
+        if (this.attachment && error instanceof Error && error.name === "QuotaExceededError")
+          throw new Error("attachment-storage-quota-pending");
+        throw error;
+      }
+      this.assertOwner();
       if ((await this.read(ref, path)).hash !== body.hash) throw new Error("Content write verification failed");
       return ref;
     });

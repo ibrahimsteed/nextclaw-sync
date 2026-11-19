@@ -6,7 +6,7 @@ import { inConfig } from "../engine/model";
 import { NativeWritePaused } from "../nativeWriteJournal";
 import { assertVersion, etagHeader, isStrongMoveEtag, sameVersion, SyncConflict } from "../engine/versionGuard";
 import { decodeRecord, name, observation, type SyncInput } from "../engine/model";
-import { scopeKey, localSnapshot, hashBytes, NOTE_LIMIT, type Snapshot } from "./identity";
+import { scopeKey, localSnapshot, hashBytes, matchesAttachmentSignature, type Snapshot } from "./identity";
 import { loadContentHistory, strongEtag } from "./migration";
 import type { ContentPlan } from "./decision";
 import { ContentStore } from "./store";
@@ -104,6 +104,7 @@ export function contentRuntime(input: SyncInput) {
   if (binding.journalToken !== runtime.journal.token) throw new Error("内容传输与原生登记owner不匹配");
   const scope = contentScope(input);
   const bodies = new ContentStore(input.db.fileContentHistoryTbl, scope, guard);
+  const attachments = bodies.attachmentStore();
   const operations = new TableOperationRepository(input.db.fileContentHistoryTbl, scope, guard);
   const rootReseed = new RootReseed(input.db.fileContentHistoryTbl, scope, input.fsRemote.contentEndpoint("/"), runtime.journal, guard);
   async function bindRoot(root: Entity) {
@@ -182,7 +183,9 @@ export function contentRuntime(input: SyncInput) {
     if (local && current && holds[path]) { delete holds[path]; await input.db.simpleKVForMiscTbl.setItem(holdKey, holds); guard(); }
     return { confirmedMissing: current === undefined, suspectedMove: manifestUnsafe || !!holds[path], reseed };
   }
-  function file(path: string, local?: Entity, remote?: Entity, initial?: InitialDownload) {
+  function file(path: string, local?: Entity, remote?: Entity, initial?: InitialDownload, attachment = false) {
+    const fileBodies = attachment ? attachments : bodies;
+    let attachmentVersion = initial?.version;
     const lp = local ? name(local) : remote ? name(remote) : path;
     const rp = remote ? name(remote) : local ? name(local) : path;
     const endpoint = input.fsRemote.contentEndpoint(rp);
@@ -192,10 +195,13 @@ export function contentRuntime(input: SyncInput) {
     const checkpoint = new IdbContentCheckpoint(runtime!.pool, input.db.prevSyncRecordsTbl, input.db.fileContentHistoryTbl,
       `${input.vaultRandomID}\t${input.profileID}\t${path}`, scope, seed, guard);
     async function readRemoteVersion(e: Entity, verify = () => assertVersion(input.fsRemote, rp, e)) {
-      if ((e.size ?? e.sizeRaw) > NOTE_LIMIT) throw new Error("content-limit-pending");
+      if ((e.size ?? e.sizeRaw) > fileBodies.fileLimit) throw new Error("content-limit-pending");
       const view = await input.fsRemote.readContent(rp, e); guard();
+      if (attachment && view.bytes.byteLength > fileBodies.fileLimit)
+        throw new Error("attachment-file-limit-pending");
       await verify(); guard();
       if (e.remoteChecksum && e.remoteChecksum !== await hashBytes(view.bytes)) throw new SyncConflict("远端正文校验和不匹配");
+      if (attachment) attachmentVersion = e;
       guard(); return { ...view, remoteFileId: e.remoteFileId };
     }
     async function assertInitialVersion(version: Entity) {
@@ -209,6 +215,8 @@ export function contentRuntime(input: SyncInput) {
       if (etag !== etagHeader(version) ||
           download.bytes.byteLength !== (version.size ?? version.sizeRaw))
         throw new SyncConflict("首次下载响应与清单版本不一致，待重新扫描");
+      if (attachment && !matchesAttachmentSignature(path, download.bytes))
+        throw new Error("attachment-signature-mismatch");
       return { ...download, etag, version };
     }
     async function cleanSavePlan(l: Snapshot, record: NextclawSyncRecord, before: Entity): Promise<ContentPlan | undefined> {
@@ -250,7 +258,7 @@ export function contentRuntime(input: SyncInput) {
     }
     async function readLocal() {
       const e = await fresh(input.fsLocal, lp); if (!e) return;
-      return localSnapshot(input.fsLocal, lp, e, guard);
+      return localSnapshot(input.fsLocal, lp, e, guard, fileBodies.fileLimit);
     }
     const io: DeleteIO = { scope, path, endpoint, nativeManaged: binding.nativeManaged,
       readLocal,
@@ -265,10 +273,22 @@ export function contentRuntime(input: SyncInput) {
       putRemote(bytes, expected) { guard(); return input.fsRemote.putContent(rp, bytes, expected); },
       async writeLocal(bytes, expectedHash, current) {
         current(); const e = await fresh(input.fsLocal, lp);
-        const before = e ? await localSnapshot(input.fsLocal, lp, e, guard) : undefined; current();
+        const before = e ? await localSnapshot(input.fsLocal, lp, e, guard, fileBodies.fileLimit) : undefined; current();
         if (before?.hash !== expectedHash) throw new SyncConflict("本地在替换前再次变化");
         if (initial) await assertInitialVersion(initial.version);
-        await input.fsLocal.writeFileGuarded(lp, bytes, Date.now(), Date.now(), e ?? null, before?.bytes, current); current();
+        const version = attachmentVersion;
+        if (attachment && (!version?.remoteFileId || e))
+          throw new SyncConflict("附件目标或远端版本不符合新建条件");
+        try {
+          await input.fsLocal.writeFileGuarded(lp, bytes, Date.now(), Date.now(), e ?? null, before?.bytes,
+            current, attachment && version ? () => assertInitialVersion(version) : undefined);
+        } catch (error) {
+          if (attachment && (error instanceof Error && error.name === "QuotaExceededError" ||
+              (error as { code?: string } | null)?.code === "ENOSPC"))
+            throw new Error("attachment-storage-quota-pending");
+          throw error;
+        }
+        current();
       },
       checkpoint: () => checkpoint.read(),
       async assertDeletionEvidence(afterKnownDelete = false) {
@@ -306,6 +326,8 @@ export function contentRuntime(input: SyncInput) {
         current(); const l = await fresh(input.fsLocal, lp), r = await fresh(input.fsRemote, rp); current();
         if (!r || !strongEtag(r.etag)) throw new SyncConflict("提交前远端版本缺失");
         if (initial && !matchesDownloadVersion(initial.version, r)) throw new SyncConflict("首次下载提交前远端版本变化");
+        if (attachment && r.remoteFileId !== content.remoteFileId)
+          throw new SyncConflict("附件提交前远端身份变化");
         const normalizedTag = r.etag.startsWith('"') ? r.etag : `"${r.etag}"`;
         if (normalizedTag !== content.remoteEtag) throw new SyncConflict("提交前远端版本改变");
         await checkpoint.commit(generation, content, pending, id, current, {
@@ -314,7 +336,7 @@ export function contentRuntime(input: SyncInput) {
         });
       }, requestRerun: () => { guard(); runtime!.requestRerun(); },
     };
-    return { io, checkpoint, readLocal, readForPlan, prefetchInitialDownload, deletion: new DeleteExecutor(deletions, io, runtime!.journal, guard, input.configDir), executor: new ContentExecutor(scope, path, bodies, operations, io, runtime!.journal,
+    return { io, checkpoint, bodies: fileBodies, readLocal, readForPlan, prefetchInitialDownload, deletion: new DeleteExecutor(deletions, io, runtime!.journal, guard, input.configDir), executor: new ContentExecutor(scope, path, fileBodies, operations, io, runtime!.journal,
       endpoint, () => { try { runtime!.assertActive(); return true; } catch { return false; } }, input.configDir, initial) };
   }
   async function collect() {
@@ -332,5 +354,5 @@ export function contentRuntime(input: SyncInput) {
   const move = (rootId: string) => binding.nativeManaged ? new ContentMove({ pool: runtime.pool, records: input.db.prevSyncRecordsTbl,
     history: input.db.fileContentHistoryTbl, vault: input.vaultRandomID, profile: input.profileID, configDir: input.configDir,
     journal: runtime.journal, assertActive: guard, local: input.fsLocal, remote: input.fsRemote, rootId }) : undefined;
-  return { scope, bodies, operations, rootReseed, ensureRoot, deletions, deletionEvidence, setManifest, file, guard, collect, move };
+  return { scope, bodies, attachments, operations, rootReseed, ensureRoot, deletions, deletionEvidence, setManifest, file, guard, collect, move };
 }

@@ -6,6 +6,8 @@ import { buildPlan, makeFilter, protection } from "./engine/plan";
 import { runLegacySync } from "./engine/legacy";
 import { contentRuntime, contentScope, checkVaultStages, ContentStagePaused } from "./content/runtime";
 import { selectBatch, type BatchState } from "./content/batches";
+import { isAttachmentPath, NOTE_LIMIT } from "./content/identity";
+import { isAttachmentRef } from "./content/store";
 import { planContent } from "./content/decision";
 import type { InitialDownloadGroup } from "./content/operation";
 import type { ContentReservation } from "./content/store";
@@ -178,7 +180,9 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       if (op.phase === "inputs-durable" && source !== "dry") { op.phase = "rediscover"; await rt.operations.put(op); }
       if (["remote-acknowledged", "local-verified"].includes(op.phase)) {
         if (source === "dry") throw new Error("有待提交的内容操作，请先进行正常同步");
-        const item = plan[op.path]; const outcome = await rt.file(op.path, item?.local, item?.remote).executor.finish(op.id);
+        const item = plan[op.path];
+        const outcome = await rt.file(op.path, item?.local, item?.remote, undefined,
+          isAttachmentRef(op.outputRef)).executor.finish(op.id);
         if (!["converged", "content-conflict"].includes(outcome.status)) {
           result.pendingContent!.push({ path: op.path, reason: outcome.reason });
           if (outcome.status === "failed") result.errors.push(new Error(outcome.reason));
@@ -197,6 +201,12 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
     const saveOnly = input.androidSaveOnly === true && source === "auto_sync_on_save" && !!rootId &&
       !result.errors.length && !(await rt.rootReseed.active());
     rt.guard();
+    const largeImported = (item: PlanItem) =>
+      isAttachmentRef(item.record?.content?.cleanBaseRef) &&
+      Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0,
+        item.remote?.size ?? item.remote?.sizeRaw ?? 0) > NOTE_LIMIT;
+    const fileForPlan = (key: string, item: PlanItem) =>
+      rt!.file(key, item.local, item.remote, undefined, largeImported(item));
     let batch = bounded ? selectBatch(contentEntries.map(([path, item]) => ({ path,
       urgent: item.record?.pendingLocalUpload === true,
       size: Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0, item.remote?.size ?? item.remote?.sizeRaw ?? 0) })),
@@ -211,17 +221,20 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           !(key.endsWith("/") || inConfig(key, input.configDir)) || (!item.change && !item.pending))) {
       const runtime = rt;
       const verified = [];
-      for (let i = 0; i < contentEntries.length; i += FIRST_B_RECOVERY_CONCURRENCY) {
-        const chunk = contentEntries.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
+      for (let i = 0; i < contentEntries.length;) {
+        const next = contentEntries.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
+        const large = next.findIndex(([, item]) => largeImported(item));
+        const chunk = large < 0 ? next : next.slice(0, Math.max(1, large));
         const checked = await Promise.allSettled(chunk.map(async ([key, item]) => {
-          const file = runtime.file(key, item.local, item.remote);
+          const file = fileForPlan(key, item);
           return (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
         }));
         runtime.guard();
         for (const check of checked) if (check.status === "rejected" &&
             !(check.reason instanceof SyncConflict) && (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
         for (const check of checked) if (check.status === "fulfilled" && check.value) verified.push(check.value);
-        if (verified.length !== i + chunk.length) break;
+        i += chunk.length;
+        if (verified.length !== i) break;
       }
       if (verified.length === contentEntries.length) {
         for (const [index, [, item]] of contentEntries.entries()) {
@@ -234,21 +247,29 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         bounded = false;
       }
     }
+    const canImport = batch && input.androidInitialDownload && rootId &&
+      !result.errors.length && !(await rt.rootReseed.active());
+    const newRemoteFiles = canImport ? contentEntries.filter(([key, item]) =>
+      ordinary(key) && !recheck.has(key) && !item.local && !item.record && !!item.remote?.remoteFileId &&
+      name(item.remote) === key && strongEtag(item.remote.etag)) : [];
+    const attachments = new Set(newRemoteFiles.filter(([key]) => isAttachmentPath(key)).map(([key]) => key));
     for (const issue of previousBatch?.issues ?? []) recheck.add(issue.path);
-    const initial = new Set(batch && input.androidInitialDownload && rootId && !batch.saveSweep &&
-      !result.errors.length && !(await rt.rootReseed.active()) ? contentEntries.filter(([key, item]) =>
-        ordinary(key) && !recheck.has(key) && !item.local && !item.record && !!item.remote?.remoteFileId &&
-        name(item.remote) === key && strongEtag(item.remote.etag)).map(([key]) => key) : []);
-    const inspect = async (key: string, item: PlanItem, f = rt!.file(key, item.local, item.remote)) => {
+    const initial = new Set(batch && !batch.saveSweep ? newRemoteFiles.filter(([key]) =>
+      !attachments.has(key) && !recheck.has(key)).map(([key]) => key) : []);
+    const inspect = async (key: string, item: PlanItem, f = fileForPlan(key, item)) => {
       rt!.guard();
       try {
         const l = await f.readLocal();
         const record = (batch?.saveSweep ?? saveOnly) && !recheck.has(key) && !result.errors.length ? item.record : undefined;
         const { clean, remote: r } = await f.readForPlan(l, record);
-        item.content = clean ?? await planContent({ scope: rt!.scope, path: key, store: rt!.bodies, rawRecord: recordByPath.get(key),
+        item.content = clean ?? await planContent({ scope: rt!.scope, path: key, store: f.bodies, rawRecord: recordByPath.get(key),
           mode: "B", configDir: input.configDir, ownerActive: () => { try { rt!.guard(); return true; } catch { return false; } },
           unknownWrite: journal!.blocked(), deletion: item.record && (!l || !r) ? await rt!.deletionEvidence(key) : undefined, local: l, remote: r && { bytes: r.bytes, etag: r.etag, remoteFileId: r.remoteFileId },
           readConflict: async id => (await rt!.operations.get(id))?.conflict });
+        if (largeImported(item) && !["hold", "none", "preserve-both"].includes(item.content.action)) {
+          item.content = { action: "hold", status: "pending", reason: "large-attachment-change-pending",
+            fullyConverged: false, fatalBudgetDelta: 0 };
+        }
         item.decision = "content"; item.change = !["prepare-base", "hold", "none", "preserve-both"].includes(item.content.action);
         item.reason = item.content.reason;
         if (item.content.status === "failed") { item.error = item.content.reason; result.errors.push(new Error(`${key}：${item.error}`)); }
@@ -300,11 +321,15 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         }
       }
       rt.guard(); await executePlan(input, plan, result.errors); rt.guard();
-      if (batch && !result.errors.length && initial.size) {
-        batch.selected = [...new Set([...batch.selected, ...initial])];
-        batch.next.remaining = batch.next.remaining.filter(key => !initial.has(key));
-        batch.next.completed = batch.next.remaining.length ? [...new Set([...batch.next.completed, ...initial])] : [];
-      } else initial.clear();
+      if (batch && !result.errors.length && (initial.size || attachments.size)) {
+        const importing = new Set([...initial, ...attachments]);
+        batch.selected = [...new Set([...batch.selected, ...importing])];
+        batch.next.remaining = batch.next.remaining.filter(key => !importing.has(key));
+        batch.next.completed = batch.next.remaining.length ? [...new Set([...batch.next.completed, ...importing])] : [];
+      } else {
+        initial.clear();
+        attachments.clear();
+      }
       let done = 0;
       let initialNeedsRescan = false;
       const executionEntries = bounded ? batch!.selected.map(key => [key, plan[key]] as const) : Object.entries(plan);
@@ -323,7 +348,8 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         const f = prepared ?? rt!.file(key, item.local, item.remote);
         if (group && p.action !== "download-create") throw new Error("initial-download-admission-changed");
         const out = await (p.action.startsWith("delete-") ? f.deletion.execute(p) : f.executor.execute(p, group)); item.reason = out.reason;
-        if (prepared && out.status === "pending" && out.reason !== "content-limit-pending") initialNeedsRescan = true;
+        if (prepared && out.status === "pending" &&
+            !["content-limit-pending", "attachment-storage-quota-pending"].includes(out.reason)) initialNeedsRescan = true;
         await cb.progress(source, ++done, Object.values(plan).filter(i=>i.content).length, key, "content");
         if (out.status === "failed") { item.error = out.reason; result.errors.push(new Error(`${key}：${out.reason}`)); }
         else if (out.status !== "converged") item.contentPending = out.status === "content-conflict" ? "content-conflict" : out.reason;
@@ -333,7 +359,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         if (!deferCollection) await rt!.collect();
       };
       for (const [key, item] of executionEntries) {
-        if (reserved.has(key) || initial.has(key)) continue;
+        if (reserved.has(key) || initial.has(key) || attachments.has(key)) continue;
         await executeContent(key, item);
         if (result.contentSummary!.blocked) break;
       }
@@ -431,6 +457,46 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         // At most one read-only chunk is ahead of publication. Drain it
         // before releasing the owner, including after an interrupted commit.
         await prefetched;
+      }
+      for (const key of attachments) {
+        if (result.contentSummary!.blocked || result.errors.length >= 10) {
+          plan[key].contentPending = "前序错误，未执行";
+          continue;
+        }
+        const item = plan[key];
+        const remote = item.remote!;
+        const size = remote.size ?? remote.sizeRaw;
+        const file = rt.file(key, undefined, remote, undefined, true);
+        if (size > file.bodies.fileLimit) {
+          item.contentPending = "attachment-file-limit-pending";
+          continue;
+        }
+        let reservation: ContentReservation | undefined;
+        try {
+          reservation = await file.bodies.reserveCapacity(new Map([[key, size * 3]]));
+          const download = await file.prefetchInitialDownload(remote);
+          const priorOperations = await rt.operations.list(rt.scope); rt.guard();
+          await executeContent(key, item, rt.file(key, undefined, remote, download, true), true,
+            { reservation, priorOperations, writeLocal: work => work() });
+        } catch (error) {
+          const reason = errorOf(error).message;
+          const status = (error as { status?: number } | undefined)?.status;
+          if (error instanceof SyncConflict || status === 404 || status === 412) {
+            item.contentPending = "首次下载版本变化，待重新扫描";
+            initialNeedsRescan = true;
+          } else if (reason === "attachment-signature-mismatch") {
+            reservation?.release();
+            reservation = undefined;
+            await executeContent(key, item);
+          } else if (["content-limit-pending", "attachment-file-limit-pending", "attachment-storage-quota-pending"].includes(reason)) {
+            item.contentPending = reason === "content-limit-pending" ? "attachment-budget-pending" : reason;
+          } else {
+            item.error = reason;
+            result.errors.push(errorOf(error));
+          }
+        } finally {
+          reservation?.release();
+        }
       }
       if (!result.contentSummary!.blocked) {
         await rt.collect();

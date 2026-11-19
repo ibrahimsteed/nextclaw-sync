@@ -228,6 +228,23 @@ describe("exclusive creation on hidden paths", () => {
     } finally { clearTimeout(limit); releases(); }
   });
 
+  it("revalidates a new attachment after staging and retains its bytes on rejection", async () => {
+    const h = host();
+    const path = "new.png";
+    let checked = false;
+    await assert.rejects(h.fs.writeFileGuarded(path, bytes("incoming"), 10000, 10000, null, undefined, undefined,
+      async () => {
+        assert.ok([...h.files].some(([file, body]) => file.startsWith(".trash/nextclaw-staging-") && text(body) === "incoming"));
+        assert.equal(h.files.has(path), false);
+        checked = true;
+        await Promise.resolve();
+        throw new Error("remote version changed");
+      }), /remote version changed/);
+    assert.equal(checked, true);
+    assert.equal(h.files.has(path), false);
+    assert.ok([...h.files].some(([file, body]) => file.startsWith(".trash/nextclaw-staging-") && text(body) === "incoming"));
+  });
+
   it("refuses a same-name creation immediately before exclusive publication", async () => {
     const h = host();
     h.setBeforeCopy(() => h.files.set("new.md", bytes("concurrent")));

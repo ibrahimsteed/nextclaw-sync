@@ -1,7 +1,7 @@
 import type { NextclawSyncRecord } from "../../localdb";
 import { validContentRecord } from "./identity";
 import type { OperationRepository } from "./operation";
-import { ContentStore } from "./store";
+import { ATTACHMENT_BODY, CONTENT_BODY, ContentStore } from "./store";
 import type { ContentTable } from "./store";
 import type { committedMove } from "./move";
 /** Only run under the full-sync owner gate, never in an admitted content operation. */
@@ -78,7 +78,7 @@ export async function collectContent(scope: string, table: ContentTable & { remo
   for (const key of await table.keys()) {
     guard(); let parts: unknown;
     try { parts = JSON.parse(key); } catch { continue; }
-    if (!Array.isArray(parts) || parts[0] !== "nextclaw-content" || parts[2] !== scope) continue;
+    if (!Array.isArray(parts) || (parts[0] !== CONTENT_BODY && parts[0] !== ATTACHMENT_BODY) || parts[2] !== scope) continue;
     if (parts[1] !== 1 || parts.length !== 5) throw new Error("GC拒绝未知正文版本");
     if (!pins.has(key)) { guard(); await table.removeItem(key); guard(); removed++; }
   }

@@ -38,7 +38,8 @@ export abstract class FakeFs {
     ctime: number,
     expected: Entity | null,
     expectedBytes?: ArrayBuffer,
-    _assertCurrent?: () => void
+    _assertCurrent?: () => void,
+    _verifyStagedCreate?: () => Promise<void>
   ): Promise<Entity> {
     throw new Error(`此存储不支持受保护写入：${key}`);
   }
