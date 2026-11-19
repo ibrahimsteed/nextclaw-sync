@@ -635,6 +635,8 @@ export default class NextclawSyncPlugin extends Plugin {
         mode,
         ...(verifyFirstBRecovery ? { androidFirstBRecovery: true as const } : {}),
         androidSaveOnly: isSave && Platform.isAndroidApp ? true : undefined,
+        ipadInitialDownload: Platform.isIosApp && Platform.isTablet && mode === "B" &&
+          this.settings.nextclawReloadAfterFirstBSync === true ? true : undefined,
         androidInitialDownload: Platform.isAndroidApp && mode === "B" &&
           this.settings.nextclawReloadAfterFirstBSync === true ? true : undefined,
         fsLocal,

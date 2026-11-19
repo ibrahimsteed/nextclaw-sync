@@ -1,2 +1,3 @@
 export const EMPTY_FIRST_B_DOWNLOAD_LIMIT = 8;
 export const INITIAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+export const IPAD_FIRST_B_DOWNLOAD_LIMIT = 8;

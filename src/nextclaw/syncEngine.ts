@@ -1,4 +1,4 @@
-import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "./content/initialDownloadLimit";
+import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES, IPAD_FIRST_B_DOWNLOAD_LIMIT } from "./content/initialDownloadLimit";
 import { probeEvent } from "./content/probeTrace";
 import { isOrdinaryMovePath, SyncConflict } from "./engine/versionGuard";
 import { getAllPrevSyncRecordsByVaultAndProfile, insertSyncPlanRecordByVault } from "../localdb";
@@ -262,15 +262,15 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       urgent: item.record?.pendingLocalUpload === true,
       size: Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0, item.remote?.size ?? item.remote?.sizeRaw ?? 0) })),
       previousBatch, saveOnly) : undefined;
-    const canImport = batch && input.androidInitialDownload && rootId &&
+    const canImport = batch && (input.androidInitialDownload || (input.ipadInitialDownload && records.length === 0)) && rootId &&
       !result.errors.length && !(await rt.rootReseed.active());
     const newRemoteFiles = canImport ? contentEntries.filter(([key, item]) =>
       ordinary(key) && !recheck.has(key) && !item.local && !item.record && !!item.remote?.remoteFileId &&
       name(item.remote) === key && strongEtag(item.remote.etag)) : [];
-    const attachments = new Set(newRemoteFiles.filter(([key]) => isAttachmentPath(key)).map(([key]) => key));
+    const attachments = new Set((input.androidInitialDownload ? newRemoteFiles : []).filter(([key]) => isAttachmentPath(key)).map(([key]) => key));
     for (const issue of previousBatch?.issues ?? []) recheck.add(issue.path);
     const initial = new Set(batch && !batch.saveSweep ? newRemoteFiles.filter(([key]) =>
-      !attachments.has(key) && !recheck.has(key)).map(([key]) => key) : []);
+      !isAttachmentPath(key) && !recheck.has(key)).map(([key]) => key) : []);
     const inspect = async (key: string, item: PlanItem, f = fileForPlan(key, item)) => {
       rt!.guard();
       try {
@@ -380,7 +380,9 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       }
       const runtime = rt;
       const downloads = executionEntries.filter(([key]) => initial.has(key));
-      const lanes = records.length === 0 ? EMPTY_FIRST_B_DOWNLOAD_LIMIT : INITIAL_DOWNLOAD_CONCURRENCY;
+      const lanes = records.length === 0
+        ? input.ipadInitialDownload ? IPAD_FIRST_B_DOWNLOAD_LIMIT : EMPTY_FIRST_B_DOWNLOAD_LIMIT
+        : INITIAL_DOWNLOAD_CONCURRENCY;
       let inFlightBytes = 0;
       const byteSize = (item: PlanItem) => item.remote!.size ?? item.remote!.sizeRaw;
       const readDownloadChunk = (start: number) => {

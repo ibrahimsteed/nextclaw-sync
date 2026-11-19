@@ -58,6 +58,7 @@ export interface SyncInput {
   contentRuntime?: ContentRuntime;
   androidSaveOnly?: true;
   androidInitialDownload?: true;
+  ipadInitialDownload?: true;
   androidFirstBRecovery?: true;
   mode: "A" | "B";
   fsLocal: FakeFs;

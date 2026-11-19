@@ -1,4 +1,4 @@
-import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "../../src/nextclaw/content/initialDownloadLimit";
+import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES, IPAD_FIRST_B_DOWNLOAD_LIMIT } from "../../src/nextclaw/content/initialDownloadLimit";
 import "fake-indexeddb/auto";
 import { strict as assert } from "assert";
 import { prepareDBs, type NextclawSyncRecord } from "../../src/localdb";
@@ -351,8 +351,12 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("downloads beyond a normal batch with one full scan and the configured GET ceiling", async () => {
+  for (const platform of ["Android", "iPad"]) it(`${platform} downloads beyond a normal batch with one full scan and the configured GET ceiling`, async () => {
     const t = await fixture(35);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
     let active = 0, peak = 0, reads = 0, fileStats = 0, recordScans = 0, capacityScans = 0;
     const records = t.db.prevSyncRecordsTbl;
     const iterate = records.iterate.bind(records);
@@ -382,7 +386,7 @@ describe("Android first B download", () => {
     };
     try {
       assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.equal(peak, EMPTY_FIRST_B_DOWNLOAD_LIMIT);
+      assert.equal(peak, platform === "iPad" ? IPAD_FIRST_B_DOWNLOAD_LIMIT : EMPTY_FIRST_B_DOWNLOAD_LIMIT);
       assert.equal(reads, 35);
       // The test transport validates each conditional GET with an extra stat.
       assert.equal(fileStats - reads, 35 * 4);
@@ -701,7 +705,7 @@ describe("Android first B download", () => {
     } finally { resumed.retire(); t.stop(); }
   });
 
-  it("passes the initial-download signal from the real Android B cutover entry only while reload is pending", async () => {
+  it("passes the initial-download signal from the real Android and iPad B cutover entry only while reload is pending", async () => {
     const t = await fixture();
     const entries: SyncInput[] = [];
     const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, async input => {
@@ -721,10 +725,18 @@ describe("Android first B download", () => {
       m.platform.isAndroidApp = false;
       assert.equal(await m.run(), "ok");
       assert.equal(entries.at(-1)?.androidInitialDownload, undefined);
+      m.platform.isIosApp = true;
+      assert.equal(await m.run(), "ok");
+      assert.equal(entries.at(-1)?.ipadInitialDownload, undefined);
+      m.platform.isTablet = true;
+      assert.equal(await m.run(), "ok");
+      assert.equal(entries.at(-1)?.ipadInitialDownload, true);
+      assert.equal(entries.at(-1)?.androidInitialDownload, undefined);
       m.platform.isAndroidApp = true;
       m.plugin.settings.nextclawReloadAfterFirstBSync = false;
       assert.equal(await m.run(), "ok");
       assert.equal(entries.at(-1)?.androidInitialDownload, undefined);
+      assert.equal(entries.at(-1)?.ipadInitialDownload, undefined);
     } finally { t.stop(); }
   });
 
