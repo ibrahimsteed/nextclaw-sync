@@ -1,7 +1,5 @@
-# NextClaw Sync 0.2.3
+# NextClaw Sync 0.2.4
 
-- Speeds up the first switch from the read-only demo vault to an account vault on Android. Ordinary remote-only files can download and be written in bounded parallel groups. Remote version checks and local overwrite protection remain in place.
-- After the first successful switch and automatic Obsidian reload, one recovery run checks clean files without downloading their bodies again when their versions and local content still match.
-- In an Android app-storage test with 1,419 ordinary files, the full vault synced and the designated note opened after automatic reload in 9 minutes 20 seconds. This was a test with one fixed snapshot and network environment.
-
-Suspected renames stay pending on Android. The plugin does not automatically send WebDAV MOVE requests for them. While a rename collision is unresolved, deletion of other files in the same vault may also be deferred. The first-sync performance result applies to the tested Android environment.
+- The first Android account sync can download up to eight ordinary remote-only files concurrently in a new vault. Guarded local writes remain limited to four concurrent operations. Each publication retains remote file identity and version checks and protects occupied local paths.
+- First-sync Android GIF and PNG imports use a separate content budget, with a 50 MiB per-file limit and one attachment at a time. Previously deferred downloads can resume, and verified clean files can be reused without downloading their bodies again.
+- In a test with a fixed snapshot containing 1,485 ordinary files on a MacBook Android 15 emulator, the full vault converged and the designated note opened after automatic reload in 7 minutes 0 seconds. Independent verification passed. Times depend on the device, snapshot and network.
