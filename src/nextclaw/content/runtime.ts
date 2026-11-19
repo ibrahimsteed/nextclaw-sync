@@ -1,3 +1,4 @@
+import { probeSpan } from "./probeTrace";
 import type { Entity } from "../../baseTypes";
 import { getAllPrevSyncRecordsByVaultAndProfile, type InternalDBs, type NextclawSyncRecord } from "../../localdb";
 import { RootReseed, checkRootStages, RootStagePaused } from "./rootReseed";
@@ -153,7 +154,7 @@ export function contentRuntime(input: SyncInput) {
     manifestUnsafe = unsafe; manifestLocal = l; manifestRemote = r; manifestRecords = records;
   };
   const fresh = async (fs: SyncInput["fsLocal"], path: string) => {
-    guard(); try { const e = await fs.stat(path); guard(); return e; }
+    guard(); try { const e = await (fs.kind === "webdav" && !path.endsWith("/") ? probeSpan(path, "version", () => fs.stat(path)) : fs.stat(path)); guard(); return e; }
     catch (e) { guard(); const v = e as { code?: string; status?: number }; if ((fs.kind !== "webdav" && v.code === "ENOENT") || v.status === 404) return; throw e; }
   };
   async function deletionEvidence(path: string) {
@@ -196,7 +197,7 @@ export function contentRuntime(input: SyncInput) {
       `${input.vaultRandomID}\t${input.profileID}\t${path}`, scope, seed, guard);
     async function readRemoteVersion(e: Entity, verify = () => assertVersion(input.fsRemote, rp, e)) {
       if ((e.size ?? e.sizeRaw) > fileBodies.fileLimit) throw new Error("content-limit-pending");
-      const view = await input.fsRemote.readContent(rp, e); guard();
+      const view = await probeSpan(path, "get", () => input.fsRemote.readContent(rp, e)); guard();
       if (attachment && view.bytes.byteLength > fileBodies.fileLimit)
         throw new Error("attachment-file-limit-pending");
       await verify(); guard();
@@ -280,8 +281,8 @@ export function contentRuntime(input: SyncInput) {
         if (attachment && (!version?.remoteFileId || e))
           throw new SyncConflict("附件目标或远端版本不符合新建条件");
         try {
-          await input.fsLocal.writeFileGuarded(lp, bytes, Date.now(), Date.now(), e ?? null, before?.bytes,
-            current, attachment && version ? () => assertInitialVersion(version) : undefined);
+          await probeSpan(path, "guarded-write", () => input.fsLocal.writeFileGuarded(lp, bytes, Date.now(), Date.now(), e ?? null, before?.bytes,
+            current, attachment && version ? () => assertInitialVersion(version) : undefined));
         } catch (error) {
           if (attachment && (error instanceof Error && error.name === "QuotaExceededError" ||
               (error as { code?: string } | null)?.code === "ENOSPC"))
@@ -301,7 +302,7 @@ export function contentRuntime(input: SyncInput) {
       async removeRemote(etag, hash, dispatch) {
         guard(); const e = await fresh(input.fsRemote, rp); guard();
         if (!e || (e.etag?.startsWith('"') ? e.etag : `"${e.etag}"`) !== etag) throw new SyncConflict("delete-remote-version-changed");
-        const view = await input.fsRemote.readContent(rp, e); guard();
+        const view = await probeSpan(path, "get", () => input.fsRemote.readContent(rp, e)); guard();
         if (await hashBytes(view.bytes) !== hash) throw new SyncConflict("delete-remote-content-changed");
         guard(); return dispatch(() => { guard(); return input.fsRemote.deleteContent(rp, e); });
       },

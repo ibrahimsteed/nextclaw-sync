@@ -80,6 +80,43 @@ describe("Android first B download", () => {
     return body.buffer;
   }
 
+  it("traces a fast download waiting for a slow peer through protected write and durable readback", async () => {
+    const t = await fixture(4);
+    const events: { phase: string; path: string; sequence: number }[] = [];
+    const host = globalThis as { __nextclawSmallFileProbe?: (payload: string) => void };
+    const [fast, slow] = t.paths;
+    let release!: () => void;
+    const slowGate = new Promise<void>(resolve => { release = resolve; });
+    host.__nextclawSmallFileProbe = payload => {
+      const event = JSON.parse(payload) as typeof events[number];
+      events.push(event);
+      if (event.path === fast && event.phase === "download-ready") release();
+    };
+    const read = t.remote.readContent.bind(t.remote);
+    t.remote.readContent = async (path, expected) => {
+      if (path === slow) await slowGate;
+      return read(path, expected);
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      const at = (path: string, phase: string) => {
+        const event = events.find(row => row.phase === phase && row.path === path);
+        assert.ok(event, phase);
+        return event.sequence;
+      };
+      assert.ok(at(fast, "get:ok") < at(fast, "download-ready"));
+      assert.ok(at(fast, "download-ready") < at(slow, "download-ready"));
+      assert.ok(at(slow, "download-ready") < at(fast, "group-released"));
+      assert.ok(at(fast, "group-released") < at(fast, "guarded-write:start"));
+      assert.ok(at(fast, "guarded-write:ok") < at(fast, "idb-write-complete"));
+      assert.ok(at(fast, "idb-write-complete") < at(fast, "checkpoint-readback-verified"));
+      assert.ok(events.some(row => row.path === fast && row.phase === "version:ok"));
+    } finally {
+      delete host.__nextclawSmallFileProbe;
+      t.stop();
+    }
+  });
+
   it("resumes the four capacity holds from an existing B sweep and verifies imports after reload", async () => {
     const t = await fixture(0);
     const sizes = { "demo.gif": 10843290, "one.png": 1653277, "two.png": 1317257, "three.png": 1392586 };

@@ -1,3 +1,4 @@
+import { probeEvent, probeSpan } from "./probeTrace";
 import { operationIntentHash } from "./operation";
 import { strongEtag } from "./migration";
 import { jsonArrayKeyRange, type IdbConnectionPool, type IdbStore } from "../../idbStore";
@@ -113,11 +114,11 @@ export class IdbContentCheckpoint {
   private async transact(content?: ContentRecord, pending = false, commitId?: string, expected?: string, assertCurrent?: () => void, observed?: Pick<NextclawSyncRecord, "local" | "remote" | "sizeRaw" | "keyRaw">): Promise<Checkpoint> {
     const guard = () => { this.guard(); assertCurrent?.(); };
     guard(); const db = await this.pool.database(this.records.dbName, [this.records.storeName, this.history.storeName]); guard();
-    return new Promise<Checkpoint>((resolve, reject) => {
+    return probeSpan(this.seed.key, content ? "idb-write" : "idb-read", () => new Promise<Checkpoint>((resolve, reject) => {
       const tx = db.transaction([this.records.storeName, this.history.storeName], content ? "readwrite" : "readonly");
       let error: Error | undefined, result: Checkpoint;
       tx.onabort = tx.onerror = () => reject(error ?? tx.error ?? Error("checkpoint transaction failed"));
-      tx.oncomplete = () => { try { guard(); resolve(result); } catch (e) { reject(e instanceof Error ? e : Error("checkpoint owner rejected")); } };
+      tx.oncomplete = () => { probeEvent(this.seed.key, content ? "idb-write-complete" : "idb-read-complete"); try { guard(); resolve(result); } catch (e) { reject(e instanceof Error ? e : Error("checkpoint owner rejected")); } };
       const records = tx.objectStore(this.records.storeName), history = tx.objectStore(this.history.storeName);
       const recordRequest = records.get(this.recordKey), auxRequest = history.get(this.auxKey()); let ready = 0;
       const consume = () => {
@@ -140,7 +141,7 @@ export class IdbContentCheckpoint {
         } catch (e) { error = e instanceof Error ? e : Error("checkpoint failed"); tx.abort(); }
       };
       recordRequest.onsuccess = consume; auxRequest.onsuccess = consume;
-    });
+    }));
   }
   read() { return this.transact(); }
   async commit(generation: string, content: ContentRecord, pending: boolean, id: string, assertCurrent?: () => void, observed?: Pick<NextclawSyncRecord, "local" | "remote" | "sizeRaw" | "keyRaw">) {

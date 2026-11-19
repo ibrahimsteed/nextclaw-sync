@@ -1,3 +1,4 @@
+import { probeEvent } from "./content/probeTrace";
 import { isOrdinaryMovePath, SyncConflict } from "./engine/versionGuard";
 import { getAllPrevSyncRecordsByVaultAndProfile, insertSyncPlanRecordByVault } from "../localdb";
 import { executePlan } from "./engine/execute";
@@ -380,7 +381,17 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       const downloads = executionEntries.filter(([key]) => initial.has(key));
       const readDownloadChunk = (start: number) => Promise.allSettled(
         downloads.slice(start, start + INITIAL_DOWNLOAD_CONCURRENCY).map(async ([key, item]) =>
-          runtime.file(key, undefined, item.remote).prefetchInitialDownload(item.remote!)));
+          {
+            probeEvent(key, "group-dispatch", { group: start });
+            try {
+              const download = await runtime.file(key, undefined, item.remote).prefetchInitialDownload(item.remote!);
+              probeEvent(key, "download-ready", { group: start, bytes: download.bytes.byteLength });
+              return download;
+            } catch (error) {
+              probeEvent(key, "download-rejected", { group: start });
+              throw error;
+            }
+          }));
       let prefetched: ReturnType<typeof readDownloadChunk> | undefined;
       let reservation: ContentReservation | undefined;
       let collectionEnd = 0;
@@ -412,6 +423,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           const chunk = downloads.slice(i, next);
           const ready = await (prefetched ?? readDownloadChunk(i));
           prefetched = undefined;
+          for (const [key] of chunk) probeEvent(key, "group-released", { group: i });
           runtime.guard();
           if (next < downloads.length) prefetched = readDownloadChunk(next);
           const apply = async ([key, item]: typeof chunk[number], j: number, group?: InitialDownloadGroup) => {

@@ -1,3 +1,4 @@
+import { probeEvent, probeSpan } from "./probeTrace";
 import { nanoid } from "nanoid";
 import { inConfig } from "../engine/model";
 import { SyncConflict } from "../engine/versionGuard";
@@ -96,9 +97,10 @@ export class ContentExecutor {
   }
   private async publish(generation: string, content: ContentRecord, pending: boolean, id: string) {
     this.guard(); await this.io.commit(generation, content, pending, id, () => this.guard()); this.guard();
-    const saved = await this.io.checkpoint(); this.guard();
+    const saved = await probeSpan(this.path, "checkpoint-readback", () => this.io.checkpoint()); this.guard();
     if (saved.commitId !== id || saved.generation === generation || saved.pendingLocalUpload !== pending ||
       serialized(saved.content) !== serialized(content)) throw new Error("record-commit-readback-failed");
+    probeEvent(this.path, "checkpoint-readback-verified");
   }
   private async exclusive(work: () => Promise<ContentOutcome>, group?: InitialDownloadGroup): Promise<ContentOutcome> {
     const locks = active.get(this.journal) ?? new Map<string, ScopeLock>();
