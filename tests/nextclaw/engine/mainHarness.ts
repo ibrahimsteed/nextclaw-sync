@@ -26,6 +26,8 @@ import {
 } from "../../../src/nextclaw/accountPolicy";
 import { switchAtoB } from "../../../src/nextclaw/switchAtoB";
 import {
+  RELOAD_COMMAND_ID,
+  dispatchFirstBReload,
   markReloadPending,
   reloadAfterFirstASync,
   reloadAfterFirstBSync,
@@ -80,6 +82,8 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
     runSync: engine,
     switchAtoB,
     markReloadPending,
+    RELOAD_COMMAND_ID,
+    dispatchFirstBReload,
     reloadAfterFirstBSync,
     shouldReloadAfterSync,
     reloadAfterFirstASync,
@@ -142,6 +146,7 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
     db: h.input.db,
     vaultRandomID: "v",
     getCurrProfileID: () => "p",
+    firstBRecoveryScope: () => "fixture-first-b-scope",
     i18n: { t: (s: string) => s },
     saveSettings: async () => {},
     updateLastSyncMsg: () => {},
@@ -154,6 +159,6 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
     executed,
     guardUi,
     platform,
-    run: (trigger = "manual", saveOnly = false) => fn.call(plugin, trigger, saveOnly),
+    run: (trigger = "manual", saveOnly = false, firstBRecovery?: string) => fn.call(plugin, trigger, saveOnly, firstBRecovery),
   };
 }

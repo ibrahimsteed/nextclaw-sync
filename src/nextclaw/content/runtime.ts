@@ -11,16 +11,25 @@ import { loadContentHistory, strongEtag } from "./migration";
 import type { ContentPlan } from "./decision";
 import { ContentStore } from "./store";
 import { IdbContentCheckpoint, TableOperationRepository } from "./repository";
-import { ContentExecutor } from "./operation";
+import { ContentExecutor, type ContentView } from "./operation";
 import { collectContent } from "./cleanup";
 import { acknowledgedMove, committedMove, ContentMove, contentMoveKey, isFinishedMove } from "./move";
 export class ContentStagePaused extends Error {
   constructor() { super("存在缺少明确完成回执的内容写入；同步已暂停，请保留现场"); }
 }
+
+type InitialDownload = ContentView & { version: Entity; etag: string };
+
+function matchesDownloadVersion(expected: Entity, actual: Entity | undefined) {
+  return !!actual && !!expected.remoteFileId && name(actual) === name(expected) &&
+    actual.remoteFileId === expected.remoteFileId && actual.remoteChecksum === expected.remoteChecksum &&
+    actual.etag === expected.etag && sameVersion(expected, actual);
+}
 export async function checkVaultStages(db: InternalDBs, vault: string, assertActive: () => void, moveScope?: () => string | undefined) {
   assertActive();
   try { await checkRootStages(db.fileContentHistoryTbl, vault, assertActive); }
   catch (e) { if (e instanceof RootStagePaused) throw new ContentStagePaused(); throw e; }
+  const operationIds = new Map<string, Set<string>>();
   for (const key of await db.fileContentHistoryTbl.keys()) {
     assertActive(); let k: unknown;
     try { k = JSON.parse(key); } catch { continue; }
@@ -49,8 +58,18 @@ export async function checkVaultStages(db: InternalDBs, vault: string, assertAct
       if (entries.some(o => o.phase === "dispatched")) throw new ContentStagePaused();
       continue;
     }
-    const op = await new TableOperationRepository(db.fileContentHistoryTbl, parts[2], assertActive).get(parts[3]); assertActive();
-    if (!op || op.phase === "remote-dispatched") throw new ContentStagePaused();
+    const ids = operationIds.get(parts[2]) ?? new Set<string>();
+    ids.add(parts[3]);
+    operationIds.set(parts[2], ids);
+  }
+  for (const [scope, ids] of operationIds) {
+    const rows = await new TableOperationRepository(db.fileContentHistoryTbl, scope, assertActive).list(scope);
+    assertActive();
+    for (const op of rows) {
+      if (op.phase === "remote-dispatched") throw new ContentStagePaused();
+      ids.delete(op.id);
+    }
+    if (ids.size) throw new ContentStagePaused();
   }
 }
 export async function assertContentResetSafe(db: InternalDBs, vault: string, assertActive: () => void) {
@@ -163,7 +182,7 @@ export function contentRuntime(input: SyncInput) {
     if (local && current && holds[path]) { delete holds[path]; await input.db.simpleKVForMiscTbl.setItem(holdKey, holds); guard(); }
     return { confirmedMissing: current === undefined, suspectedMove: manifestUnsafe || !!holds[path], reseed };
   }
-  function file(path: string, local?: Entity, remote?: Entity) {
+  function file(path: string, local?: Entity, remote?: Entity, initial?: InitialDownload) {
     const lp = local ? name(local) : remote ? name(remote) : path;
     const rp = remote ? name(remote) : local ? name(local) : path;
     const endpoint = input.fsRemote.contentEndpoint(rp);
@@ -172,12 +191,25 @@ export function contentRuntime(input: SyncInput) {
       remote: remote ? observation(remote, "remote") : { mtime: 0, size: 0 } };
     const checkpoint = new IdbContentCheckpoint(runtime!.pool, input.db.prevSyncRecordsTbl, input.db.fileContentHistoryTbl,
       `${input.vaultRandomID}\t${input.profileID}\t${path}`, scope, seed, guard);
-    async function readRemoteVersion(e: Entity) {
+    async function readRemoteVersion(e: Entity, verify = () => assertVersion(input.fsRemote, rp, e)) {
       if ((e.size ?? e.sizeRaw) > NOTE_LIMIT) throw new Error("content-limit-pending");
       const view = await input.fsRemote.readContent(rp, e); guard();
-      await assertVersion(input.fsRemote, rp, e); guard();
+      await verify(); guard();
       if (e.remoteChecksum && e.remoteChecksum !== await hashBytes(view.bytes)) throw new SyncConflict("远端正文校验和不匹配");
       guard(); return { ...view, remoteFileId: e.remoteFileId };
+    }
+    async function assertInitialVersion(version: Entity) {
+      const current = await fresh(input.fsRemote, rp); guard();
+      if (!matchesDownloadVersion(version, current))
+        throw new SyncConflict("首次下载期间远端版本变化，待重新扫描");
+    }
+    async function prefetchInitialDownload(version: Entity): Promise<InitialDownload> {
+      const download = await readRemoteVersion(version, () => assertInitialVersion(version));
+      const { etag } = download;
+      if (etag !== etagHeader(version) ||
+          download.bytes.byteLength !== (version.size ?? version.sizeRaw))
+        throw new SyncConflict("首次下载响应与清单版本不一致，待重新扫描");
+      return { ...download, etag, version };
     }
     async function cleanSavePlan(l: Snapshot, record: NextclawSyncRecord, before: Entity): Promise<ContentPlan | undefined> {
       const c = record.content;
@@ -200,16 +232,21 @@ export function contentRuntime(input: SyncInput) {
         fatalBudgetDelta: 0, expected: { scope, path, localHash: l.hash, remoteHash: l.hash,
           remoteEtag: c.remoteEtag, baseRef: c.cleanBaseRef } };
     }
-    async function readForPlan(l?: Snapshot, record?: NextclawSyncRecord) {
+    async function readForPlan(l?: Snapshot, record?: NextclawSyncRecord, cleanOnly = false) {
+      if (initial) {
+        if (l) throw new SyncConflict("首次下载本地目标已出现，待重新扫描");
+        // The executor checks the version again before admitting any write.
+        return { remote: initial };
+      }
       const before = await fresh(input.fsRemote, rp);
       if (!before) return {};
       const clean = l && record ? await cleanSavePlan(l, record, before) : undefined;
-      if (!clean) return { remote: await readRemoteVersion(before) };
+      if (!clean) return cleanOnly ? {} : { remote: await readRemoteVersion(before) };
       const after = await fresh(input.fsRemote, rp);
       if (!after) throw new SyncConflict();
       if (sameVersion(before, after) && name(before) === name(after) &&
         before.remoteFileId === after.remoteFileId && before.remoteChecksum === after.remoteChecksum) return { clean };
-      return { remote: await readRemoteVersion(after) };
+      return cleanOnly ? {} : { remote: await readRemoteVersion(after) };
     }
     async function readLocal() {
       const e = await fresh(input.fsLocal, lp); if (!e) return;
@@ -218,6 +255,10 @@ export function contentRuntime(input: SyncInput) {
     const io: DeleteIO = { scope, path, endpoint, nativeManaged: binding.nativeManaged,
       readLocal,
       async readRemote() {
+        if (initial) {
+          await assertInitialVersion(initial.version);
+          return initial;
+        }
         const e = await fresh(input.fsRemote, rp); if (!e) return;
         return readRemoteVersion(e);
       },
@@ -226,6 +267,7 @@ export function contentRuntime(input: SyncInput) {
         current(); const e = await fresh(input.fsLocal, lp);
         const before = e ? await localSnapshot(input.fsLocal, lp, e, guard) : undefined; current();
         if (before?.hash !== expectedHash) throw new SyncConflict("本地在替换前再次变化");
+        if (initial) await assertInitialVersion(initial.version);
         await input.fsLocal.writeFileGuarded(lp, bytes, Date.now(), Date.now(), e ?? null, before?.bytes, current); current();
       },
       checkpoint: () => checkpoint.read(),
@@ -263,6 +305,7 @@ export function contentRuntime(input: SyncInput) {
       async commit(generation, content, pending, id, current) {
         current(); const l = await fresh(input.fsLocal, lp), r = await fresh(input.fsRemote, rp); current();
         if (!r || !strongEtag(r.etag)) throw new SyncConflict("提交前远端版本缺失");
+        if (initial && !matchesDownloadVersion(initial.version, r)) throw new SyncConflict("首次下载提交前远端版本变化");
         const normalizedTag = r.etag.startsWith('"') ? r.etag : `"${r.etag}"`;
         if (normalizedTag !== content.remoteEtag) throw new SyncConflict("提交前远端版本改变");
         await checkpoint.commit(generation, content, pending, id, current, {
@@ -271,8 +314,8 @@ export function contentRuntime(input: SyncInput) {
         });
       }, requestRerun: () => { guard(); runtime!.requestRerun(); },
     };
-    return { io, checkpoint, readLocal, readForPlan, deletion: new DeleteExecutor(deletions, io, runtime!.journal, guard, input.configDir), executor: new ContentExecutor(scope, path, bodies, operations, io, runtime!.journal,
-      endpoint, () => { try { runtime!.assertActive(); return true; } catch { return false; } }, input.configDir) };
+    return { io, checkpoint, readLocal, readForPlan, prefetchInitialDownload, deletion: new DeleteExecutor(deletions, io, runtime!.journal, guard, input.configDir), executor: new ContentExecutor(scope, path, bodies, operations, io, runtime!.journal,
+      endpoint, () => { try { runtime!.assertActive(); return true; } catch { return false; } }, input.configDir, initial) };
   }
   async function collect() {
     guard(); const rows = [];

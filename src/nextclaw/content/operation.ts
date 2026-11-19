@@ -5,11 +5,12 @@ import { NativeWriteJournal } from "../nativeWriteJournal";
 import { hashBytes, NOTE_LIMIT, type ContentRecord } from "./identity";
 import { strongEtag, type ConflictRegistration } from "./migration";
 import { mergeContent } from "./merge";
-import { ContentStore } from "./store";
+import { ContentStore, type ContentReservation } from "./store";
 import type { ContentPlan } from "./decision";
 import { markerState } from "./markers";
 
 export interface ContentView { bytes: ArrayBuffer; etag?: string; remoteFileId?: string; }
+type VerifiedView = ContentView & { hash: string };
 /** Adapter must atomically compare the generation and patch the existing record, retaining metadata. */
 export interface Checkpoint {
   generation: string; content?: ContentRecord; pendingLocalUpload: boolean; commitId?: string;
@@ -48,7 +49,13 @@ export interface OperationRepository {
   put(value: ContentOperation): Promise<void>;
 }
 export interface ContentOutcome { status: "converged" | "content-conflict" | "pending" | "failed" | "blocked-unknown-write"; reason: string; operation?: string; }
-const active = new WeakMap<NativeWriteJournal, Set<string>>();
+export interface InitialDownloadGroup {
+  readonly priorOperations: readonly ContentOperation[];
+  readonly reservation: ContentReservation;
+  writeLocal(work: () => Promise<void>): Promise<void>;
+}
+type ScopeLock = { group?: InitialDownloadGroup; paths: Set<string> };
+const active = new WeakMap<NativeWriteJournal, Map<string, ScopeLock>>();
 const serialized = (x: unknown) => JSON.stringify(x);
 const success = (status: number) => [200, 201, 204].includes(status);
 export const operationIntentHash = (o: ContentOperation) => hashBytes(new TextEncoder().encode(JSON.stringify([
@@ -61,7 +68,8 @@ export class ContentExecutor {
   constructor(private readonly scope: string, private readonly path: string, private readonly bodies: ContentStore,
     private readonly operations: OperationRepository, private readonly io: ContentIO,
     private readonly journal: NativeWriteJournal, private readonly endpoint: string,
-    private readonly ownerActive: () => boolean, configDir: string) {
+    private readonly ownerActive: () => boolean, configDir: string,
+    private readonly prefetchedDownload?: ContentView) {
     if (!scope || !configDir || !path || path.endsWith("/") || path.split("/").some(x => !x || x === "." || x === "..") ||
       inConfig(path, configDir) || io.scope !== scope || io.path !== path || io.endpoint !== endpoint ||
       !["https:", "http:"].includes(new URL(endpoint).protocol) || bodies.scope !== scope || new URL(endpoint).search || new URL(endpoint).hash ||
@@ -71,8 +79,8 @@ export class ContentExecutor {
     if (!this.ownerActive()) throw new Error("retired-owner-no-write");
     if (this.journal.blocked()) throw new Error("retain-native-journal");
   }
-  private async view(side: "local" | "remote") {
-    this.guard(); const v = await (side === "local" ? this.io.readLocal() : this.io.readRemote()); this.guard();
+  private async view(side: "local" | "remote", prefetched?: ContentView): Promise<VerifiedView | undefined> {
+    this.guard(); const v = await (side === "local" ? this.io.readLocal() : prefetched ?? this.io.readRemote()); this.guard();
     if (!v) return;
     if (v.bytes.byteLength > NOTE_LIMIT) throw new Error("content-limit-pending");
     const bytes = v.bytes.slice(0), etag = v.etag, hash = await hashBytes(bytes); this.guard();
@@ -90,31 +98,48 @@ export class ContentExecutor {
     if (saved.commitId !== id || saved.generation === generation || saved.pendingLocalUpload !== pending ||
       serialized(saved.content) !== serialized(content)) throw new Error("record-commit-readback-failed");
   }
-  private async exclusive(work: () => Promise<ContentOutcome>): Promise<ContentOutcome> {
-    const locks = active.get(this.journal) ?? new Set<string>(); active.set(this.journal, locks);
-    if (locks.has(this.scope)) return { status: "pending", reason: "content-owner-busy" };
-    locks.add(this.scope);
+  private async exclusive(work: () => Promise<ContentOutcome>, group?: InitialDownloadGroup): Promise<ContentOutcome> {
+    const locks = active.get(this.journal) ?? new Map<string, ScopeLock>();
+    const current = locks.get(this.scope);
+    if (current && (!group || current.group !== group || current.paths.has(this.path)))
+      return { status: "pending", reason: "content-owner-busy" };
+    const lock = current ?? { group, paths: new Set<string>() };
+    lock.paths.add(this.path);
+    locks.set(this.scope, lock);
+    active.set(this.journal, locks);
     try { this.guard(); return await work(); }
     catch (e) {
       return { status: !this.ownerActive() ? "pending" : this.journal.blocked() ? "blocked-unknown-write" :
         e instanceof SyncConflict || (e instanceof Error && e.message === "content-limit-pending") ? "pending" : "failed",
         reason: e instanceof Error ? e.message : "content-operation-failed" };
-    } finally { locks.delete(this.scope); if (!locks.size) active.delete(this.journal); }
+    } finally {
+      lock.paths.delete(this.path);
+      if (!lock.paths.size) locks.delete(this.scope);
+      if (!locks.size) active.delete(this.journal);
+    }
   }
-  async execute(plan: ContentPlan): Promise<ContentOutcome> {
+  async execute(plan: ContentPlan, group?: InitialDownloadGroup): Promise<ContentOutcome> {
+    if (group && (!this.prefetchedDownload || plan.action !== "download-create" ||
+      plan.expected?.localHash !== undefined || plan.expected?.baseRef !== undefined))
+      return { status: "pending", reason: "initial-download-admission-changed" };
     return this.exclusive(async () => {
       if (!plan.expected || plan.expected.scope !== this.scope || plan.expected.path !== this.path ||
         !["prepare-base", "upload", "upload-create", "download", "download-create", "merge-three-way", "conflict-two-way", "resolve-local"].includes(plan.action))
         return { status: "pending", reason: "non-executable-content-plan" };
-      const previousOperations = await this.operations.list(this.scope); this.guard();
+      const previousOperations = group?.priorOperations ?? await this.operations.list(this.scope); this.guard();
       if (previousOperations.some(o => o.version !== 1 || o.scope !== this.scope || !o.id || !o.owner))
         throw new Error("invalid-operation-collection");
       if (previousOperations.some(o => !settled(o))) return { status: "pending", reason: "keep-unconfirmed-stage" };
-      const local = await this.view("local"), remote = await this.view("remote");
+      const local = await this.view("local");
+      const prefetched = plan.action === "download-create" && !local && !plan.expected.baseRef
+        ? this.prefetchedDownload : undefined;
+      const remote = await this.view("remote", prefetched);
       if (local?.hash !== plan.expected.localHash || remote?.hash !== plan.expected.remoteHash || remote?.etag !== plan.expected.remoteEtag)
         return { status: "pending", reason: "rediscover-actual-bytes" };
       const previous = structuredClone(await this.io.checkpoint()); this.guard();
       if (previous.content && previous.content.scopeKey !== this.scope) throw new Error("checkpoint-scope-mismatch");
+      if (group && (local || previous.content || previous.commitId || previous.pendingLocalUpload))
+        return { status: "pending", reason: "initial-download-admission-changed" };
       if (previous.content?.cleanBaseRef !== plan.expected.baseRef || previous.content?.conflictRef !== plan.expected.conflictRef)
         return { status: "pending", reason: "record-generation-changed" };
       const base = plan.expected.baseRef ? await this.bodies.read(plan.expected.baseRef, this.path) : undefined; this.guard();
@@ -128,11 +153,14 @@ export class ContentExecutor {
         !(outputMarkers === "binary" && !this.path.toLowerCase().endsWith(".md"))) return { status: "pending", reason: "unresolved-marker" };
       // Includes input copies, output and the verified clean base; no partial input
       // staging or local replacement when the complete operation cannot fit.
-      await this.bodies.ensureCapacity((local?.bytes.byteLength ?? 0) + (remote?.bytes.byteLength ?? 0) +
-        merge.bytes.byteLength * (merge.kind === "clean" ? 2 : 1)); this.guard();
-      const put = (v: typeof local) => v ? this.bodies.put(this.path, v.bytes, "merge-input") : undefined;
+      const required = (local?.bytes.byteLength ?? 0) + (remote?.bytes.byteLength ?? 0) +
+        merge.bytes.byteLength * (merge.kind === "clean" ? 2 : 1);
+      if (group) this.bodies.checkReservedCapacity(this.path, required, group.reservation);
+      else await this.bodies.ensureCapacity(required);
+      this.guard();
+      const put = (v: typeof local) => v ? this.bodies.put(this.path, v.bytes, "merge-input", group?.reservation) : undefined;
       const localRef = await put(local); this.guard(); const remoteRef = await put(remote); this.guard();
-      const outputRef = await this.bodies.put(this.path, merge.bytes, "merge-input"); this.guard();
+      const outputRef = await this.bodies.put(this.path, merge.bytes, "merge-input", group?.reservation); this.guard();
       const operation: ContentOperation = { version: 1, id: nanoid(), scope: this.scope, path: this.path,
         supersedes: previousOperations.filter(o => o.path === this.path && settled(o)).map(o => o.id),
         owner: this.journal.token, intentHash: "", dispatchStarted: false, phase: "inputs-durable", action: plan.action, previous, localRef, remoteRef,
@@ -162,8 +190,8 @@ export class ContentExecutor {
           expectedEtag: operation.expectedEtag, status: receipt.status, etag: receipt.etag };
         operation.phase = "remote-acknowledged"; await this.save(operation);
       } else { operation.phase = "local-verified"; await this.save(operation); }
-      return this.complete(operation);
-    });
+      return this.complete(operation, prefetched ? remote : undefined, group);
+    }, group);
   }
   /** No dispatch/replay here. Incomplete dispatched stages remain pending even when reads match. */
   async finish(id: string): Promise<ContentOutcome> {
@@ -176,7 +204,7 @@ export class ContentExecutor {
       return this.complete(operation);
     });
   }
-  private async complete(o: ContentOperation): Promise<ContentOutcome> {
+  private async complete(o: ContentOperation, prefetched?: VerifiedView, group?: InitialDownloadGroup): Promise<ContentOutcome> {
     if (o.intentHash !== await operationIntentHash(o)) throw new Error("invalid-operation-intent");
     this.guard();
     if (o.scope !== this.scope || o.path !== this.path || !o.id || !o.owner ||
@@ -195,7 +223,7 @@ export class ContentExecutor {
       throw new Error("invalid-bound-completion");
     const output = await this.bodies.read(o.outputRef, this.path); this.guard();
     if (output.hash !== o.outputHash || output.kind !== "merge-input") throw new Error("invalid-operation-output");
-    const remote = await this.view("remote"), local = await this.view("local");
+    const remote = prefetched ?? await this.view("remote"), local = await this.view("local");
     const expectedEtag = sendsRemote ? o.receipt!.etag : o.expectedEtag;
     if (remote?.hash !== output.hash || remote?.etag !== expectedEtag) {
       o.phase = "rediscover"; await this.save(o);
@@ -236,14 +264,20 @@ export class ContentExecutor {
       return { status: "pending", reason: "pendingLocalUpload-existing-rerun", operation: o.id };
     }
     if (local?.hash !== output.hash) {
-      this.guard(); await this.io.writeLocal(output.bytes.slice(0), o.localHash, () => this.guard()); this.guard();
+      const publishLocal = () => {
+        this.guard();
+        return this.io.writeLocal(output.bytes.slice(0), o.localHash, () => this.guard());
+      };
+      if (group) await group.writeLocal(publishLocal);
+      else await publishLocal();
+      this.guard();
     }
-    const current = await this.view("local"), verifiedRemote = await this.view("remote");
+    const current = await this.view("local"), verifiedRemote = prefetched ?? await this.view("remote");
     if (current?.hash !== output.hash || verifiedRemote?.hash !== output.hash || verifiedRemote.etag !== expectedEtag)
       return { status: "pending", reason: "rediscover-actual-bytes", operation: o.id };
     o.phase = "local-verified";
     let baseRef = o.baseRef;
-    if (o.outputKind === "clean") baseRef = await this.bodies.prepareBase(this.path, current.bytes, verifiedRemote.bytes);
+    if (o.outputKind === "clean") baseRef = await this.bodies.prepareBase(this.path, current.bytes, verifiedRemote.bytes, group?.reservation);
     else {
       if (!o.localRef || !o.remoteRef) throw new Error("missing-conflict-inputs");
       o.conflict = { version: 1, id: o.id, scope: this.scope, path: this.path, format: "whole-document-v1",
@@ -253,7 +287,9 @@ export class ContentExecutor {
     await this.save(o);
     const content: ContentRecord = { version: 1, scopeKey: this.scope, status: o.outputKind === "clean" ? "clean" : "content-conflict",
       cleanBaseRef: baseRef, conflictRef: o.conflict?.id, localHash: output.hash, remoteHash: output.hash, remoteEtag: verifiedRemote.etag, remoteFileId: verifiedRemote.remoteFileId };
-    if ((await this.view("local"))?.hash !== output.hash || (await this.view("remote"))?.etag !== expectedEtag)
+    // The initial-download adapter verifies the bound version at the guarded
+    // local write and again inside commit. Keep a fresh remote read after commit.
+    if ((await this.view("local"))?.hash !== output.hash || (!prefetched && (await this.view("remote"))?.etag !== expectedEtag))
       return { status: "pending", reason: "changed-before-record-commit", operation: o.id };
     await this.publish(checkpoint.generation, content, false, o.id);
     o.phase = "committed"; await this.save(o);

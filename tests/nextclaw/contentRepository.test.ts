@@ -45,6 +45,22 @@ describe("P1 repositories on actual existing IndexedDB implementation", () => {
       assert.equal((await next.operations.get(op.id))!.phase, "remote-dispatched");
     } finally { next.pool.dispose(); }
   });
+  it("validates persisted operations from a scoped scan and rejects unsupported keys", async () => {
+    const t = env();
+    try {
+      const op = operation();
+      op.intentHash = await operationIntentHash(op);
+      await t.operations.put(op);
+      const slot = JSON.stringify(["nextclaw-content-operation", 1, scope, op.id]);
+      await t.history.setItem(JSON.stringify(["nextclaw-content-operation", 2, "foreign", op.id]), {});
+      assert.deepEqual(await t.operations.list(scope), [op]);
+      await t.history.setItem(slot, { ...op, intentHash: "wrong" });
+      await assert.rejects(t.operations.list(scope), /invalid-operation-intent/);
+      await t.history.setItem(slot, op);
+      await t.history.setItem(JSON.stringify(["nextclaw-content-operation", 2, scope, op.id]), op);
+      await assert.rejects(t.operations.list(scope), /invalid-operation-key/);
+    } finally { t.pool.dispose(); }
+  });
   it("rejects retired owners, changed legacy records and unsupported capabilities without overwriting them", async () => {
     const t = env(); try {
       await t.records.setItem(key, seed); const before = await t.checkpoint.read();

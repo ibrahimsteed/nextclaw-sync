@@ -57,6 +57,8 @@ export interface LocalRename { scope: string; source: string; target: string }
 export interface SyncInput {
   contentRuntime?: ContentRuntime;
   androidSaveOnly?: true;
+  androidInitialDownload?: true;
+  androidFirstBRecovery?: true;
   mode: "A" | "B";
   fsLocal: FakeFs;
   fsRemote: FakeFs;

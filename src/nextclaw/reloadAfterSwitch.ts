@@ -79,6 +79,36 @@ export interface ReloadDeps {
     executeCommandById(id: string): boolean;
   };
   delay(ms: number): Promise<void>;
+  dispatchReload?(): boolean;
+}
+
+const FIRST_B_RECOVERY = "nextclaw:first-b-reload";
+type ReloadPage = Pick<Window, "sessionStorage" | "performance">;
+
+export function dispatchFirstBReload(page: ReloadPage, scope: string, dispatch: () => boolean) {
+  let storage: Storage;
+  try {
+    storage = page.sessionStorage;
+    storage.setItem(FIRST_B_RECOVERY, JSON.stringify([scope, page.performance.timeOrigin]));
+  } catch { return dispatch(); }
+  let accepted = false;
+  try { return accepted = dispatch(); }
+  finally {
+    if (!accepted) {
+      try { storage.removeItem(FIRST_B_RECOVERY); } catch { /* Recovery can fall back to a full run. */ }
+    }
+  }
+}
+
+export function takeFirstBRecovery(page: ReloadPage, scope: string): string | undefined {
+  try {
+    const storage = page.sessionStorage, raw = storage.getItem(FIRST_B_RECOVERY);
+    if (raw === null) return;
+    storage.removeItem(FIRST_B_RECOVERY);
+    const marker: unknown = JSON.parse(raw);
+    if (Array.isArray(marker) && marker.length === 2 && marker[0] === scope &&
+        Number.isFinite(marker[1]) && marker[1] < page.performance.timeOrigin) return scope;
+  } catch { /* Without a reload marker, run normal recovery. */ }
 }
 
 /**
@@ -105,7 +135,8 @@ const reloadObsidian = async (
 
   deps.notice(notice, RELOAD_NOTICE_MS);
   await deps.delay(RELOAD_NOTICE_MS);
-  deps.commands.executeCommandById(RELOAD_COMMAND_ID);
+  if (deps.dispatchReload) deps.dispatchReload();
+  else deps.commands.executeCommandById(RELOAD_COMMAND_ID);
   return "reloaded";
 };
 

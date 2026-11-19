@@ -1,6 +1,6 @@
 import { operationIntentHash } from "./operation";
 import { strongEtag } from "./migration";
-import type { IdbConnectionPool, IdbStore } from "../../idbStore";
+import { jsonArrayKeyRange, type IdbConnectionPool, type IdbStore } from "../../idbStore";
 import type { NextclawSyncRecord } from "../../localdb";
 import { SyncConflict } from "../engine/versionGuard";
 import { decodeRecord } from "../engine/model";
@@ -21,6 +21,10 @@ export class TableOperationRepository implements OperationRepository {
   async get(id: string): Promise<ContentOperation | undefined> {
     this.guard(); const o = await this.table.getItem<ContentOperation>(this.key(id)); this.guard();
     if (o === null) return;
+    return this.validate(id, o);
+  }
+  private async validate(id: string, o: ContentOperation) {
+    this.guard();
     if (o.version !== 1 || o.id !== id || o.scope !== this.scope || !Object.prototype.hasOwnProperty.call(transitions, o.phase) || !o.intentHash)
       throw new Error("invalid-persistent-operation");
     if (typeof o.dispatchStarted !== "boolean" || o.intentHash !== await operationIntentHash(o)) throw new Error("invalid-operation-intent");
@@ -40,17 +44,48 @@ export class TableOperationRepository implements OperationRepository {
   }
   async list(scope: string) {
     if (scope !== this.scope) throw new Error("operation-scope-mismatch");
-    this.guard(); const out: ContentOperation[] = [];
-    for (const key of await this.table.keys()) {
-      this.guard(); let parts: unknown;
-      try { parts = JSON.parse(key); } catch { continue; }
-      if (!Array.isArray(parts) || parts[0] !== "nextclaw-content-operation" || parts[2] !== scope) continue;
+    this.guard();
+    const idFor = (key: string) => {
+      this.guard();
+      let parts: unknown;
+      try { parts = JSON.parse(key); } catch { return; }
+      if (!Array.isArray(parts) || parts[0] !== "nextclaw-content-operation" || parts[2] !== scope) return;
       if (parts.length !== 4 || parts[1] !== 1 || typeof parts[3] !== "string" || key !== this.key(parts[3]))
         throw new Error("invalid-operation-key");
-      const o = await this.get(parts[3]); if (!o) throw new Error("missing-persistent-operation"); out.push(o);
+      return parts[3];
+    };
+    const out: ContentOperation[] = [];
+    if (this.table.getEntries) {
+      const entries = await this.table.getEntries(jsonArrayKeyRange(["nextclaw-content-operation"]));
+      for (const [key, value] of entries) {
+        const id = idFor(key);
+        if (id === undefined) continue;
+        if (!value) throw new Error("missing-persistent-operation");
+        out.push(await this.validate(id, value as ContentOperation));
+      }
+    } else if (this.table.iterate) {
+      const rows: { id: string; value: ContentOperation }[] = [];
+      await this.table.iterate((value, key) => {
+        const id = idFor(key);
+        if (id === undefined) return;
+        if (!value) throw new Error("missing-persistent-operation");
+        rows.push({ id, value: value as ContentOperation });
+      }, jsonArrayKeyRange(["nextclaw-content-operation"]));
+      // Hash validation is asynchronous and must run after the cursor transaction.
+      for (const { id, value } of rows) out.push(await this.validate(id, value));
+    } else {
+      for (const key of await this.table.keys()) {
+        const id = idFor(key);
+        if (id === undefined) continue;
+        const o = await this.get(id);
+        if (!o) throw new Error("missing-persistent-operation");
+        out.push(o);
+      }
     }
+    this.guard();
     return out;
   }
+
   async put(value: ContentOperation) {
     if (value.scope !== this.scope) throw new Error("operation-scope-mismatch");
     const next = structuredClone(value), previous = await this.get(next.id);

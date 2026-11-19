@@ -51,6 +51,7 @@ describe("NextClaw：IndexedDB 表的读写", () => {
     assert.deepEqual(await t.getItem("a"), { n: 1 });
     assert.deepEqual((await t.keys()).sort(), ["a", "b", "c"]);
     assert.deepEqual(await t.getItems(), { a: { n: 1 }, b: [1, 2], c: "x" });
+    assert.deepEqual(await t.getEntries(IDBKeyRange.bound("b","c",false,true)), [["b",[1,2]]]);
     const seen: string[] = [];
     const stopped = await t.iterate((_v, k) => (seen.push(k), k === "b" ? "stop" : undefined));
     assert.equal(stopped, "stop");

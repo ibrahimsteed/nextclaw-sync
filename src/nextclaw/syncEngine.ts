@@ -7,12 +7,20 @@ import { runLegacySync } from "./engine/legacy";
 import { contentRuntime, contentScope, checkVaultStages, ContentStagePaused } from "./content/runtime";
 import { selectBatch, type BatchState } from "./content/batches";
 import { planContent } from "./content/decision";
+import type { InitialDownloadGroup } from "./content/operation";
+import type { ContentReservation } from "./content/store";
 import { hashBytes, isHash } from "./content/identity";
+import { strongEtag } from "./content/migration";
 import { MoveTargetOccupied } from "./content/move";
 import { NativeWritePaused, type NativeWriteJournal } from "./nativeWriteJournal";
 export type { SyncCallbacks, SyncInput, SyncResult } from "./engine/model";
 const running = new WeakSet<NativeWriteJournal>();
 type MoveCollision = { source: string; target: string; fileId: string; hash: string };
+const INITIAL_DOWNLOAD_CONCURRENCY = 4;
+const INITIAL_PUBLICATION_CONCURRENCY = 4;
+const FIRST_B_RECOVERY_CONCURRENCY = 4;
+const INITIAL_COLLECTION_BATCH = 128;
+const INITIAL_SMALL_COLLECTION_BATCH = 32;
 export async function runSync(input: SyncInput): Promise<SyncResult> {
   const result: SyncResult = { ok: false, fullyConverged: false, pendingDirectories: [], counts: {}, errors: [],
     pendingContent: [], contentSummary: { pending: 0, conflicts: 0, blocked: false } };
@@ -183,20 +191,56 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
     }
     if (source !== "dry") await rt.collect();
     const contentEntries = Object.entries(plan).filter(([key, item]) => !reserved.has(key) && !item.error && !key.endsWith("/") && !inConfig(key, input.configDir));
-    const bounded = source !== "dry" && input.protectModifyPercentage >= 100;
+    let bounded = source !== "dry" && input.protectModifyPercentage >= 100;
     const scheduleKey = `content-batch:${rt.scope}`;
     const previousBatch = bounded ? await input.db.simpleKVForMiscTbl.getItem<BatchState>(scheduleKey) : undefined;
     const saveOnly = input.androidSaveOnly === true && source === "auto_sync_on_save" && !!rootId &&
       !result.errors.length && !(await rt.rootReseed.active());
     rt.guard();
-    const batch = bounded ? selectBatch(contentEntries.map(([path, item]) => ({ path,
+    let batch = bounded ? selectBatch(contentEntries.map(([path, item]) => ({ path,
       urgent: item.record?.pendingLocalUpload === true,
       size: Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0, item.remote?.size ?? item.remote?.sizeRaw ?? 0) })),
       previousBatch, saveOnly) : undefined;
+    if (input.androidFirstBRecovery && source === "auto_sync_on_save" && bounded && rootId &&
+        !result.errors.length && !result.pendingContent!.length && !reserved.size && !recheck.size &&
+        !previousBatch?.remaining.length && !previousBatch?.completed.length && !previousBatch?.issues?.length &&
+        !(await rt.rootReseed.active()) &&
+        contentEntries.length && contentEntries.every(([key, item]) => ordinary(key) && item.local &&
+          item.remote && item.record?.content?.status === "clean" && !item.record.pendingLocalUpload) &&
+        Object.entries(plan).every(([key, item]) =>
+          !(key.endsWith("/") || inConfig(key, input.configDir)) || (!item.change && !item.pending))) {
+      const runtime = rt;
+      const verified = [];
+      for (let i = 0; i < contentEntries.length; i += FIRST_B_RECOVERY_CONCURRENCY) {
+        const chunk = contentEntries.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
+        const checked = await Promise.allSettled(chunk.map(async ([key, item]) => {
+          const file = runtime.file(key, item.local, item.remote);
+          return (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
+        }));
+        runtime.guard();
+        for (const check of checked) if (check.status === "rejected" &&
+            !(check.reason instanceof SyncConflict) && (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
+        for (const check of checked) if (check.status === "fulfilled" && check.value) verified.push(check.value);
+        if (verified.length !== i + chunk.length) break;
+      }
+      if (verified.length === contentEntries.length) {
+        for (const [index, [, item]] of contentEntries.entries()) {
+          item.decision = "content";
+          item.change = false;
+          item.content = verified[index];
+          item.reason = verified[index].reason;
+        }
+        batch = undefined;
+        bounded = false;
+      }
+    }
     for (const issue of previousBatch?.issues ?? []) recheck.add(issue.path);
-    const inspect = async (key: string, item: PlanItem) => {
+    const initial = new Set(batch && input.androidInitialDownload && rootId && !batch.saveSweep &&
+      !result.errors.length && !(await rt.rootReseed.active()) ? contentEntries.filter(([key, item]) =>
+        ordinary(key) && !recheck.has(key) && !item.local && !item.record && !!item.remote?.remoteFileId &&
+        name(item.remote) === key && strongEtag(item.remote.etag)).map(([key]) => key) : []);
+    const inspect = async (key: string, item: PlanItem, f = rt!.file(key, item.local, item.remote)) => {
       rt!.guard();
-      const f = rt!.file(key, item.local, item.remote);
       try {
         const l = await f.readLocal();
         const record = (batch?.saveSweep ?? saveOnly) && !recheck.has(key) && !result.errors.length ? item.record : undefined;
@@ -210,12 +254,17 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         if (item.content.status === "failed") { item.error = item.content.reason; result.errors.push(new Error(`${key}：${item.error}`)); }
       } catch (e) {
         rt!.guard(); item.decision = "content"; item.change = false;
-        if (e instanceof SyncConflict || (e as {status?:number}).status === 412) item.contentPending = "读取时版本发生变化，待重新扫描";
+        if (e instanceof SyncConflict || (e as {status?:number}).status === 412) {
+          item.contentPending = "读取时版本发生变化，待重新扫描";
+          return true;
+        }
         else if (e instanceof Error && e.message === "content-limit-pending") item.contentPending = "内容超过安全预算，待处理";
         else { item.error = errorOf(e).message; result.errors.push(errorOf(e)); }
       }
     };
-    if (!bounded) for (const [key, item] of contentEntries) await inspect(key, item);
+    if (!bounded) {
+      for (const [key, item] of contentEntries) if (!item.content) await inspect(key, item);
+    }
     else for (const [, item] of contentEntries) {
       // The metadata planner uses legacy decisions. Never delegate uninspected B
       // content to executePlan (which is now limited to config/directories).
@@ -251,26 +300,137 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         }
       }
       rt.guard(); await executePlan(input, plan, result.errors); rt.guard();
+      if (batch && !result.errors.length && initial.size) {
+        batch.selected = [...new Set([...batch.selected, ...initial])];
+        batch.next.remaining = batch.next.remaining.filter(key => !initial.has(key));
+        batch.next.completed = batch.next.remaining.length ? [...new Set([...batch.next.completed, ...initial])] : [];
+      } else initial.clear();
       let done = 0;
+      let initialNeedsRescan = false;
       const executionEntries = bounded ? batch!.selected.map(key => [key, plan[key]] as const) : Object.entries(plan);
-      for (const [key, item] of executionEntries) {
-        if (reserved.has(key)) continue;
-        if (bounded) await inspect(key, item);
-        if (item.decision !== "content" || item.error || !item.content) continue;
-        rt.guard(); if (result.errors.length >= 10) { item.contentPending = "前序错误，未执行"; continue; }
+      const executeContent = async (key: string, item: PlanItem, prepared?: ReturnType<NonNullable<typeof rt>["file"]>,
+        deferCollection = false, group?: InitialDownloadGroup) => {
+        if (bounded) {
+          const needsFreshPlan = await inspect(key, item, prepared);
+          if (prepared && needsFreshPlan) initialNeedsRescan = true;
+        }
+        if (item.decision !== "content" || item.error || !item.content) return;
+        rt!.guard(); if (result.errors.length >= 10) { item.contentPending = "前序错误，未执行"; return; }
         const p = item.content;
         if (["hold", "preserve-both", "none"].includes(p.action)) {
-          if (p.action !== "none") item.contentPending = p.reason; continue;
+          if (p.action !== "none") item.contentPending = p.reason; return;
         }
-        const f = rt.file(key, item.local, item.remote);
-        const out = await (p.action.startsWith("delete-") ? f.deletion.execute(p) : f.executor.execute(p)); item.reason = out.reason;
+        const f = prepared ?? rt!.file(key, item.local, item.remote);
+        if (group && p.action !== "download-create") throw new Error("initial-download-admission-changed");
+        const out = await (p.action.startsWith("delete-") ? f.deletion.execute(p) : f.executor.execute(p, group)); item.reason = out.reason;
+        if (prepared && out.status === "pending" && out.reason !== "content-limit-pending") initialNeedsRescan = true;
         await cb.progress(source, ++done, Object.values(plan).filter(i=>i.content).length, key, "content");
         if (out.status === "failed") { item.error = out.reason; result.errors.push(new Error(`${key}：${out.reason}`)); }
         else if (out.status !== "converged") item.contentPending = out.status === "content-conflict" ? "content-conflict" : out.reason;
-        if (out.status === "blocked-unknown-write") { result.contentSummary!.blocked = true; break; }
-        await checkVaultStages(input.db, input.vaultRandomID, rt.guard, moveScope);
+        if (out.status === "blocked-unknown-write") { result.contentSummary!.blocked = true; return; }
+        if (!group) await checkVaultStages(input.db, input.vaultRandomID, rt!.guard, moveScope);
         // Only verified retirement proof can release bodies, between admitted operations.
-        await rt.collect();
+        if (!deferCollection) await rt!.collect();
+      };
+      for (const [key, item] of executionEntries) {
+        if (reserved.has(key) || initial.has(key)) continue;
+        await executeContent(key, item);
+        if (result.contentSummary!.blocked) break;
+      }
+      const runtime = rt;
+      const downloads = executionEntries.filter(([key]) => initial.has(key));
+      const readDownloadChunk = (start: number) => Promise.allSettled(
+        downloads.slice(start, start + INITIAL_DOWNLOAD_CONCURRENCY).map(async ([key, item]) =>
+          runtime.file(key, undefined, item.remote).prefetchInitialDownload(item.remote!)));
+      let prefetched: ReturnType<typeof readDownloadChunk> | undefined;
+      let reservation: ContentReservation | undefined;
+      let collectionEnd = 0;
+      try {
+        for (let i = 0; i < downloads.length; i += INITIAL_DOWNLOAD_CONCURRENCY) {
+          if (result.contentSummary!.blocked || result.errors.length >= 10) {
+            for (const [, item] of downloads.slice(i)) item.contentPending = "前序错误，未执行";
+            break;
+          }
+          if (i === collectionEnd) {
+            const remaining = downloads.length - i;
+            const sizes = remaining > INITIAL_SMALL_COLLECTION_BATCH
+              ? [INITIAL_COLLECTION_BATCH, INITIAL_SMALL_COLLECTION_BATCH] : [INITIAL_SMALL_COLLECTION_BATCH];
+            for (const size of sizes) {
+              collectionEnd = i + size;
+              const group = downloads.slice(i, collectionEnd);
+              // Bound the retained remote input, output and clean base.
+              const budgets = new Map(group.map(([key, item]) => [key, 3 * (item.remote!.size ?? item.remote!.sizeRaw)]));
+              if (group.length < 2 || ![...budgets.values()].every(bytes => Number.isSafeInteger(bytes) && bytes >= 0)) continue;
+              try {
+                reservation = await runtime.bodies.reserveCapacity(budgets);
+                break;
+              } catch (e) {
+                if (errorOf(e).message !== "content-limit-pending") throw e;
+              }
+            }
+          }
+          const next = i + INITIAL_DOWNLOAD_CONCURRENCY;
+          const chunk = downloads.slice(i, next);
+          const ready = await (prefetched ?? readDownloadChunk(i));
+          prefetched = undefined;
+          runtime.guard();
+          if (next < downloads.length) prefetched = readDownloadChunk(next);
+          const apply = async ([key, item]: typeof chunk[number], j: number, group?: InitialDownloadGroup) => {
+            if (result.contentSummary!.blocked || result.errors.length >= 10) {
+              item.contentPending = "前序错误，未执行";
+              return;
+            }
+            const download = ready[j];
+            if (download.status === "fulfilled") {
+              await executeContent(key, item, runtime.file(key, undefined, item.remote, download.value), !!group, group);
+            } else {
+              const error = errorOf(download.reason);
+              const status = (download.reason as { status?: number } | undefined)?.status;
+              if (download.reason instanceof SyncConflict || status === 404 || status === 412) {
+                item.contentPending = "首次下载版本变化，待重新扫描";
+                initialNeedsRescan = true;
+              } else if (error.message === "content-limit-pending") item.contentPending = "内容超过安全预算，待处理";
+              else { item.error = error.message; result.errors.push(error); }
+            }
+          };
+          if (reservation) {
+            await checkVaultStages(input.db, input.vaultRandomID, runtime.guard, moveScope);
+            const priorOperations = await runtime.operations.list(runtime.scope);
+            runtime.guard();
+            const writers = Array.from({ length: INITIAL_PUBLICATION_CONCURRENCY }, () => Promise.resolve());
+            let nextWriter = 0;
+            const group: InitialDownloadGroup = {
+              priorOperations, reservation,
+              writeLocal(work) {
+                // Each admitted path keeps its own version check, guard and exclusive create.
+                const writer = nextWriter++ % writers.length;
+                const nextWrite = writers[writer].then(work);
+                writers[writer] = nextWrite.catch(() => {});
+                return nextWrite;
+              },
+            };
+            if (result.errors.length + chunk.length <= 10) {
+              const outcomes = await Promise.allSettled(chunk.map((entry, j) => apply(entry, j, group)));
+              for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+            } else {
+              for (const [j, entry] of chunk.entries()) await apply(entry, j, group);
+            }
+            if (!result.contentSummary!.blocked)
+              await checkVaultStages(input.db, input.vaultRandomID, runtime.guard, moveScope);
+          } else {
+            for (const [j, entry] of chunk.entries()) await apply(entry, j);
+          }
+          if (reservation && next === collectionEnd) {
+            reservation.release();
+            reservation = undefined;
+            if (!result.contentSummary!.blocked && next < downloads.length) await runtime.collect();
+          }
+        }
+      } finally {
+        reservation?.release();
+        // At most one read-only chunk is ahead of publication. Drain it
+        // before releasing the owner, including after an interrupted commit.
+        await prefetched;
       }
       if (!result.contentSummary!.blocked) {
         await rt.collect();
@@ -290,7 +450,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
             const item = plan[key]; item.decision = "content"; item.change = false;
             item.contentPending = "正文批次待续跑";
           }
-          if (batch.next.remaining.length && !result.errors.length) input.contentRuntime!.requestRerun(batch.next.saveOnly);
+          if ((batch.next.remaining.length || initialNeedsRescan) && !result.errors.length) input.contentRuntime!.requestRerun(batch.next.saveOnly);
         }
       }
     }

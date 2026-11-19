@@ -51,6 +51,493 @@ export async function environment() {
     stop() { active=false; journal.retire(); pool.dispose(); }, guard };
 }
 
+describe("Android first B download", () => {
+  async function fixture(count = 1) {
+    const t = await environment();
+    const stat = t.remote.stat.bind(t.remote);
+    t.remote.stat = async key => key === "/" ? { ...await stat(key), remoteFileId: "root" } : stat(key);
+    const paths = Array.from({ length: count }, (_, i) => `page-${i}.md`);
+    const seed = (path: string, body: string) => {
+      t.remote.put(path, body);
+      t.remote.files.get(path)!.entity.remoteFileId = path;
+    };
+    for (const path of paths) seed(path, `remote ${path}`);
+    t.input.androidInitialDownload = true;
+    return { ...t, paths, seed };
+  }
+
+  it("downloads beyond a normal batch with one full scan and at most four concurrent GETs", async () => {
+    const t = await fixture(35);
+    let active = 0, peak = 0, reads = 0, fileStats = 0, recordScans = 0, capacityScans = 0;
+    const records = t.db.prevSyncRecordsTbl;
+    const iterate = records.iterate.bind(records);
+    records.iterate = (...args) => {
+      recordScans++;
+      return iterate(...args);
+    };
+    const history = t.db.fileContentHistoryTbl;
+    const iterateHistory = history.iterate.bind(history);
+    history.iterate = (...args) => {
+      if (typeof args[1]?.lower === "string" && args[1].lower.startsWith('["nextclaw-content",')) capacityScans++;
+      return iterateHistory(...args);
+    };
+    const stat = t.remote.stat.bind(t.remote);
+    t.remote.stat = async key => {
+      if (key !== "/") fileStats++;
+      return stat(key);
+    };
+    const read = t.remote.readContent.bind(t.remote);
+    t.remote.readContent = async (path, expected) => {
+      reads++;
+      peak = Math.max(peak, ++active);
+      try {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        return await read(path, expected);
+      } finally { active--; }
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      assert.equal(peak, 4);
+      assert.equal(reads, 35);
+      // The test transport validates each conditional GET with an extra stat.
+      assert.equal(fileStats - reads, 35 * 4);
+      assert.equal(recordScans, 3);
+      assert.equal(capacityScans, 1);
+      assert.equal(t.remote.calls.filter(x => x.op === "walk").length, 1);
+      assert.equal(t.local.calls.filter(x => x.op === "walk").length, 1);
+      assert.equal(t.reruns(), 0);
+      assert.equal(t.remote.puts, 0);
+      for (const path of t.paths) {
+        assert.equal(text(await t.local.readFile(path)), `remote ${path}`);
+        assert.equal((await t.rec(path))?.content?.status, "clean");
+      }
+    } finally { t.stop(); }
+  });
+
+  it("prefetches the next group while the first group publishes", async () => {
+    const t = await fixture(8);
+    let nextStarted = false;
+    let release!: () => void;
+    const firstWrite = new Promise<void>(resolve => { release = resolve; });
+    const read = t.remote.readContent.bind(t.remote);
+    t.remote.readContent = async (path, expected) => {
+      if (path === t.paths[4]) {
+        nextStarted = true;
+        await firstWrite;
+      }
+      return read(path, expected);
+    };
+    t.local.current = () => {
+      release();
+      assert.equal(nextStarted, true);
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      assert.deepEqual(t.local.writes().map(op => op.key).sort(), t.paths);
+      assert.equal(t.remote.puts, 0);
+    } finally { release(); t.stop(); }
+  });
+
+  it("validates independent paths concurrently with at most four guarded writers", async () => {
+    const t = await fixture(4);
+    const stat = t.remote.stat.bind(t.remote);
+    const write = t.local.writeFileGuarded.bind(t.local);
+    let checksInFlight = 0, checkPeak = 0, writers = 0, writerPeak = 0;
+    let release!: () => void, releaseWriters!: () => void;
+    const concurrentChecks = new Promise<void>(resolve => { release = resolve; });
+    const concurrentWriters = new Promise<void>(resolve => { releaseWriters = resolve; });
+    const guard = setTimeout(() => { release(); releaseWriters(); }, 750);
+    t.remote.stat = async path => {
+      if (!t.local.files.has(path)) return stat(path);
+      checkPeak = Math.max(checkPeak, ++checksInFlight);
+      if (checksInFlight === 2) release();
+      try {
+        await concurrentChecks;
+        return await stat(path);
+      } finally { checksInFlight--; }
+    };
+    t.local.writeFileGuarded = async (...args) => {
+      writerPeak = Math.max(writerPeak, ++writers);
+      if (writers === 4) releaseWriters();
+      try {
+        await concurrentWriters;
+        return await write(...args);
+      } finally { writers--; }
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      assert.equal(writerPeak, 4);
+      assert.ok(checkPeak >= 2);
+      assert.equal(t.remote.puts, 0);
+    } finally { clearTimeout(guard); release(); releaseWriters(); t.stop(); }
+  });
+
+  it("does not publish queued or in-flight paths after retirement during their write checks", async () => {
+    const t = await fixture(5);
+    const stat = t.remote.stat.bind(t.remote);
+    const queries = new Map<string, number>();
+    const atWrite = new Set<string>();
+    let retired = false, release!: () => void;
+    const inFlight = new Promise<void>(resolve => { release = resolve; });
+    const limit = setTimeout(release, 750);
+    t.input.contentRuntime!.assertActive = () => { if (retired) throw Error("retired"); };
+    t.remote.stat = async path => {
+      const call = (queries.get(path) ?? 0) + 1;
+      queries.set(path, call);
+      if (path !== "/" && call === 3) {
+        // The fake conditional GET uses stat once, then prefetch and write each recheck.
+        atWrite.add(path);
+        if (atWrite.size === 4) { retired = true; release(); }
+        await inFlight;
+      }
+      return stat(path);
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, false);
+      assert.equal(atWrite.size, 4);
+      assert.equal(t.local.writes().length, 0);
+      assert.equal(t.remote.puts, 0);
+    } finally { clearTimeout(limit); release(); t.stop(); }
+  });
+
+  it("uses the smaller cleanup group when the full group would exceed capacity", async function () {
+    this.timeout(15000);
+    const t = await fixture(45);
+    for (const path of t.paths) t.seed(path, "x".repeat(300 * 1024));
+    const records = t.db.prevSyncRecordsTbl;
+    const iterate = records.iterate.bind(records);
+    let recordScans = 0;
+    records.iterate = (...args) => {
+      recordScans++;
+      return iterate(...args);
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      assert.equal(recordScans, 4);
+      assert.equal(t.remote.puts, 0);
+      assert.equal(t.local.writes().length, t.paths.length);
+    } finally { t.stop(); }
+  });
+
+  it("collects between files if the whole download group cannot fit", async function () {
+    this.timeout(15000);
+    const t = await fixture(3);
+    const size = 4 * 1024 * 1024 - 128;
+    for (const [index, path] of t.paths.entries()) t.seed(path, String(index).repeat(size));
+    const records = t.db.prevSyncRecordsTbl;
+    const iterate = records.iterate.bind(records);
+    let recordScans = 0;
+    records.iterate = (...args) => {
+      recordScans++;
+      return iterate(...args);
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      assert.equal(recordScans, 6);
+      assert.equal(t.remote.puts, 0);
+      for (const path of t.paths) assert.equal((await t.local.stat(path)).sizeRaw, size);
+    } finally { t.stop(); }
+  });
+
+  it("discards a downloaded version that changes before publication and uses normal rediscovery", async () => {
+    const t = await fixture();
+    const [path] = t.paths;
+    const read = t.remote.readContent.bind(t.remote);
+    let reads = 0;
+    t.remote.readContent = async (key, expected) => {
+      const incoming = await read(key, expected);
+      if (++reads === 1) t.seed(key, "new remote version");
+      return incoming;
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, false);
+      assert.equal(t.local.files.has(path), false);
+      assert.equal(await t.rec(path), null);
+      assert.equal(t.reruns(), 1);
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      assert.equal(text(await t.local.readFile(path)), "new remote version");
+      assert.ok(reads > 2, "normal path rereads the body during verification");
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
+  it("keeps an occupied target and completes its independent group peer", async () => {
+    const t = await fixture(2);
+    const [path, peer] = t.paths;
+    const write = t.local.writeFileGuarded.bind(t.local);
+    t.local.writeFileGuarded = (...args) => {
+      if (args[0] === path) t.local.put(path, "concurrent edit");
+      return write(...args);
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, false);
+      assert.equal(t.reruns(), 1);
+      assert.equal(text(await t.local.readFile(path)), "concurrent edit");
+      assert.equal(await t.rec(path), null);
+      assert.equal(text(await t.local.readFile(peer)), `remote ${peer}`);
+      assert.equal((await t.rec(peer))?.content?.status, "clean");
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
+  it("rechecks the remote version after staging and before the local writer", async () => {
+    const t = await fixture();
+    const [path] = t.paths;
+    const stat = t.local.stat.bind(t.local);
+    const content = t.db.fileContentHistoryTbl;
+    let changed = false;
+    t.local.stat = async key => {
+      if (key === path && !changed) {
+        const stages = await Promise.all((await content.keys()).map(id => content.getItem<{ phase?: string }>(id)));
+        if (stages.some(stage => stage?.phase === "local-verified")) {
+          changed = true;
+          t.seed(path, "changed after staging");
+        }
+      }
+      return stat(key);
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(changed, true);
+      assert.equal(result.fullyConverged, false);
+      assert.equal(t.local.writes().some(op => op.key === path), false);
+      assert.equal(await t.rec(path), null);
+      assert.equal(t.reruns(), 1);
+    } finally { t.stop(); }
+  });
+
+  it("does not publish a clean checkpoint if the remote changes during local publication", async () => {
+    const t = await fixture();
+    const [path] = t.paths;
+    const write = t.local.writeFileGuarded.bind(t.local);
+    t.local.writeFileGuarded = async (...args) => {
+      const result = await write(...args);
+      t.seed(path, "new remote after local publication");
+      return result;
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, false);
+      assert.equal(await t.rec(path), null);
+      assert.equal(text(await t.local.readFile(path)), `remote ${path}`);
+      assert.equal(text(await t.remote.readFile(path)), "new remote after local publication");
+      assert.equal(t.remote.puts, 0);
+      assert.equal(t.reruns(), 1);
+    } finally { t.stop(); }
+  });
+
+  it("does not report convergence when the remote changes after the checkpoint commits", async () => {
+    const t = await fixture();
+    const [path] = t.paths;
+    const history = t.db.fileContentHistoryTbl;
+    const setItem = history.setItem.bind(history);
+    history.setItem = async (key, value) => {
+      const result = await setItem(key, value);
+      if ((value as { phase?: string })?.phase === "committed") t.seed(path, "new remote after checkpoint");
+      return result;
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, false);
+      assert.equal((await t.rec(path))?.content?.status, "clean");
+      assert.equal(text(await t.local.readFile(path)), `remote ${path}`);
+      assert.equal(text(await t.remote.readFile(path)), "new remote after checkpoint");
+      assert.equal(t.remote.puts, 0);
+      assert.ok(t.reruns() > 0);
+    } finally { t.stop(); }
+  });
+
+  it("pauses if a stage from the key inventory is missing at the batched read", async () => {
+    const t = await fixture();
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      const history = t.db.fileContentHistoryTbl;
+      const scope = (await t.rec(t.paths[0]))?.content?.scopeKey;
+      assert.ok(scope);
+      const prefix = JSON.stringify(["nextclaw-content-operation", 1, scope]).slice(0, -1) + ",";
+      const slots = (await history.keys()).filter(key => key.startsWith(prefix));
+      assert.equal(slots.length, 1);
+      const read = history.getEntries.bind(history);
+      history.getEntries = async range => {
+        await history.removeItem(slots[0]);
+        return read(range);
+      };
+      await assert.rejects(checkVaultStages(t.db, t.input.vaultRandomID, t.guard), /同步已暂停/);
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
+  it("resumes after retirement without rewriting the file already committed", async () => {
+    const t = await fixture(5);
+    const [first] = t.paths;
+    let retired = false;
+    t.input.contentRuntime!.assertActive = () => { if (retired) throw Error("retired"); };
+    const history = t.db.fileContentHistoryTbl;
+    const setItem = history.setItem.bind(history);
+    history.setItem = async (key, value) => {
+      const result = await setItem(key, value);
+      const row = value as { path?: string; phase?: string } | null;
+      if (row?.path === first && row.phase === "committed") retired = true;
+      return result;
+    };
+    const resumed = new NativeWriteJournal({ getItem: k => t.entries.get(k) ?? null,
+      setItem: (k, v) => { t.entries.set(k, v); }, removeItem: k => { t.entries.delete(k); } }, crypto.randomUUID());
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, false);
+      assert.equal((await t.rec(first))?.content?.status, "clean");
+      const published = new Set(t.paths.filter(path => t.local.files.has(path)));
+      assert.ok(published.has(first));
+      assert.equal(t.local.files.has(t.paths.at(-1)!), false);
+      t.journal.retire();
+      history.setItem = setItem;
+      t.local.calls.length = 0;
+      const binding = t.remote.contentBinding.bind(t.remote);
+      t.remote.contentBinding = () => ({ ...binding(), journalToken: resumed.token });
+      const resumeInput = { ...t.input, contentRuntime: { ...t.input.contentRuntime!, journal: resumed, assertActive: t.guard } };
+      for (let runs = 0; runs <= t.paths.length; runs++) {
+        if ((await runSync(resumeInput)).fullyConverged) break;
+      }
+      for (const path of t.paths) {
+        assert.equal(text(await t.local.readFile(path)), `remote ${path}`);
+        assert.equal((await t.rec(path))?.content?.status, "clean");
+      }
+      assert.equal(t.local.writes().some(x => published.has(x.key)), false);
+      assert.equal(t.remote.puts, 0);
+    } finally { resumed.retire(); t.stop(); }
+  });
+
+  it("passes the initial-download signal from the real Android B cutover entry only while reload is pending", async () => {
+    const t = await fixture();
+    const entries: SyncInput[] = [];
+    const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, async input => {
+      entries.push(input);
+      return { ok: true, fullyConverged: false, pendingDirectories: [], counts: {}, errors: [] };
+    });
+    m.plugin.databaseConnections = t.pool;
+    m.plugin.nativeWrites = t.journal;
+    m.plugin.vaultRandomID = t.input.vaultRandomID;
+    m.plugin.settings.webdav = { address: "https://synthetic.invalid/vault", username: "s00000", password: "synthetic" };
+    m.plugin.settings.nextclawPendingSwitchToB = true;
+    m.platform.isAndroidApp = true;
+    try {
+      assert.equal(await m.run(), "ok");
+      assert.equal(m.plugin.settings.nextclawPendingSwitchToB, false);
+      assert.equal(entries.at(-1)?.androidInitialDownload, true);
+      m.platform.isAndroidApp = false;
+      assert.equal(await m.run(), "ok");
+      assert.equal(entries.at(-1)?.androidInitialDownload, undefined);
+      m.platform.isAndroidApp = true;
+      m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+      assert.equal(await m.run(), "ok");
+      assert.equal(entries.at(-1)?.androidInitialDownload, undefined);
+    } finally { t.stop(); }
+  });
+
+  it("rechecks the clean first-B vault in one run with four read-only lanes", async () => {
+    const t = await fixture(35);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      t.local.calls.length = 0;
+      t.remote.calls.length = 0;
+      const stat = t.remote.stat.bind(t.remote);
+      let active = 0, peak = 0, started = 0;
+      let releaseFirstBatch!: () => void;
+      const firstBatch = new Promise<void>(resolve => { releaseFirstBatch = resolve; });
+      t.remote.stat = async path => {
+        if (path === "/") return stat(path);
+        const position = ++started;
+        peak = Math.max(peak, ++active);
+        try {
+          if (position === 4) releaseFirstBatch();
+          if (position <= 4) await firstBatch;
+          else await new Promise<void>(resolve => setImmediate(resolve));
+          return await stat(path);
+        } finally { active--; }
+      };
+      const recovery = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: true as const,
+        triggerSource: "auto_sync_on_save" as const };
+      assert.ok((await runSync(recovery)).fullyConverged);
+      assert.equal(peak,4);
+      assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length,70);
+      assert.equal(t.remote.calls.filter(x=>x.op==="walk").length,1);
+      assert.equal(t.remote.calls.filter(x=>x.op==="readFile").length,0);
+      assert.deepEqual(t.local.writes(),[]);
+      assert.equal(t.remote.puts,0);
+      assert.equal(t.reruns(),0);
+    } finally { t.stop(); }
+  });
+
+  it("falls back to ordinary planning on a version change during the second read-only query", async () => {
+    const t = await fixture(4);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      const path = t.paths[0], stat = t.remote.stat.bind(t.remote);
+      let observations = 0;
+      t.remote.stat = async key => {
+        if (key === path && ++observations === 2) t.seed(path,"replacement");
+        return stat(key);
+      };
+      assert.ok((await runSync({ ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: true,
+        triggerSource: "auto_sync_on_save" })).fullyConverged);
+      assert.equal(text(await t.local.readFile(path)),"replacement");
+      assert.equal(t.remote.puts,0);
+    } finally { t.stop(); }
+  });
+
+  it("retains the config and real edit paths, then respects an outstanding native write", async () => {
+    const t = await fixture(4);
+    const recovery = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: true as const,
+      triggerSource: "auto_sync_on_save" as const };
+    try {
+      t.remote.put(".obsidian/app.json",'{"showLineNumber":false}');
+      assert.ok((await runSync(t.input)).fullyConverged);
+      const path = t.paths[0];
+      t.local.put(path, `Remote ${path}`);
+      t.remote.put(".obsidian/app.json",'{"showLineNumber":true}');
+      assert.ok((await runSync(recovery)).fullyConverged);
+      assert.equal(text(await t.local.readFile(".obsidian/app.json")),'{"showLineNumber":true}');
+      assert.equal(text(await t.remote.readFile(path)),`Remote ${path}`);
+      assert.equal(t.remote.puts,1);
+
+      await assert.rejects(t.journal.send("PUT","https://synthetic.invalid/vault/unknown.md",null,
+        async () => { throw Error("reply lost"); }));
+      const registration = t.entries.get(t.journal.key);
+      assert.ok(registration);
+      t.remote.calls.length = 0;
+      const result = await runSync(recovery);
+      assert.equal(result.contentSummary?.blocked,true);
+      assert.deepEqual(t.remote.calls,[]);
+      assert.equal(t.entries.get(t.journal.key),registration);
+    } finally { t.stop(); }
+  });
+
+  it("binds the first-B recovery signal to Android, the same scope and the recovery trigger", async () => {
+    const t = await fixture();
+    const seen: SyncInput[] = [];
+    const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, async input => {
+      seen.push(input);
+      return { ok: true, fullyConverged: true, pendingDirectories: [], counts: {}, errors: [] };
+    });
+    m.plugin.databaseConnections = t.pool;
+    m.plugin.nativeWrites = t.journal;
+    m.plugin.vaultRandomID = t.input.vaultRandomID;
+    m.plugin.settings.webdav = { address: "https://synthetic.invalid/vault", username: "s00000", password: "synthetic" };
+    try {
+      m.platform.isAndroidApp = true;
+      await m.run("auto_sync_on_save", false, "fixture-first-b-scope");
+      assert.equal(seen.at(-1)?.androidFirstBRecovery,true);
+      await m.run("auto_sync_on_save", false, "different-scope");
+      assert.equal(seen.at(-1)?.androidFirstBRecovery,undefined);
+      await m.run("manual", false, "fixture-first-b-scope");
+      assert.equal(seen.at(-1)?.androidFirstBRecovery,undefined);
+      m.platform.isAndroidApp = false;
+      await m.run("auto_sync_on_save", false, "fixture-first-b-scope");
+      assert.equal(seen.at(-1)?.androidFirstBRecovery,undefined);
+    } finally { t.stop(); }
+  });
+});
+
 describe("Android save sync skips only verified clean remote bodies", () => {
   async function cleanFiles(paths: string[] = ["page.md"]) {
     const t = await environment();

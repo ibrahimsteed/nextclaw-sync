@@ -115,6 +115,58 @@ describe("content foundation with actual IndexedDB adapter", () => {
       assert.equal(decodeText(body.bytes), "saved");
     } finally { next.dispose(); }
   });
+  it("counts only the active profile in IndexedDB and rejects corrupt accounting entries", async () => {
+    const pool = new IdbConnectionPool();
+    const table = new IdbStore("p1-content-budget-" + crypto.randomUUID(), "history", ["history"], pool);
+    const limits = { note: 4, profile: 5 };
+    const guard = () => pool.assertOpen();
+    const a = new ContentStore(table, scope(), guard, limits);
+    const b = new ContentStore(table, scope("other"), guard, limits);
+    try {
+      await b.put("other.md", bytes("1234"), "clean-base");
+      const results = await Promise.allSettled([
+        a.put("a.md", bytes("123"), "merge-input"),
+        new ContentStore(table, scope(), guard, limits).put("b.md", bytes("456"), "merge-input"),
+      ]);
+      const saved = results.filter(r => r.status === "fulfilled").map(r => r.value);
+      assert.equal(saved.length, 1);
+      await assert.rejects(a.ensureCapacity(3), /content-limit-pending/);
+      await table.setItem(saved[0], {});
+      await assert.rejects(a.ensureCapacity(1), /Invalid content accounting/);
+      await assert.rejects(a.put("late.md", bytes("x"), "merge-input"), /Invalid content accounting/);
+      assert.equal((await table.keys()).length, 2);
+    } finally { pool.dispose(); }
+  });
+  it("binds a reservation to its path and owner and accounts for writes with a lost result", async () => {
+    const pool = new IdbConnectionPool();
+    const table = new IdbStore("p1-content-reservation-" + crypto.randomUUID(), "history", ["history"], pool);
+    const guard = () => pool.assertOpen(), limits = { note: 4, profile: 5 };
+    const store = new ContentStore(table, scope(), guard, limits);
+    const other = new ContentStore(table, scope(), guard, limits);
+    const reservation = await store.reserveCapacity(new Map([["a.md", 3], ["b.md", 2]]));
+    const setItem = table.setItem.bind(table);
+    try {
+      await assert.rejects(other.put("a.md", bytes("1"), "merge-input", reservation), /invalid-content-reservation/);
+      await assert.rejects(store.put("outside.md", bytes("1"), "merge-input", reservation), /invalid-content-reservation/);
+      await assert.rejects(other.put("a.md", bytes("1"), "merge-input"), /content-limit-pending/);
+      table.setItem = async (key, value) => {
+        await setItem(key, value);
+        throw Error("result lost after persisted body");
+      };
+      await assert.rejects(store.put("a.md", bytes("123"), "merge-input", reservation), /result lost/);
+      table.setItem = setItem;
+      await assert.rejects(store.put("a.md", bytes("1"), "merge-input", reservation), /content-limit-pending/);
+      reservation.release();
+      await assert.rejects(store.put("b.md", bytes("1"), "merge-input", reservation), /invalid-content-reservation/);
+      await assert.rejects(store.reserveCapacity(new Map([["b.md", 3]])), /content-limit-pending/);
+      const remaining = await store.reserveCapacity(new Map([["b.md", 2]]));
+      try {
+        const ref = await store.put("b.md", bytes("45"), "clean-base", remaining);
+        assert.equal(decodeText((await store.read(ref, "b.md")).bytes), "45");
+        assert.equal((await table.keys()).length, 2);
+      } finally { remaining.release(); }
+    } finally { reservation.release(); pool.dispose(); }
+  });
   it("does not publish a reference when its owner retires during the admitted write", async () => {
     const table = new Table(); let retired = false;
     const put = table.setItem.bind(table);

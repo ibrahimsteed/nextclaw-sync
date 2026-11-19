@@ -2,20 +2,21 @@
 export class SyncQueue {
   private dirty = false;
   private saveOnly = false;
+  private firstBRecovery?: string;
   private timer?: ReturnType<Window["setTimeout"]>;
   private failures = 0;
   private stopped = false;
   constructor(
-    private readonly run: (saveOnly: boolean) => Promise<"ok" | "failed" | "blocked">,
+    private readonly run: (saveOnly: boolean, firstBRecovery?: string) => Promise<"ok" | "failed" | "blocked">,
     // Capture the owning window once so native timer calls retain their receiver.
     private readonly clock: {
       setTimeout(fn: () => void, delay: number): ReturnType<Window["setTimeout"]>;
       clearTimeout(handle: ReturnType<Window["setTimeout"]>): void;
     } = window
   ) {}
-  request(delay = 0, saveOnly = false) {
+  request(delay = 0, saveOnly = false, firstBRecovery?: string) {
     if (this.stopped) return;
-    this.markDirty(saveOnly);
+    this.markDirty(saveOnly, firstBRecovery);
     this.failures = 0;
     this.schedule(delay);
   }
@@ -35,8 +36,9 @@ export class SyncQueue {
     }
     // Account/policy/confirmation blocks never start a retry loop.
   }
-  private markDirty(saveOnly: boolean) {
+  private markDirty(saveOnly: boolean, firstBRecovery?: string) {
     this.saveOnly = saveOnly && (!this.dirty || this.saveOnly);
+    this.firstBRecovery = !this.dirty || this.firstBRecovery === firstBRecovery ? firstBRecovery : undefined;
     this.dirty = true;
   }
   private schedule(delay: number) {
@@ -45,8 +47,9 @@ export class SyncQueue {
       this.timer = undefined;
       if (this.stopped || !this.dirty) return;
       const saveOnly = this.saveOnly;
+      const firstBRecovery = this.firstBRecovery;
       this.dirty = false;
-      void this.run(saveOnly).then(
+      void this.run(saveOnly, firstBRecovery).then(
         (outcome) => {
           if (outcome === "blocked" && !this.stopped) this.markDirty(saveOnly);
         },

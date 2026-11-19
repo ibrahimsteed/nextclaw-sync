@@ -61,6 +61,9 @@ import {
   shouldReloadAfterFirstASync,
   shouldReloadAfterSync,
   type ReloadDeps,
+  RELOAD_COMMAND_ID,
+  dispatchFirstBReload,
+  takeFirstBRecovery,
 } from "./nextclaw/reloadAfterSwitch";
 import { detectBranch, effectiveIgnorePaths } from "./nextclaw/branch";
 import { applyBranchPreset, enforceHiddenSettings } from "./nextclaw/presets";
@@ -211,7 +214,8 @@ export default class NextclawSyncPlugin extends Plugin {
 
   async syncRun(
     triggerSource: SyncTriggerSourceType = "manual",
-    saveOnly = false
+    saveOnly = false,
+    firstBRecovery?: string
   ): Promise<"ok" | "failed" | "blocked"> {
     const isSave = saveOnly && triggerSource === "auto_sync_on_save";
     if (this.deferredTasks.disposed || this.initializationWaiting) return "blocked";
@@ -624,9 +628,15 @@ export default class NextclawSyncPlugin extends Plugin {
         await this.saveSettings();
       }
 
+      const verifyFirstBRecovery = Platform.isAndroidApp && mode === "B" &&
+        triggerSource === "auto_sync_on_save" && firstBRecovery !== undefined &&
+        firstBRecovery === this.firstBRecoveryScope() && !this.settings.nextclawReloadAfterFirstBSync;
       const result = await runSync({
         mode,
+        ...(verifyFirstBRecovery ? { androidFirstBRecovery: true as const } : {}),
         androidSaveOnly: isSave && Platform.isAndroidApp ? true : undefined,
+        androidInitialDownload: Platform.isAndroidApp && mode === "B" &&
+          this.settings.nextclawReloadAfterFirstBSync === true ? true : undefined,
         fsLocal,
         fsRemote,
         db: this.db,
@@ -685,7 +695,12 @@ export default class NextclawSyncPlugin extends Plugin {
         // 引擎结束时已把 isSyncing 复位；这里重新置位，挡住提示等待期间的新同步
         // （例如保存时同步），免得它被重新加载中途打断。finally 会复位。
         this.isSyncing = true;
-        await reloadAfterFirstBSync(reloadDeps);
+        await reloadAfterFirstBSync({
+          ...reloadDeps,
+          dispatchReload: Platform.isAndroidApp ? () => !stopped() && dispatchFirstBReload(
+            window, this.firstBRecoveryScope(), () => reloadDeps.commands.executeCommandById(RELOAD_COMMAND_ID)
+          ) : undefined,
+        });
       } else if (
         shouldReloadAfterFirstASync({
           pending: this.settings.nextclawReloadAfterFirstASync,
@@ -993,9 +1008,9 @@ export default class NextclawSyncPlugin extends Plugin {
 
       this.addSettingTab(new NextclawSyncSettingTab(this.app, this));
 
-      this.syncQueue = new SyncQueue(async (saveOnly) => {
+      this.syncQueue = new SyncQueue(async (saveOnly, firstBRecovery) => {
         if (this.isSyncing) return "blocked";
-        return await this.syncRun("auto_sync_on_save", saveOnly);
+        return await this.syncRun("auto_sync_on_save", saveOnly, firstBRecovery);
       });
       this.registerDomEvent(window, "online", () => this.requestRecoverySync());
       this.registerDomEvent(document, "visibilitychange", () => {
@@ -1003,10 +1018,18 @@ export default class NextclawSyncPlugin extends Plugin {
       });
       // Intent is reconstructed from disk and the journal after reload, not mtime
       // versus a previous completion timestamp. Respect all-auto-off and mode A.
-      this.app.workspace.onLayoutReady(() => this.requestRecoverySync());
+      let startupMerged = false;
+      this.app.workspace.onLayoutReady(() => {
+        if (this.deferredTasks.disposed) return;
+        const firstBRecovery = Platform.isAndroidApp ? takeFirstBRecovery(window, this.firstBRecoveryScope()) : undefined;
+        const startupDelay = this.settings.initRunAfterMilliseconds ?? -1;
+        startupMerged = firstBRecovery !== undefined && startupDelay > 0 &&
+          this.requestRecoverySync(firstBRecovery, startupDelay);
+        if (!startupMerged) this.requestRecoverySync(firstBRecovery);
+      });
       this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onVaultRename(file, oldPath)));
       this.enableAutoSyncIfSet();
-      this.enableInitSyncIfSet();
+      this.enableInitSyncIfSet(() => startupMerged);
       this.toggleSyncOnSaveIfSet();
 
       await upsertPluginVersionByVault(
@@ -1188,26 +1211,33 @@ export default class NextclawSyncPlugin extends Plugin {
     }
   }
 
-  enableInitSyncIfSet() {
+  enableInitSyncIfSet(merged = () => false) {
     const delay = this.settings.initRunAfterMilliseconds;
     if (delay !== undefined && delay !== null && delay > 0) {
       this.app.workspace.onLayoutReady(() => {
-        if (this.deferredTasks.disposed) return;
+        if (this.deferredTasks.disposed || merged()) return;
         this.deferredTasks.schedule(() => this.syncRun("auto_once_init"), delay);
       });
     }
   }
 
-  requestRecoverySync() {
-    if (this.deferredTasks.disposed || this.initializationWaiting) return;
-    if (this.settings.syncDirection !== "bidirectional") return;
+  private firstBRecoveryScope() {
+    const { address, username, remoteBaseDir } = this.settings.webdav;
+    return JSON.stringify([this.getVaultBasePath(), this.getCurrProfileID(), address, username, remoteBaseDir]);
+  }
+
+  requestRecoverySync(firstBRecovery?: string, delay = 3000): boolean {
+    if (this.deferredTasks.disposed || this.initializationWaiting) return false;
+    if (this.settings.syncDirection !== "bidirectional") return false;
     if (
       (this.settings.autoRunEveryMilliseconds ?? -1) <= 0 &&
       (this.settings.syncOnSaveAfterMilliseconds ?? -1) <= 0 &&
       (this.settings.initRunAfterMilliseconds ?? -1) <= 0
     )
-      return;
-    this.syncQueue?.request(3000);
+      return false;
+    if (!this.syncQueue) return false;
+    this.syncQueue.request(delay, false, firstBRecovery);
+    return true;
   }
 
   async _checkCurrFileModified(caller: "SYNC" | "FILE_CHANGES") {
