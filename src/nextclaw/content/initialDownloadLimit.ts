@@ -1,0 +1,2 @@
+export const EMPTY_FIRST_B_DOWNLOAD_LIMIT = 4;
+export const INITIAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;

@@ -1,3 +1,4 @@
+import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "../../src/nextclaw/content/initialDownloadLimit";
 import "fake-indexeddb/auto";
 import { strict as assert } from "assert";
 import { prepareDBs, type NextclawSyncRecord } from "../../src/localdb";
@@ -350,7 +351,7 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("downloads beyond a normal batch with one full scan and at most four concurrent GETs", async () => {
+  it("downloads beyond a normal batch with one full scan and the configured GET ceiling", async () => {
     const t = await fixture(35);
     let active = 0, peak = 0, reads = 0, fileStats = 0, recordScans = 0, capacityScans = 0;
     const records = t.db.prevSyncRecordsTbl;
@@ -381,7 +382,7 @@ describe("Android first B download", () => {
     };
     try {
       assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.equal(peak, 4);
+      assert.equal(peak, EMPTY_FIRST_B_DOWNLOAD_LIMIT);
       assert.equal(reads, 35);
       // The test transport validates each conditional GET with an extra stat.
       assert.equal(fileStats - reads, 35 * 4);
@@ -399,13 +400,19 @@ describe("Android first B download", () => {
   });
 
   it("prefetches the next group while the first group publishes", async () => {
-    const t = await fixture(8);
+    const t = await fixture(2 * EMPTY_FIRST_B_DOWNLOAD_LIMIT);
+    const held: number[] = [];
+    const host = globalThis as { __nextclawSmallFileProbe?: (payload: string) => void };
+    host.__nextclawSmallFileProbe = payload => {
+      const row = JSON.parse(payload) as { phase: string; bytes: number };
+      if (row.phase === "download-byte-reserve" || row.phase === "download-byte-release") held.push(row.bytes);
+    };
     let nextStarted = false;
     let release!: () => void;
     const firstWrite = new Promise<void>(resolve => { release = resolve; });
     const read = t.remote.readContent.bind(t.remote);
     t.remote.readContent = async (path, expected) => {
-      if (path === t.paths[4]) {
+      if (path === t.paths[EMPTY_FIRST_B_DOWNLOAD_LIMIT]) {
         nextStarted = true;
         await firstWrite;
       }
@@ -417,13 +424,16 @@ describe("Android first B download", () => {
     };
     try {
       assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.deepEqual(t.local.writes().map(op => op.key).sort(), t.paths);
+      assert.deepEqual(t.local.writes().map(op => op.key).sort(), [...t.paths].sort());
       assert.equal(t.remote.puts, 0);
-    } finally { release(); t.stop(); }
+      assert.equal(Math.max(...held), t.paths.reduce((sum, path) => sum + t.remote.files.get(path)!.bytes.byteLength, 0));
+      assert.ok(Math.max(...held) <= INITIAL_DOWNLOAD_BYTES);
+      assert.equal(held.at(-1), 0);
+    } finally { delete host.__nextclawSmallFileProbe; release(); t.stop(); }
   });
 
   it("validates independent paths concurrently with at most four guarded writers", async () => {
-    const t = await fixture(4);
+    const t = await fixture(EMPTY_FIRST_B_DOWNLOAD_LIMIT);
     const stat = t.remote.stat.bind(t.remote);
     const write = t.local.writeFileGuarded.bind(t.local);
     let checksInFlight = 0, checkPeak = 0, writers = 0, writerPeak = 0;
@@ -653,7 +663,7 @@ describe("Android first B download", () => {
   });
 
   it("resumes after retirement without rewriting the file already committed", async () => {
-    const t = await fixture(5);
+    const t = await fixture(EMPTY_FIRST_B_DOWNLOAD_LIMIT + 1);
     const [first] = t.paths;
     let retired = false;
     t.input.contentRuntime!.assertActive = () => { if (retired) throw Error("retired"); };

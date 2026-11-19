@@ -1,3 +1,4 @@
+import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "./content/initialDownloadLimit";
 import { probeEvent } from "./content/probeTrace";
 import { isOrdinaryMovePath, SyncConflict } from "./engine/versionGuard";
 import { getAllPrevSyncRecordsByVaultAndProfile, insertSyncPlanRecordByVault } from "../localdb";
@@ -379,24 +380,46 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       }
       const runtime = rt;
       const downloads = executionEntries.filter(([key]) => initial.has(key));
-      const readDownloadChunk = (start: number) => Promise.allSettled(
-        downloads.slice(start, start + INITIAL_DOWNLOAD_CONCURRENCY).map(async ([key, item]) =>
-          {
+      const lanes = records.length === 0 ? EMPTY_FIRST_B_DOWNLOAD_LIMIT : INITIAL_DOWNLOAD_CONCURRENCY;
+      let inFlightBytes = 0;
+      const byteSize = (item: PlanItem) => item.remote!.size ?? item.remote!.sizeRaw;
+      const readDownloadChunk = (start: number) => {
+        const entries = downloads.slice(start, start + lanes);
+        const charge = entries.reduce((sum, [, item]) => {
+          const size = byteSize(item);
+          return sum + (Number.isSafeInteger(size) && size >= 0 && size <= NOTE_LIMIT ? size : 0);
+        }, 0);
+        if (inFlightBytes + charge > INITIAL_DOWNLOAD_BYTES) throw new Error("initial-download-byte-budget");
+        inFlightBytes += charge;
+        probeEvent(entries[0][0], "download-byte-reserve", { group: start, bytes: inFlightBytes });
+        return {
+          ready: Promise.allSettled(entries.map(async ([key, item]) => {
             probeEvent(key, "group-dispatch", { group: start });
             try {
+              const size = byteSize(item);
+              if (!Number.isSafeInteger(size) || size < 0 || size > NOTE_LIMIT)
+                throw new Error("content-limit-pending");
               const download = await runtime.file(key, undefined, item.remote).prefetchInitialDownload(item.remote!);
               probeEvent(key, "download-ready", { group: start, bytes: download.bytes.byteLength });
               return download;
             } catch (error) {
-              probeEvent(key, "download-rejected", { group: start });
+              const timeout = /timeout|timed out|deadline/i.test(errorOf(error).message);
+              probeEvent(key, "download-rejected", { group: start, timeout: Number(timeout) });
               throw error;
             }
-          }));
+          })),
+          release() {
+            inFlightBytes -= charge;
+            probeEvent(entries[0][0], "download-byte-release", { group: start, bytes: inFlightBytes });
+          },
+        };
+      };
       let prefetched: ReturnType<typeof readDownloadChunk> | undefined;
+      let activeDownload: ReturnType<typeof readDownloadChunk> | undefined;
       let reservation: ContentReservation | undefined;
       let collectionEnd = 0;
       try {
-        for (let i = 0; i < downloads.length; i += INITIAL_DOWNLOAD_CONCURRENCY) {
+        for (let i = 0; i < downloads.length; i += lanes) {
           if (result.contentSummary!.blocked || result.errors.length >= 10) {
             for (const [, item] of downloads.slice(i)) item.contentPending = "前序错误，未执行";
             break;
@@ -419,10 +442,11 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
               }
             }
           }
-          const next = i + INITIAL_DOWNLOAD_CONCURRENCY;
+          const next = i + lanes;
           const chunk = downloads.slice(i, next);
-          const ready = await (prefetched ?? readDownloadChunk(i));
+          activeDownload = prefetched ?? readDownloadChunk(i);
           prefetched = undefined;
+          const ready = await activeDownload.ready;
           for (const [key] of chunk) probeEvent(key, "group-released", { group: i });
           runtime.guard();
           if (next < downloads.length) prefetched = readDownloadChunk(next);
@@ -471,6 +495,8 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           } else {
             for (const [j, entry] of chunk.entries()) await apply(entry, j);
           }
+          activeDownload.release();
+          activeDownload = undefined;
           if (reservation && next === collectionEnd) {
             reservation.release();
             reservation = undefined;
@@ -481,7 +507,9 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         reservation?.release();
         // At most one read-only chunk is ahead of publication. Drain it
         // before releasing the owner, including after an interrupted commit.
-        await prefetched;
+        await prefetched?.ready;
+        prefetched?.release();
+        activeDownload?.release();
       }
       for (const key of attachments) {
         if (result.contentSummary!.blocked || result.errors.length >= 10) {
