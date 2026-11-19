@@ -194,7 +194,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       }
     }
     if (source !== "dry") await rt.collect();
-    const contentEntries = Object.entries(plan).filter(([key, item]) => !reserved.has(key) && !item.error && !key.endsWith("/") && !inConfig(key, input.configDir));
+    let contentEntries = Object.entries(plan).filter(([key, item]) => !reserved.has(key) && !item.error && !key.endsWith("/") && !inConfig(key, input.configDir));
     let bounded = source !== "dry" && input.protectModifyPercentage >= 100;
     const scheduleKey = `content-batch:${rt.scope}`;
     const previousBatch = bounded ? await input.db.simpleKVForMiscTbl.getItem<BatchState>(scheduleKey) : undefined;
@@ -207,22 +207,24 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         item.remote?.size ?? item.remote?.sizeRaw ?? 0) > NOTE_LIMIT;
     const fileForPlan = (key: string, item: PlanItem) =>
       rt!.file(key, item.local, item.remote, undefined, largeImported(item));
-    let batch = bounded ? selectBatch(contentEntries.map(([path, item]) => ({ path,
-      urgent: item.record?.pendingLocalUpload === true,
-      size: Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0, item.remote?.size ?? item.remote?.sizeRaw ?? 0) })),
-      previousBatch, saveOnly) : undefined;
-    if (input.androidFirstBRecovery && source === "auto_sync_on_save" && bounded && rootId &&
-        !result.errors.length && !result.pendingContent!.length && !reserved.size && !recheck.size &&
-        !previousBatch?.remaining.length && !previousBatch?.completed.length && !previousBatch?.issues?.length &&
-        !(await rt.rootReseed.active()) &&
-        contentEntries.length && contentEntries.every(([key, item]) => ordinary(key) && item.local &&
-          item.remote && item.record?.content?.status === "clean" && !item.record.pendingLocalUpload) &&
-        Object.entries(plan).every(([key, item]) =>
-          !(key.endsWith("/") || inConfig(key, input.configDir)) || (!item.change && !item.pending))) {
+    const canVerifyClean = bounded && rootId && !result.errors.length && !result.pendingContent!.length &&
+      !reserved.size && (input.androidInitialDownload || input.androidFirstBRecovery) && !(await rt.rootReseed.active());
+    const resumeFirstB = canVerifyClean && input.androidInitialDownload &&
+      (source === "manual" || source === "auto_sync_on_save") && records.length > 0;
+    const verifyAfterReload = canVerifyClean && input.androidFirstBRecovery && source === "auto_sync_on_save" &&
+      !recheck.size && !previousBatch?.remaining.length && !previousBatch?.completed.length && !previousBatch?.issues?.length &&
+      contentEntries.length > 0 && contentEntries.every(([key, item]) => ordinary(key) && item.local &&
+        item.remote && item.record?.content?.status === "clean" && !item.record.pendingLocalUpload) &&
+      Object.entries(plan).every(([key, item]) =>
+        !(key.endsWith("/") || inConfig(key, input.configDir)) || (!item.change && !item.pending));
+    if (resumeFirstB || verifyAfterReload) {
       const runtime = rt;
-      const verified = [];
-      for (let i = 0; i < contentEntries.length;) {
-        const next = contentEntries.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
+      const issues = new Set(previousBatch?.issues?.map(item => item.path));
+      const candidates = resumeFirstB ? contentEntries.filter(([key, item]) => ordinary(key) && item.local &&
+        item.remote && item.record?.content?.status === "clean" && !recheck.has(key) && !issues.has(key)) : contentEntries;
+      const verified = new Map<string, NonNullable<PlanItem["content"]>>();
+      for (let i = 0; i < candidates.length;) {
+        const next = candidates.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
         const large = next.findIndex(([, item]) => largeImported(item));
         const chunk = large < 0 ? next : next.slice(0, Math.max(1, large));
         const checked = await Promise.allSettled(chunk.map(async ([key, item]) => {
@@ -230,23 +232,34 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           return (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
         }));
         runtime.guard();
-        for (const check of checked) if (check.status === "rejected" &&
-            !(check.reason instanceof SyncConflict) && (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
-        for (const check of checked) if (check.status === "fulfilled" && check.value) verified.push(check.value);
+        for (const [index, check] of checked.entries()) {
+          if (check.status === "rejected" && !(check.reason instanceof SyncConflict) &&
+              (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
+          if (check.status === "fulfilled" && check.value) verified.set(chunk[index][0], check.value);
+        }
         i += chunk.length;
-        if (verified.length !== i) break;
+        if (!resumeFirstB && verified.size !== i) break;
       }
-      if (verified.length === contentEntries.length) {
-        for (const [index, [, item]] of contentEntries.entries()) {
+      if (resumeFirstB || verified.size === contentEntries.length) {
+        for (const [key, clean] of verified) {
+          const item = plan[key];
           item.decision = "content";
           item.change = false;
-          item.content = verified[index];
-          item.reason = verified[index].reason;
+          item.content = clean;
+          item.reason = clean.reason;
         }
-        batch = undefined;
-        bounded = false;
+        if (resumeFirstB) {
+          // Schedule unresolved paths only. The clean proofs apply to this run, never a later sweep.
+          contentEntries = contentEntries.filter(([key]) => !verified.has(key));
+        } else {
+          bounded = false;
+        }
       }
     }
+    const batch = bounded ? selectBatch(contentEntries.map(([path, item]) => ({ path,
+      urgent: item.record?.pendingLocalUpload === true,
+      size: Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0, item.remote?.size ?? item.remote?.sizeRaw ?? 0) })),
+      previousBatch, saveOnly) : undefined;
     const canImport = batch && input.androidInitialDownload && rootId &&
       !result.errors.length && !(await rt.rootReseed.active());
     const newRemoteFiles = canImport ? contentEntries.filter(([key, item]) =>

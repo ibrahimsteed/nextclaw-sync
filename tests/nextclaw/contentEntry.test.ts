@@ -127,6 +127,56 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
+  it("resumes first B with existing clean records and fetches only the four held attachments", async () => {
+    const t = await fixture(36);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      const attachments = new Map(Object.entries({"demo.gif":10843290,"one.png":1653277,"two.png":1317257,"three.png":1392586})
+        .map(([path, size]) => [path, seedAttachment(t, path, size)]));
+      const scope = contentRuntime(t.input).scope;
+      await t.db.simpleKVForMiscTbl.setItem(`content-batch:${scope}`, {
+        version: 1, remaining: t.paths, completed: [],
+        issues: [...attachments.keys()].map(path => ({path, reason:"content-limit-pending"})),
+      });
+      t.remote.calls.length = t.local.calls.length = 0;
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, true, JSON.stringify(result.pendingContent));
+      assert.deepEqual(t.remote.calls.filter(c=>c.op==="readFile").map(c=>c.key).sort(), [...attachments.keys()].sort());
+      assert.deepEqual(t.local.writes().map(c=>c.key).sort(), [...attachments.keys()].sort());
+      assert.equal(t.remote.puts,0);
+      assert.equal(t.reruns(),0);
+      for (const [path, body] of attachments) assert.deepEqual(await t.local.readFile(path), body);
+    } finally { t.stop(); }
+  });
+
+  it("runs ordinary first-B planning for a missing record, changed version, and edited local bytes", async () => {
+    const t = await fixture(6);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      const [missing, replaced, edited, changedDuringCheck, changedIdentity, unchecked] = t.paths;
+      await t.db.prevSyncRecordsTbl.removeItem(`${t.input.vaultRandomID}\tp\t${missing}`);
+      t.seed(replaced,"remote edit");
+      t.local.put(edited,`Remote ${edited}`);
+      t.remote.files.get(changedIdentity)!.entity.remoteFileId="replacement-id";
+      const stat = t.remote.stat.bind(t.remote);
+      let observed = 0;
+      t.remote.stat = async key => {
+        if (key === changedDuringCheck && ++observed === 2) t.seed(key,"changed during verification");
+        return stat(key);
+      };
+      t.remote.calls.length = 0;
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged,true,JSON.stringify(result.pendingContent));
+      const reads = t.remote.calls.filter(c=>c.op==="readFile").map(c=>c.key);
+      for (const changed of [missing,replaced,edited,changedDuringCheck,changedIdentity]) assert.ok(reads.includes(changed),changed);
+      assert.ok(!reads.includes(unchecked));
+      assert.equal(text(await t.local.readFile(replaced)),"remote edit");
+      assert.equal(text(await t.local.readFile(changedDuringCheck)),"changed during verification");
+      assert.equal(text(await t.remote.readFile(edited)),`Remote ${edited}`);
+      assert.equal(t.remote.puts,1);
+    } finally { t.stop(); }
+  });
+
   it("charges attachment bodies separately and rejects a declared file above 50 MiB before GET", async () => {
     const t = await fixture(0);
     try {
