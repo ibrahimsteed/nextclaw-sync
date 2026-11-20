@@ -207,7 +207,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0,
         item.remote?.size ?? item.remote?.sizeRaw ?? 0) > NOTE_LIMIT;
     const fileForPlan = (key: string, item: PlanItem) =>
-      rt!.file(key, item.local, item.remote, undefined, largeImported(item));
+      rt!.file(key, item.local, item.remote, undefined, !input.mobileDailyContentBudget && largeImported(item));
     const mobileFirstB = input.androidInitialDownload || input.ipadInitialDownload;
     const canVerifyClean = bounded && rootId && !result.errors.length && !result.pendingContent!.length &&
       !reserved.size && (mobileFirstB || input.androidFirstBRecovery) && !(await rt.rootReseed.active());
@@ -279,7 +279,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           mode: "B", configDir: input.configDir, ownerActive: () => { try { rt!.guard(); return true; } catch { return false; } },
           unknownWrite: journal!.blocked(), deletion: item.record && (!l || !r) ? await rt!.deletionEvidence(key) : undefined, local: l, remote: r && { bytes: r.bytes, etag: r.etag, remoteFileId: r.remoteFileId },
           readConflict: async id => (await rt!.operations.get(id))?.conflict });
-        if (largeImported(item) && !["hold", "none", "preserve-both"].includes(item.content.action)) {
+        if (!input.mobileDailyContentBudget && largeImported(item) && !["hold", "none", "preserve-both"].includes(item.content.action)) {
           item.content = { action: "hold", status: "pending", reason: "large-attachment-change-pending",
             fullyConverged: false, fatalBudgetDelta: 0 };
         }

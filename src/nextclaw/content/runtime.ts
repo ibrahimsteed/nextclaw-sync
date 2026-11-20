@@ -10,7 +10,7 @@ import { decodeRecord, name, observation, type SyncInput } from "../engine/model
 import { scopeKey, localSnapshot, hashBytes, isAttachmentPath, matchesAttachmentSignature, type Snapshot } from "./identity";
 import { loadContentHistory, strongEtag } from "./migration";
 import type { ContentPlan } from "./decision";
-import { ContentStore } from "./store";
+import { ContentStore, MOBILE_CONTENT_LIMITS } from "./store";
 import { IdbContentCheckpoint, TableOperationRepository } from "./repository";
 import { ContentExecutor, type ContentView } from "./operation";
 import { collectContent } from "./cleanup";
@@ -104,7 +104,8 @@ export function contentRuntime(input: SyncInput) {
   const binding = input.fsRemote.contentBinding();
   if (binding.journalToken !== runtime.journal.token) throw new Error("内容传输与原生登记owner不匹配");
   const scope = contentScope(input);
-  const bodies = new ContentStore(input.db.fileContentHistoryTbl, scope, guard);
+  const bodies = new ContentStore(input.db.fileContentHistoryTbl, scope, guard,
+    input.mobileDailyContentBudget ? MOBILE_CONTENT_LIMITS : undefined);
   const attachments = bodies.attachmentStore();
   const operations = new TableOperationRepository(input.db.fileContentHistoryTbl, scope, guard);
   const rootReseed = new RootReseed(input.db.fileContentHistoryTbl, scope, input.fsRemote.contentEndpoint("/"), runtime.journal, guard);
@@ -198,8 +199,8 @@ export function contentRuntime(input: SyncInput) {
     async function readRemoteVersion(e: Entity, verify = () => assertVersion(input.fsRemote, rp, e)) {
       if ((e.size ?? e.sizeRaw) > fileBodies.fileLimit) throw new Error("content-limit-pending");
       const view = await probeSpan(path, "get", () => input.fsRemote.readContent(rp, e)); guard();
-      if (attachment && view.bytes.byteLength > fileBodies.fileLimit)
-        throw new Error("attachment-file-limit-pending");
+      if (view.bytes.byteLength > fileBodies.fileLimit)
+        throw new Error(attachment ? "attachment-file-limit-pending" : "content-limit-pending");
       await verify(); guard();
       if (e.remoteChecksum && e.remoteChecksum !== await hashBytes(view.bytes)) throw new SyncConflict("远端正文校验和不匹配");
       if (attachment) attachmentVersion = e;
@@ -284,7 +285,7 @@ export function contentRuntime(input: SyncInput) {
           await probeSpan(path, "guarded-write", () => input.fsLocal.writeFileGuarded(lp, bytes, Date.now(), Date.now(), e ?? null, before?.bytes,
             current, attachment && version ? () => assertInitialVersion(version) : undefined));
         } catch (error) {
-          if (attachment && (error instanceof Error && error.name === "QuotaExceededError" ||
+          if ((attachment || input.mobileDailyContentBudget) && (error instanceof Error && error.name === "QuotaExceededError" ||
               (error as { code?: string } | null)?.code === "ENOSPC"))
             throw new Error("attachment-storage-quota-pending");
           throw error;
@@ -308,7 +309,7 @@ export function contentRuntime(input: SyncInput) {
       },
       async removeLocal(hash, current) {
         current(); const e = await fresh(input.fsLocal, lp); if (!e) throw new SyncConflict("delete-local-disappeared");
-        const snapshot = await localSnapshot(input.fsLocal, lp, e, guard); current();
+        const snapshot = await localSnapshot(input.fsLocal, lp, e, guard, fileBodies.fileLimit); current();
         if (snapshot.hash !== hash) throw new SyncConflict("delete-local-content-changed");
         await input.fsLocal.rmGuarded(lp, e, snapshot.bytes, current); current();
       },
@@ -348,7 +349,7 @@ export function contentRuntime(input: SyncInput) {
       const slot = await file(value.key).checkpoint.read(); guard(); rows.push({ value, commitId: slot.commitId });
     }
     const stage = await input.db.fileContentHistoryTbl.getItem(contentMoveKey(scope));
-    return collectContent(scope, input.db.fileContentHistoryTbl, operations, rows, guard,
+    return collectContent(bodies, input.db.fileContentHistoryTbl, operations, rows, guard,
       (await deletions.list()).map(o => ({ id: o.id, path: o.path, baseRef: o.baseRef, baseHash: o.baseHash, supersedes: o.supersedes, phase: o.phase })),
       acknowledgedMove(stage, scope)?.targetBase, committedMove(stage, scope));
   }

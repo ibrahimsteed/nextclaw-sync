@@ -799,6 +799,97 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
+  for (const platform of ["Android", "iPad"]) it(`${platform} daily B uses the raised budget for local and remote file changes`, async function () {
+    this.timeout(20000);
+    const t = await fixture(0);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const path = "imported.md";
+    const base = "x".repeat(NOTE_LIMIT + 1);
+    t.seed(path, base);
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+      const m = mainHarness({...harness(), local:t.local, remote:t.remote, input:t.input}, runSync);
+      m.plugin.databaseConnections = t.pool;
+      m.plugin.nativeWrites = t.journal;
+      m.plugin.vaultRandomID = t.input.vaultRandomID;
+      m.plugin.settings.webdav = {address:"https://synthetic.invalid/vault", username:"s00000", password:"synthetic"};
+      m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+      if (platform === "Android") m.platform.isAndroidApp = true;
+      else { m.platform.isIosApp = true; m.platform.isTablet = true; }
+      const upload = "L" + base;
+      t.local.put(path, upload);
+      assert.equal(await m.run("manual"), "ok");
+      assert.equal(t.remote.puts, 1);
+      assert.equal(text(await t.remote.readFile(path)), upload);
+      assert.equal((await t.rec(path))?.content?.status, "clean");
+      assert.ok(!isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+      const download = "R" + base;
+      t.seed(path, download);
+      assert.equal(await m.run("auto"), "ok");
+      assert.equal(text(await t.local.readFile(path)), download);
+      assert.equal(m.plugin.pendingContent.pending, 0);
+      assert.equal(await m.run("manual"), "ok", "a later sweep can verify the new large baseline");
+      assert.equal(m.plugin.pendingContent.pending, 0);
+      assert.equal(t.remote.puts, 1);
+    } finally { t.stop(); }
+  });
+
+  it("limits enlarged daily B to Android and iPad", async () => {
+    const t = await fixture();
+    const seen: SyncInput[] = [];
+    const m = mainHarness({...harness(), local:t.local, remote:t.remote, input:t.input}, async input => {
+      seen.push(input);
+      return {ok:true, fullyConverged:false, pendingDirectories:[], counts:{}, errors:[]};
+    });
+    m.plugin.databaseConnections=t.pool;
+    m.plugin.nativeWrites=t.journal;
+    m.plugin.vaultRandomID=t.input.vaultRandomID;
+    m.plugin.settings.webdav={address:"https://synthetic.invalid/vault", username:"s00000", password:"synthetic"};
+    try {
+      m.platform.isIosApp = true;
+      await m.run();
+      assert.equal(seen.at(-1)?.mobileDailyContentBudget, undefined);
+      m.platform.isTablet = true;
+      m.plugin.settings.nextclawReloadAfterFirstBSync = true;
+      await m.run();
+      assert.equal(seen.at(-1)?.mobileDailyContentBudget, undefined);
+      assert.equal(seen.at(-1)?.ipadInitialDownload, true);
+      m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+      await m.run();
+      assert.equal(seen.at(-1)?.mobileDailyContentBudget, true);
+      m.platform.isIosApp = m.platform.isTablet = false;
+      await m.run();
+      assert.equal(seen.at(-1)?.mobileDailyContentBudget, undefined);
+    } finally { t.stop(); }
+  });
+
+  it("rejects daily B files above 50 MiB before GET and charges both stores to 1,000 MiB", async () => {
+    const t = await fixture(0);
+    delete t.input.androidInitialDownload;
+    t.input.mobileDailyContentBudget = true;
+    const rt = contentRuntime(t.input);
+    const old = bytes("imported");
+    const daily = bytes("daily update");
+    try {
+      await rt.attachments.put("old.html", old, "clean-base");
+      await rt.bodies.put("today.md", daily, "clean-base");
+      assert.equal(rt.bodies.fileLimit, ATTACHMENT_LIMIT);
+      await rt.bodies.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - old.byteLength - daily.byteLength);
+      await assert.rejects(rt.bodies.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - old.byteLength - daily.byteLength + 1), /content-limit-pending/);
+      t.seed("oversized.pdf", "fixture");
+      const row = t.remote.files.get("oversized.pdf")!;
+      row.entity.size = row.entity.sizeRaw = ATTACHMENT_LIMIT + 1;
+      const result = await runSync(t.input);
+      assert.deepEqual(result.pendingContent, [{path:"oversized.pdf", reason:"内容超过安全预算，待处理"}]);
+      assert.equal(t.remote.calls.some(c=>c.op==="readFile"), false);
+      assert.deepEqual(t.local.writes(), []);
+    } finally { t.stop(); }
+  });
+
   it("rechecks the clean first-B vault in one run with four read-only lanes", async () => {
     const t = await fixture(35);
     try {

@@ -1,5 +1,5 @@
 import { inConfig } from "../engine/model";
-import { ATTACHMENT_LIMIT, hashBytes, NOTE_LIMIT } from "./identity";
+import { hashBytes } from "./identity";
 import { loadContentHistory, strongEtag } from "./migration";
 import { markerState } from "./markers";
 
@@ -48,7 +48,7 @@ export async function planContent(input: ContentPlanInput): Promise<ContentPlan>
     // A stage without a durable operation-completion check is not replayable.
     if (history.content?.operationRef)
       return result("hold", "pending", "keep-unconfirmed-stage");
-    const limit = input.store.attachment ? ATTACHMENT_LIMIT : NOTE_LIMIT;
+    const limit = input.store.fileLimit;
     if ((input.local?.bytes.byteLength ?? 0) > limit || (input.remote?.bytes.byteLength ?? 0) > limit)
       return result("hold", "pending", "content-limit-pending");
     const remoteEtag = input.remote?.etag;

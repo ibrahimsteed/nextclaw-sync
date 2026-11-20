@@ -1,13 +1,14 @@
 import type { NextclawSyncRecord } from "../../localdb";
 import { validContentRecord } from "./identity";
 import type { OperationRepository } from "./operation";
-import { ATTACHMENT_BODY, CONTENT_BODY, ContentStore } from "./store";
+import { ATTACHMENT_BODY, CONTENT_BODY, type ContentStore } from "./store";
 import type { ContentTable } from "./store";
 import type { committedMove } from "./move";
 /** Only run under the full-sync owner gate, never in an admitted content operation. */
-export async function collectContent(scope: string, table: ContentTable & { removeItem(key: string): Promise<unknown> },
+export async function collectContent(store: ContentStore, table: ContentTable & { removeItem(key: string): Promise<unknown> },
   operations: OperationRepository, records: { value: NextclawSyncRecord; commitId?: string }[], guard: () => void, deleted: { id: string; path: string; baseRef: string; baseHash: string; supersedes: string[]; phase?: string }[] = [],
   moveBase?: string, moved?: ReturnType<typeof committedMove>) {
+  const scope = store.scope;
   guard(); const all = await operations.list(scope); guard();
   const operationsById = new Map(all.map(op => [op.id, op]));
   const recordsByPath = new Map<string, typeof records[number]>();
@@ -26,7 +27,7 @@ export async function collectContent(scope: string, table: ContentTable & { remo
     const c = r.value.content;
     if (c?.scopeKey === scope && !recordsByPath.has(r.value.key)) recordsByPath.set(r.value.key, r);
     if (c?.scopeKey === scope && c.cleanBaseRef) {
-      const base = await new ContentStore(table, scope, guard).read(c.cleanBaseRef, r.value.key); guard();
+      const base = await store.read(c.cleanBaseRef, r.value.key); guard();
       if (base.kind !== "clean-base" || (c.status === "clean" && !r.value.pendingLocalUpload &&
         (base.hash !== c.localHash || base.hash !== c.remoteHash))) throw new Error("GC拒绝无效共同基线");
     }

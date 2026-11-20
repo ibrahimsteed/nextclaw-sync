@@ -57,6 +57,7 @@ export interface LocalRename { scope: string; source: string; target: string }
 export interface SyncInput {
   contentRuntime?: ContentRuntime;
   androidSaveOnly?: true;
+  mobileDailyContentBudget?: true;
   androidInitialDownload?: true;
   ipadInitialDownload?: true;
   androidFirstBRecovery?: true;
