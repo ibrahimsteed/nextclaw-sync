@@ -174,6 +174,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       }
     }
     // Recover only stages with durable completion. No dispatch/replay in this path.
+    const recoveredPaths = new Set<string>();
     for (const op of await rt.operations.list(rt.scope)) {
       rt.guard();
       if (op.phase !== "committed" && op.phase !== "archived") recheck.add(op.path);
@@ -181,6 +182,8 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       if (op.phase === "inputs-durable" && source !== "dry") { op.phase = "rediscover"; await rt.operations.put(op); }
       if (["remote-acknowledged", "local-verified"].includes(op.phase)) {
         if (source === "dry") throw new Error("有待提交的内容操作，请先进行正常同步");
+        // A second operation at this path needs a fresh plan after the first commit.
+        if (recoveredPaths.has(op.path)) break;
         const item = plan[op.path];
         const outcome = await rt.file(op.path, item?.local, item?.remote, undefined,
           isAttachmentRef(op.outputRef)).executor.finish(op.id);
@@ -190,9 +193,14 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           if (outcome.status === "blocked-unknown-write") result.contentSummary!.blocked = true;
           return result;
         }
-        // Observations and record generations changed; re-discover through a queued run, not an old plan.
-        input.contentRuntime!.requestRerun(); result.pendingContent!.push({ path: op.path, reason: "操作已确认，待重新扫描" }); return result;
+        recoveredPaths.add(op.path);
+        result.pendingContent!.push({ path: op.path, reason: "操作已确认，待重新扫描" });
       }
+    }
+    // Re-discover the confirmed paths before dispatching work from the old plan.
+    if (recoveredPaths.size) {
+      input.contentRuntime!.requestRerun();
+      return result;
     }
     if (source !== "dry") await rt.collect();
     let contentEntries = Object.entries(plan).filter(([key, item]) => !reserved.has(key) && !item.error && !key.endsWith("/") && !inConfig(key, input.configDir));

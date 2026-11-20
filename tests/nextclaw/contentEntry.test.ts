@@ -355,6 +355,65 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
+  for (const platform of ["Android", "iPad"]) {
+    for (const changedVersion of [false, true]) {
+      it(`${platform} first B ${changedVersion ? "stops at an unconfirmed recovery" : "recovers independent operations before one rescan and imports a remote-only PNG"}`, async () => {
+        const t = await fixture(3);
+        if (platform === "iPad") {
+          delete t.input.androidInitialDownload;
+          t.input.ipadInitialDownload = true;
+        }
+        const history = t.db.fileContentHistoryTbl;
+        const persist = history.setItem.bind(history);
+        const runtime = contentRuntime(t.input);
+        history.setItem = async (key, value) => {
+          const result = await persist(key, value);
+          const operation = value as { path?: string; phase?: string } | null;
+          if (operation?.phase === "local-verified") throw Error("interrupted before checkpoint");
+          return result;
+        };
+        try {
+          assert.equal((await runSync(t.input)).fullyConverged, false);
+          history.setItem = persist;
+          const staged = (await runtime.operations.list(runtime.scope)).filter(o => o.phase === "local-verified");
+          assert.equal(staged.length, 3);
+          const png = "remaining.png";
+          const body = seedAttachment(t, png, 128);
+          if (changedVersion) t.seed(staged[1].path, "new remote version");
+          const before = t.reruns();
+          const input = { ...t.input, triggerSource: "auto_sync_on_save" as const };
+          const recovered = await runSync(input);
+          assert.equal(recovered.fullyConverged, false);
+          assert.equal(recovered.errors.length, 0);
+          assert.equal(t.local.files.has(png), false);
+          assert.equal(t.remote.puts, 0);
+          if (changedVersion) {
+            assert.deepEqual(recovered.pendingContent, [
+              { path: staged[0].path, reason: "操作已确认，待重新扫描" },
+              { path: staged[1].path, reason: "remote-changed-after-ack" },
+            ]);
+            assert.equal(t.reruns(), before);
+            assert.equal(await t.rec(staged[1].path), null);
+            assert.equal(await t.rec(staged[2].path), null);
+            assert.equal((await runtime.operations.get(staged[2].id))?.phase, "local-verified");
+          } else {
+            assert.deepEqual(recovered.pendingContent, staged.map(({ path }) => ({ path, reason: "操作已确认，待重新扫描" })));
+            assert.equal(t.reruns(), before + 1);
+            for (const operation of staged) {
+              assert.equal((await runtime.operations.get(operation.id))?.phase, "committed");
+              assert.equal((await t.rec(operation.path))?.content?.status, "clean");
+            }
+            assert.equal((await runSync(input)).fullyConverged, true);
+            assert.deepEqual(await t.local.readFile(png), body);
+            assert.equal((await t.rec(png))?.content?.status, "clean");
+            assert.equal(t.reruns(), before + 1);
+            assert.equal(t.remote.puts, 0);
+          }
+        } finally { t.stop(); }
+      });
+    }
+  }
+
   for (const platform of ["Android", "iPad"]) it(`${platform} downloads beyond a normal batch with one full scan and the configured GET ceiling`, async () => {
     const t = await fixture(35);
     if (platform === "iPad") {
