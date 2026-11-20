@@ -7,7 +7,7 @@ import { inConfig } from "../engine/model";
 import { NativeWritePaused } from "../nativeWriteJournal";
 import { assertVersion, etagHeader, isStrongMoveEtag, sameVersion, SyncConflict } from "../engine/versionGuard";
 import { decodeRecord, name, observation, type SyncInput } from "../engine/model";
-import { scopeKey, localSnapshot, hashBytes, matchesAttachmentSignature, type Snapshot } from "./identity";
+import { scopeKey, localSnapshot, hashBytes, isAttachmentPath, matchesAttachmentSignature, type Snapshot } from "./identity";
 import { loadContentHistory, strongEtag } from "./migration";
 import type { ContentPlan } from "./decision";
 import { ContentStore } from "./store";
@@ -216,7 +216,7 @@ export function contentRuntime(input: SyncInput) {
       if (etag !== etagHeader(version) ||
           download.bytes.byteLength !== (version.size ?? version.sizeRaw))
         throw new SyncConflict("首次下载响应与清单版本不一致，待重新扫描");
-      if (attachment && !matchesAttachmentSignature(path, download.bytes))
+      if (attachment && isAttachmentPath(path) && !matchesAttachmentSignature(path, download.bytes))
         throw new Error("attachment-signature-mismatch");
       return { ...download, etag, version };
     }

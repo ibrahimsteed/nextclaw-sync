@@ -1,4 +1,4 @@
-import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES, IPAD_FIRST_B_DOWNLOAD_LIMIT } from "../../src/nextclaw/content/initialDownloadLimit";
+import { FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "../../src/nextclaw/content/initialDownloadLimit";
 import "fake-indexeddb/auto";
 import { strict as assert } from "assert";
 import { prepareDBs, type NextclawSyncRecord } from "../../src/localdb";
@@ -56,7 +56,7 @@ export async function environment() {
     stop() { active=false; journal.retire(); pool.dispose(); }, guard };
 }
 
-describe("Android first B download", () => {
+describe("Mobile first B download", () => {
   async function fixture(count = 1) {
     const t = await environment();
     const stat = t.remote.stat.bind(t.remote);
@@ -138,7 +138,7 @@ describe("Android first B download", () => {
     try {
       const imported = await runSync(t.input);
       assert.equal(imported.fullyConverged, true, JSON.stringify(imported.pendingContent));
-      assert.equal(peak, 1);
+      assert.equal(peak, 4);
       for (const [path, body] of files) {
         assert.deepEqual(await t.local.readFile(path), body);
         assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
@@ -165,8 +165,12 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("resumes first B with existing clean records and fetches only the four held attachments", async () => {
+  for (const platform of ["Android", "iPad"]) it(`${platform} resumes first B with existing clean records and fetches only the four held attachments`, async () => {
     const t = await fixture(36);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
     try {
       assert.ok((await runSync(t.input)).fullyConverged);
       const attachments = new Map(Object.entries({"demo.gif":10843290,"one.png":1653277,"two.png":1317257,"three.png":1392586})
@@ -215,7 +219,7 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("charges attachment bodies separately and rejects a declared file above 50 MiB before GET", async () => {
+  it("counts retained old and new bodies in the import budget and rejects a declared file above 50 MiB before GET", async () => {
     const t = await fixture(0);
     try {
       const rt = contentRuntime(t.input);
@@ -228,8 +232,8 @@ describe("Android first B download", () => {
       const ref = await rt.attachments.put("image.gif", bytes, "clean-base");
       assert.ok(isAttachmentRef(ref));
       assert.deepEqual((await rt.bodies.read(ref, "image.gif")).bytes, bytes);
-      await rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - bytes.byteLength);
-      await assert.rejects(rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - bytes.byteLength + 1), /content-limit-pending/);
+      await rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - PROFILE_LIMIT - bytes.byteLength);
+      await assert.rejects(rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - PROFILE_LIMIT - bytes.byteLength + 1), /content-limit-pending/);
       await assert.rejects(rt.bodies.ensureCapacity(1), /content-limit-pending/);
       t.remote.files.delete("image.gif");
       seedAttachment(t, "too-big.gif", 8);
@@ -386,10 +390,10 @@ describe("Android first B download", () => {
     };
     try {
       assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.equal(peak, platform === "iPad" ? IPAD_FIRST_B_DOWNLOAD_LIMIT : EMPTY_FIRST_B_DOWNLOAD_LIMIT);
+      assert.equal(peak, FIRST_B_DOWNLOAD_LIMIT);
       assert.equal(reads, 35);
       // The test transport validates each conditional GET with an extra stat.
-      assert.equal(fileStats - reads, 35 * 4);
+      assert.equal(fileStats - reads, 35 * 5);
       assert.equal(recordScans, 3);
       assert.equal(capacityScans, 1);
       assert.equal(t.remote.calls.filter(x => x.op === "walk").length, 1);
@@ -403,12 +407,77 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("prefetches the next group while the first group publishes", async () => {
-    const t = await fixture(2 * EMPTY_FIRST_B_DOWNLOAD_LIMIT);
-    const held: number[] = [];
+  for (const platform of ["Android", "iPad"]) it(`${platform} imports mixed formats with ten GETs and the shared larger budget`, async () => {
+    const t = await fixture(0);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const source = new Map<string, ArrayBuffer>();
+    source.set("a.md", bytes("x".repeat(NOTE_LIMIT + 1)));
+    source.set("b.jpeg", Uint8Array.of(0xff, 0xd8, 0xff, 1).buffer);
+    source.set("c.png", seedAttachment(t, "c.png", 20));
+    source.set("d.gif", seedAttachment(t, "d.gif", 20));
+    source.set("e.html", Uint8Array.of(0xef, 0xbb, 0xbf, 60, 62, 13, 10, 0xff).buffer);
+    source.set("f.pdf", bytes("%PDF-1.7"));
+    for (const [path, value] of [["g.any", ""], ["h.bin", "opaque"], ["i.md", "# hi"], ["j.htm", "html"]]) {
+      source.set(path, bytes(value));
+    }
+    for (const [path, body] of source) {
+      t.seed(path, "");
+      const row = t.remote.files.get(path)!;
+      row.bytes = body;
+      row.entity.size = row.entity.sizeRaw = body.byteLength;
+    }
+    const read = t.remote.readContent.bind(t.remote);
+    let active = 0, peak = 0;
+    t.remote.readContent = async (...args) => {
+      peak = Math.max(peak, ++active);
+      try {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        return await read(...args);
+      } finally { active--; }
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, true, JSON.stringify(result.pendingContent));
+      assert.equal(peak, 10);
+      assert.equal(t.remote.calls.filter(c=>c.op==="readFile").length, 10);
+      for (const [path, body] of source) {
+        assert.deepEqual(await t.local.readFile(path), body);
+        assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+      }
+    } finally { t.stop(); }
+  });
+
+  it("limits simultaneous whole responses even when ten download slots are available", async () => {
+    const t = await fixture(2);
+    for (const path of t.paths) {
+      const row = t.remote.files.get(path)!;
+      row.entity.size = row.entity.sizeRaw = 33 * 1024 * 1024;
+    }
     const host = globalThis as { __nextclawSmallFileProbe?: (payload: string) => void };
+    const held: number[] = [];
     host.__nextclawSmallFileProbe = payload => {
       const row = JSON.parse(payload) as { phase: string; bytes: number };
+      if (row.phase === "download-byte-reserve" || row.phase === "download-byte-release") held.push(row.bytes);
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, false);
+      assert.deepEqual(held, [33 * 1024 * 1024, 0, 33 * 1024 * 1024, 0]);
+      assert.equal(t.local.writes().length, 0, "mismatched bodies never publish");
+    } finally { delete host.__nextclawSmallFileProbe; t.stop(); }
+  });
+
+  it("prefetches the next group while the first group publishes", async () => {
+    const t = await fixture(2 * FIRST_B_DOWNLOAD_LIMIT);
+    const held: number[] = [];
+    let nextPath: string | undefined;
+    const host = globalThis as { __nextclawSmallFileProbe?: (payload: string) => void };
+    host.__nextclawSmallFileProbe = payload => {
+      const row = JSON.parse(payload) as { phase: string; bytes: number; group: number; path: string };
+      if (row.phase === "group-dispatch" && row.group === FIRST_B_DOWNLOAD_LIMIT) nextPath ??= row.path;
       if (row.phase === "download-byte-reserve" || row.phase === "download-byte-release") held.push(row.bytes);
     };
     let nextStarted = false;
@@ -416,7 +485,7 @@ describe("Android first B download", () => {
     const firstWrite = new Promise<void>(resolve => { release = resolve; });
     const read = t.remote.readContent.bind(t.remote);
     t.remote.readContent = async (path, expected) => {
-      if (path === t.paths[EMPTY_FIRST_B_DOWNLOAD_LIMIT]) {
+      if (path === nextPath) {
         nextStarted = true;
         await firstWrite;
       }
@@ -437,7 +506,7 @@ describe("Android first B download", () => {
   });
 
   it("validates independent paths concurrently with at most four guarded writers", async () => {
-    const t = await fixture(EMPTY_FIRST_B_DOWNLOAD_LIMIT);
+    const t = await fixture(FIRST_B_DOWNLOAD_LIMIT);
     const stat = t.remote.stat.bind(t.remote);
     const write = t.local.writeFileGuarded.bind(t.local);
     let checksInFlight = 0, checkPeak = 0, writers = 0, writerPeak = 0;
@@ -498,10 +567,15 @@ describe("Android first B download", () => {
     } finally { clearTimeout(limit); release(); t.stop(); }
   });
 
-  it("uses the smaller cleanup group when the full group would exceed capacity", async function () {
+  for (const { count, byteSize, quota, scans } of [
+    { count: 45, byteSize: 300 * 1024, quota: 35 * 1024 * 1024, scans: 4 },
+    { count: 3, byteSize: 4 * 1024 * 1024 - 128, quota: 12 * 1024 * 1024, scans: 5 },
+  ]) it(`collects between reservations when WebView has room for only part of ${count} files`, async function () {
     this.timeout(15000);
-    const t = await fixture(45);
-    for (const path of t.paths) t.seed(path, "x".repeat(300 * 1024));
+    const t = await fixture(count);
+    for (const path of t.paths) t.seed(path, "x".repeat(byteSize));
+    const original = Object.getOwnPropertyDescriptor(navigator, "storage");
+    Object.defineProperty(navigator, "storage", { configurable: true, value: { estimate: async () => ({quota, usage: 0}) } });
     const records = t.db.prevSyncRecordsTbl;
     const iterate = records.iterate.bind(records);
     let recordScans = 0;
@@ -511,30 +585,14 @@ describe("Android first B download", () => {
     };
     try {
       assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.equal(recordScans, 4);
+      assert.equal(recordScans, scans);
       assert.equal(t.remote.puts, 0);
       assert.equal(t.local.writes().length, t.paths.length);
-    } finally { t.stop(); }
-  });
-
-  it("collects between files if the whole download group cannot fit", async function () {
-    this.timeout(15000);
-    const t = await fixture(3);
-    const size = 4 * 1024 * 1024 - 128;
-    for (const [index, path] of t.paths.entries()) t.seed(path, String(index).repeat(size));
-    const records = t.db.prevSyncRecordsTbl;
-    const iterate = records.iterate.bind(records);
-    let recordScans = 0;
-    records.iterate = (...args) => {
-      recordScans++;
-      return iterate(...args);
-    };
-    try {
-      assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.equal(recordScans, 6);
-      assert.equal(t.remote.puts, 0);
-      for (const path of t.paths) assert.equal((await t.local.stat(path)).sizeRaw, size);
-    } finally { t.stop(); }
+    } finally {
+      if (original) Object.defineProperty(navigator, "storage", original);
+      else Reflect.deleteProperty(navigator, "storage");
+      t.stop();
+    }
   });
 
   it("discards a downloaded version that changes before publication and uses normal rediscovery", async () => {
@@ -554,7 +612,7 @@ describe("Android first B download", () => {
       assert.equal(t.reruns(), 1);
       assert.equal((await runSync(t.input)).fullyConverged, true);
       assert.equal(text(await t.local.readFile(path)), "new remote version");
-      assert.ok(reads > 2, "normal path rereads the body during verification");
+      assert.equal(reads, 2, "rediscovery downloads the new, independently verified version");
       assert.equal(t.remote.puts, 0);
     } finally { t.stop(); }
   });
@@ -667,8 +725,9 @@ describe("Android first B download", () => {
   });
 
   it("resumes after retirement without rewriting the file already committed", async () => {
-    const t = await fixture(EMPTY_FIRST_B_DOWNLOAD_LIMIT + 1);
-    const [first] = t.paths;
+    const t = await fixture(FIRST_B_DOWNLOAD_LIMIT + 1);
+    const first = [...t.paths].sort()[0];
+    const last = [...t.paths].sort().at(-1)!;
     let retired = false;
     t.input.contentRuntime!.assertActive = () => { if (retired) throw Error("retired"); };
     const history = t.db.fileContentHistoryTbl;
@@ -686,7 +745,7 @@ describe("Android first B download", () => {
       assert.equal((await t.rec(first))?.content?.status, "clean");
       const published = new Set(t.paths.filter(path => t.local.files.has(path)));
       assert.ok(published.has(first));
-      assert.equal(t.local.files.has(t.paths.at(-1)!), false);
+      assert.equal(t.local.files.has(last), false);
       t.journal.retire();
       history.setItem = setItem;
       t.local.calls.length = 0;
