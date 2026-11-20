@@ -897,6 +897,58 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
+  for (const platform of ["Android", "iPad"]) it(`${platform} daily B keeps verified files out of the manual sweep and its continuations`, async function () {
+    this.timeout(10000);
+    const t = await fixture(36);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, runSync);
+    m.plugin.databaseConnections = t.pool;
+    m.plugin.nativeWrites = t.journal;
+    m.plugin.vaultRandomID = t.input.vaultRandomID;
+    m.plugin.settings.webdav = { address: "https://synthetic.invalid/vault", username: "s00000", password: "synthetic" };
+    m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+    if (platform === "Android") m.platform.isAndroidApp = true;
+    else { m.platform.isIosApp = true; m.platform.isTablet = true; }
+    const gets = () => t.remote.calls.filter(x => x.op === "readFile").map(x => x.key);
+    const png = "imported.png";
+    seedAttachment(t, png, 128);
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      t.remote.calls.length = 0;
+      t.local.calls.length = 0;
+      await m.run("manual");
+      assert.deepEqual(gets(), []);
+      assert.deepEqual(t.local.writes(), []);
+      assert.equal(m.plugin.pendingContent.pending, 0);
+
+      const changed = t.paths[0];
+      t.seed(changed, "new remote bytes");
+      for (let i = 0; i < 34; i++) t.seed(`new-${i}.md`, `new ${i}`);
+      const stillClean = new Set([...t.paths.slice(1), png]);
+      await m.run("manual");
+      assert.ok(m.plugin.pendingContent.pending > 0);
+      await m.run("auto_sync_on_save");
+      assert.equal(m.plugin.pendingContent.pending, 0);
+      assert.ok(gets().includes(changed));
+      assert.ok(!gets().some(path => stillClean.has(path)));
+      assert.equal(text(await t.local.readFile(changed)), "new remote bytes");
+      assert.equal(t.remote.puts, 0);
+
+      const unreadable = t.paths[1];
+      const ref = (await t.rec(unreadable))!.content!.cleanBaseRef!;
+      await t.db.fileContentHistoryTbl.removeItem(ref);
+      t.remote.calls.length = 0;
+      t.local.calls.length = 0;
+      assert.equal(await m.run("manual"), "failed");
+      assert.deepEqual(gets(), []);
+      assert.deepEqual(t.local.writes(), []);
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
   it("limits enlarged daily B to Android and iPad", async () => {
     const t = await fixture();
     const seen: SyncInput[] = [];

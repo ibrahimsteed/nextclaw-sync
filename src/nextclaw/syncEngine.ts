@@ -218,7 +218,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       rt!.file(key, item.local, item.remote, undefined, !input.mobileDailyContentBudget && largeImported(item));
     const mobileFirstB = input.androidInitialDownload || input.ipadInitialDownload;
     const canVerifyClean = bounded && rootId && !result.errors.length && !result.pendingContent!.length &&
-      !reserved.size && (mobileFirstB || input.androidFirstBRecovery) && !(await rt.rootReseed.active());
+      !reserved.size && (mobileFirstB || input.androidFirstBRecovery || input.mobileDailyContentBudget) && !(await rt.rootReseed.active());
     const resumeFirstB = canVerifyClean && mobileFirstB &&
       (source === "manual" || source === "auto_sync_on_save") && records.length > 0;
     const verifyAfterReload = canVerifyClean && input.androidFirstBRecovery && source === "auto_sync_on_save" &&
@@ -227,11 +227,17 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         item.remote && item.record?.content?.status === "clean" && !item.record.pendingLocalUpload) &&
       Object.entries(plan).every(([key, item]) =>
         !(key.endsWith("/") || inConfig(key, input.configDir)) || (!item.change && !item.pending));
-    if (resumeFirstB || verifyAfterReload) {
+    // Recheck the same evidence on queued follow-ups so clean paths stay out of the batch.
+    const verifyDaily = canVerifyClean && input.mobileDailyContentBudget && !saveOnly &&
+      (source === "manual" || source === "auto_sync_on_save");
+    const verifyIndependently = resumeFirstB || verifyDaily;
+    if (verifyIndependently || verifyAfterReload) {
       const runtime = rt;
       const issues = new Set(previousBatch?.issues?.map(item => item.path));
-      const candidates = resumeFirstB ? contentEntries.filter(([key, item]) => ordinary(key) && item.local &&
-        item.remote && item.record?.content?.status === "clean" && !recheck.has(key) && !issues.has(key)) : contentEntries;
+      const candidates = verifyIndependently ? contentEntries.filter(([key, item]) => ordinary(key) && item.local &&
+        item.remote && item.record?.content?.status === "clean" && !recheck.has(key) && !issues.has(key) &&
+        (!verifyDaily || Math.max(item.local.size ?? item.local.sizeRaw ?? 0,
+          item.remote.size ?? item.remote.sizeRaw ?? 0) <= ATTACHMENT_LIMIT)) : contentEntries;
       const verified = new Map<string, NonNullable<PlanItem["content"]>>();
       for (let i = 0; i < candidates.length;) {
         const next = candidates.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
@@ -243,14 +249,14 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         }));
         runtime.guard();
         for (const [index, check] of checked.entries()) {
-          if (check.status === "rejected" && !(check.reason instanceof SyncConflict) &&
+          if (!verifyDaily && check.status === "rejected" && !(check.reason instanceof SyncConflict) &&
               (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
           if (check.status === "fulfilled" && check.value) verified.set(chunk[index][0], check.value);
         }
         i += chunk.length;
-        if (!resumeFirstB && verified.size !== i) break;
+        if (!verifyIndependently && verified.size !== i) break;
       }
-      if (resumeFirstB || verified.size === contentEntries.length) {
+      if (verifyIndependently || verified.size === contentEntries.length) {
         for (const [key, clean] of verified) {
           const item = plan[key];
           item.decision = "content";
@@ -258,7 +264,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           item.content = clean;
           item.reason = clean.reason;
         }
-        if (resumeFirstB) {
+        if (verifyIndependently) {
           // Schedule unresolved paths only. The clean proofs apply to this run, never a later sweep.
           contentEntries = contentEntries.filter(([key]) => !verified.has(key));
         } else {
