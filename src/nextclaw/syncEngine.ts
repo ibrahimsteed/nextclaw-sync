@@ -1,4 +1,4 @@
-import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "./content/initialDownloadLimit";
+import { FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "./content/initialDownloadLimit";
 import { probeEvent } from "./content/probeTrace";
 import { isOrdinaryMovePath, SyncConflict } from "./engine/versionGuard";
 import { getAllPrevSyncRecordsByVaultAndProfile, insertSyncPlanRecordByVault } from "../localdb";
@@ -8,7 +8,7 @@ import { buildPlan, makeFilter, protection } from "./engine/plan";
 import { runLegacySync } from "./engine/legacy";
 import { contentRuntime, contentScope, checkVaultStages, ContentStagePaused } from "./content/runtime";
 import { selectBatch, type BatchState } from "./content/batches";
-import { isAttachmentPath, NOTE_LIMIT } from "./content/identity";
+import { ATTACHMENT_LIMIT, NOTE_LIMIT } from "./content/identity";
 import { isAttachmentRef } from "./content/store";
 import { planContent } from "./content/decision";
 import type { InitialDownloadGroup } from "./content/operation";
@@ -20,7 +20,6 @@ import { NativeWritePaused, type NativeWriteJournal } from "./nativeWriteJournal
 export type { SyncCallbacks, SyncInput, SyncResult } from "./engine/model";
 const running = new WeakSet<NativeWriteJournal>();
 type MoveCollision = { source: string; target: string; fileId: string; hash: string };
-const INITIAL_DOWNLOAD_CONCURRENCY = 4;
 const INITIAL_PUBLICATION_CONCURRENCY = 4;
 const FIRST_B_RECOVERY_CONCURRENCY = 4;
 const INITIAL_COLLECTION_BATCH = 128;
@@ -175,6 +174,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       }
     }
     // Recover only stages with durable completion. No dispatch/replay in this path.
+    const recoveredPaths = new Set<string>();
     for (const op of await rt.operations.list(rt.scope)) {
       rt.guard();
       if (op.phase !== "committed" && op.phase !== "archived") recheck.add(op.path);
@@ -182,6 +182,8 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       if (op.phase === "inputs-durable" && source !== "dry") { op.phase = "rediscover"; await rt.operations.put(op); }
       if (["remote-acknowledged", "local-verified"].includes(op.phase)) {
         if (source === "dry") throw new Error("有待提交的内容操作，请先进行正常同步");
+        // A second operation at this path needs a fresh plan after the first commit.
+        if (recoveredPaths.has(op.path)) break;
         const item = plan[op.path];
         const outcome = await rt.file(op.path, item?.local, item?.remote, undefined,
           isAttachmentRef(op.outputRef)).executor.finish(op.id);
@@ -191,9 +193,14 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           if (outcome.status === "blocked-unknown-write") result.contentSummary!.blocked = true;
           return result;
         }
-        // Observations and record generations changed; re-discover through a queued run, not an old plan.
-        input.contentRuntime!.requestRerun(); result.pendingContent!.push({ path: op.path, reason: "操作已确认，待重新扫描" }); return result;
+        recoveredPaths.add(op.path);
+        result.pendingContent!.push({ path: op.path, reason: "操作已确认，待重新扫描" });
       }
+    }
+    // Re-discover the confirmed paths before dispatching work from the old plan.
+    if (recoveredPaths.size) {
+      input.contentRuntime!.requestRerun();
+      return result;
     }
     if (source !== "dry") await rt.collect();
     let contentEntries = Object.entries(plan).filter(([key, item]) => !reserved.has(key) && !item.error && !key.endsWith("/") && !inConfig(key, input.configDir));
@@ -208,10 +215,11 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0,
         item.remote?.size ?? item.remote?.sizeRaw ?? 0) > NOTE_LIMIT;
     const fileForPlan = (key: string, item: PlanItem) =>
-      rt!.file(key, item.local, item.remote, undefined, largeImported(item));
+      rt!.file(key, item.local, item.remote, undefined, !input.mobileDailyContentBudget && largeImported(item));
+    const mobileFirstB = input.androidInitialDownload || input.ipadInitialDownload;
     const canVerifyClean = bounded && rootId && !result.errors.length && !result.pendingContent!.length &&
-      !reserved.size && (input.androidInitialDownload || input.androidFirstBRecovery) && !(await rt.rootReseed.active());
-    const resumeFirstB = canVerifyClean && input.androidInitialDownload &&
+      !reserved.size && (mobileFirstB || input.androidFirstBRecovery) && !(await rt.rootReseed.active());
+    const resumeFirstB = canVerifyClean && mobileFirstB &&
       (source === "manual" || source === "auto_sync_on_save") && records.length > 0;
     const verifyAfterReload = canVerifyClean && input.androidFirstBRecovery && source === "auto_sync_on_save" &&
       !recheck.size && !previousBatch?.remaining.length && !previousBatch?.completed.length && !previousBatch?.issues?.length &&
@@ -262,15 +270,13 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       urgent: item.record?.pendingLocalUpload === true,
       size: Math.max(item.local?.size ?? item.local?.sizeRaw ?? 0, item.remote?.size ?? item.remote?.sizeRaw ?? 0) })),
       previousBatch, saveOnly) : undefined;
-    const canImport = batch && input.androidInitialDownload && rootId &&
+    const canImport = batch && mobileFirstB && rootId &&
       !result.errors.length && !(await rt.rootReseed.active());
     const newRemoteFiles = canImport ? contentEntries.filter(([key, item]) =>
       ordinary(key) && !recheck.has(key) && !item.local && !item.record && !!item.remote?.remoteFileId &&
       name(item.remote) === key && strongEtag(item.remote.etag)) : [];
-    const attachments = new Set(newRemoteFiles.filter(([key]) => isAttachmentPath(key)).map(([key]) => key));
     for (const issue of previousBatch?.issues ?? []) recheck.add(issue.path);
-    const initial = new Set(batch && !batch.saveSweep ? newRemoteFiles.filter(([key]) =>
-      !attachments.has(key) && !recheck.has(key)).map(([key]) => key) : []);
+    const initial = new Set(newRemoteFiles.map(([key]) => key));
     const inspect = async (key: string, item: PlanItem, f = fileForPlan(key, item)) => {
       rt!.guard();
       try {
@@ -281,7 +287,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
           mode: "B", configDir: input.configDir, ownerActive: () => { try { rt!.guard(); return true; } catch { return false; } },
           unknownWrite: journal!.blocked(), deletion: item.record && (!l || !r) ? await rt!.deletionEvidence(key) : undefined, local: l, remote: r && { bytes: r.bytes, etag: r.etag, remoteFileId: r.remoteFileId },
           readConflict: async id => (await rt!.operations.get(id))?.conflict });
-        if (largeImported(item) && !["hold", "none", "preserve-both"].includes(item.content.action)) {
+        if (!input.mobileDailyContentBudget && largeImported(item) && !["hold", "none", "preserve-both"].includes(item.content.action)) {
           item.content = { action: "hold", status: "pending", reason: "large-attachment-change-pending",
             fullyConverged: false, fatalBudgetDelta: 0 };
         }
@@ -336,14 +342,13 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         }
       }
       rt.guard(); await executePlan(input, plan, result.errors); rt.guard();
-      if (batch && !result.errors.length && (initial.size || attachments.size)) {
-        const importing = new Set([...initial, ...attachments]);
+      if (batch && !result.errors.length && initial.size) {
+        const importing = initial;
         batch.selected = [...new Set([...batch.selected, ...importing])];
         batch.next.remaining = batch.next.remaining.filter(key => !importing.has(key));
         batch.next.completed = batch.next.remaining.length ? [...new Set([...batch.next.completed, ...importing])] : [];
       } else {
         initial.clear();
-        attachments.clear();
       }
       let done = 0;
       let initialNeedsRescan = false;
@@ -374,101 +379,82 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         if (!deferCollection) await rt!.collect();
       };
       for (const [key, item] of executionEntries) {
-        if (reserved.has(key) || initial.has(key) || attachments.has(key)) continue;
+        if (reserved.has(key) || initial.has(key)) continue;
         await executeContent(key, item);
         if (result.contentSummary!.blocked) break;
       }
       const runtime = rt;
-      const downloads = executionEntries.filter(([key]) => initial.has(key));
-      const lanes = records.length === 0 ? EMPTY_FIRST_B_DOWNLOAD_LIMIT : INITIAL_DOWNLOAD_CONCURRENCY;
+      const downloads = executionEntries.filter(([key, item]) => {
+        if (!initial.has(key)) return false;
+        const size = item.remote!.size ?? item.remote!.sizeRaw;
+        if (Number.isSafeInteger(size) && size >= 0 && size <= ATTACHMENT_LIMIT) return true;
+        item.contentPending = "attachment-file-limit-pending";
+        return false;
+      });
+      const unavailable = () => result.contentSummary!.blocked || result.errors.length >= 10;
+      const sizeOf = (item: PlanItem) => item.remote!.size ?? item.remote!.sizeRaw;
+      const limits = [INITIAL_COLLECTION_BATCH, INITIAL_SMALL_COLLECTION_BATCH, 1];
       let inFlightBytes = 0;
-      const byteSize = (item: PlanItem) => item.remote!.size ?? item.remote!.sizeRaw;
-      const readDownloadChunk = (start: number) => {
-        const entries = downloads.slice(start, start + lanes);
-        const charge = entries.reduce((sum, [, item]) => {
-          const size = byteSize(item);
-          return sum + (Number.isSafeInteger(size) && size >= 0 && size <= NOTE_LIMIT ? size : 0);
-        }, 0);
-        if (inFlightBytes + charge > INITIAL_DOWNLOAD_BYTES) throw new Error("initial-download-byte-budget");
-        inFlightBytes += charge;
+      function readChunk(start: number, end: number) {
+        let bytes = 0;
+        let next = start;
+        while (next < end && next - start < FIRST_B_DOWNLOAD_LIMIT) {
+          const size = sizeOf(downloads[next][1]);
+          if (inFlightBytes + bytes + size > INITIAL_DOWNLOAD_BYTES) break;
+          bytes += size;
+          next++;
+        }
+        if (next === start) return;
+        const entries = downloads.slice(start, next);
+        inFlightBytes += bytes;
         probeEvent(entries[0][0], "download-byte-reserve", { group: start, bytes: inFlightBytes });
         return {
+          start, next, entries,
           ready: Promise.allSettled(entries.map(async ([key, item]) => {
             probeEvent(key, "group-dispatch", { group: start });
             try {
-              const size = byteSize(item);
-              if (!Number.isSafeInteger(size) || size < 0 || size > NOTE_LIMIT)
-                throw new Error("content-limit-pending");
-              const download = await runtime.file(key, undefined, item.remote).prefetchInitialDownload(item.remote!);
+              const download = await runtime.file(key, undefined, item.remote, undefined, true).prefetchInitialDownload(item.remote!);
               probeEvent(key, "download-ready", { group: start, bytes: download.bytes.byteLength });
               return download;
             } catch (error) {
-              const timeout = /timeout|timed out|deadline/i.test(errorOf(error).message);
-              probeEvent(key, "download-rejected", { group: start, timeout: Number(timeout) });
+              probeEvent(key, "download-rejected", { group: start, timeout: Number(/timeout|timed out|deadline/i.test(errorOf(error).message)) });
               throw error;
             }
           })),
           release() {
-            inFlightBytes -= charge;
+            inFlightBytes -= bytes;
             probeEvent(entries[0][0], "download-byte-release", { group: start, bytes: inFlightBytes });
           },
         };
-      };
-      let prefetched: ReturnType<typeof readDownloadChunk> | undefined;
-      let activeDownload: ReturnType<typeof readDownloadChunk> | undefined;
-      let reservation: ContentReservation | undefined;
-      let collectionEnd = 0;
-      try {
-        for (let i = 0; i < downloads.length; i += lanes) {
-          if (result.contentSummary!.blocked || result.errors.length >= 10) {
-            for (const [, item] of downloads.slice(i)) item.contentPending = "前序错误，未执行";
-            break;
-          }
-          if (i === collectionEnd) {
-            const remaining = downloads.length - i;
-            const sizes = remaining > INITIAL_SMALL_COLLECTION_BATCH
-              ? [INITIAL_COLLECTION_BATCH, INITIAL_SMALL_COLLECTION_BATCH] : [INITIAL_SMALL_COLLECTION_BATCH];
-            for (const size of sizes) {
-              collectionEnd = i + size;
-              const group = downloads.slice(i, collectionEnd);
-              // Bound the retained remote input, output and clean base.
-              const budgets = new Map(group.map(([key, item]) => [key, 3 * (item.remote!.size ?? item.remote!.sizeRaw)]));
-              if (group.length < 2 || ![...budgets.values()].every(bytes => Number.isSafeInteger(bytes) && bytes >= 0)) continue;
-              try {
-                reservation = await runtime.bodies.reserveCapacity(budgets);
-                break;
-              } catch (e) {
-                if (errorOf(e).message !== "content-limit-pending") throw e;
-              }
-            }
-          }
-          const next = i + lanes;
-          const chunk = downloads.slice(i, next);
-          activeDownload = prefetched ?? readDownloadChunk(i);
-          prefetched = undefined;
-          const ready = await activeDownload.ready;
-          for (const [key] of chunk) probeEvent(key, "group-released", { group: i });
-          runtime.guard();
-          if (next < downloads.length) prefetched = readDownloadChunk(next);
-          const apply = async ([key, item]: typeof chunk[number], j: number, group?: InitialDownloadGroup) => {
-            if (result.contentSummary!.blocked || result.errors.length >= 10) {
-              item.contentPending = "前序错误，未执行";
-              return;
-            }
-            const download = ready[j];
-            if (download.status === "fulfilled") {
-              await executeContent(key, item, runtime.file(key, undefined, item.remote, download.value), !!group, group);
-            } else {
-              const error = errorOf(download.reason);
-              const status = (download.reason as { status?: number } | undefined)?.status;
-              if (download.reason instanceof SyncConflict || status === 404 || status === 412) {
-                item.contentPending = "首次下载版本变化，待重新扫描";
-                initialNeedsRescan = true;
-              } else if (error.message === "content-limit-pending") item.contentPending = "内容超过安全预算，待处理";
-              else { item.error = error.message; result.errors.push(error); }
-            }
-          };
-          if (reservation) {
+      }
+      function recordDownloadFailure(item: PlanItem, failure: unknown) {
+        const reason = errorOf(failure).message;
+        const status = (failure as { status?: number } | undefined)?.status;
+        if (failure instanceof SyncConflict || status === 404 || status === 412) {
+          item.contentPending = "首次下载版本变化，待重新扫描";
+          initialNeedsRescan = true;
+        } else if (["content-limit-pending", "attachment-file-limit-pending", "attachment-storage-quota-pending", "attachment-signature-mismatch"].includes(reason)) {
+          item.contentPending = reason === "content-limit-pending" ? "attachment-budget-pending" : reason;
+        } else {
+          item.error = reason;
+          result.errors.push(errorOf(failure));
+        }
+      }
+      async function publishGroup(start: number, end: number, reservation: ContentReservation) {
+        let active: ReturnType<typeof readChunk>;
+        let prefetched: ReturnType<typeof readChunk>;
+        let next = start;
+        try {
+          while (next < end && !unavailable()) {
+            active = prefetched ?? readChunk(next, end);
+            prefetched = undefined;
+            if (!active) throw Error("initial-download-byte-budget");
+            const { entries, ready, start: groupStart } = active;
+            next = active.next;
+            const completed = await ready;
+            for (const [key] of entries) probeEvent(key, "group-released", { group: groupStart });
+            runtime.guard();
+            if (next < end) prefetched = readChunk(next, end);
             await checkVaultStages(input.db, input.vaultRandomID, runtime.guard, moveScope);
             const priorOperations = await runtime.operations.list(runtime.scope);
             runtime.guard();
@@ -477,79 +463,61 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
             const group: InitialDownloadGroup = {
               priorOperations, reservation,
               writeLocal(work) {
-                // Each admitted path keeps its own version check, guard and exclusive create.
                 const writer = nextWriter++ % writers.length;
-                const nextWrite = writers[writer].then(work);
-                writers[writer] = nextWrite.catch(() => {});
-                return nextWrite;
+                const write = writers[writer].then(work);
+                writers[writer] = write.catch(() => {});
+                return write;
               },
             };
-            if (result.errors.length + chunk.length <= 10) {
-              const outcomes = await Promise.allSettled(chunk.map((entry, j) => apply(entry, j, group)));
+            const apply = async ([key, item]: typeof entries[number], index: number) => {
+              if (unavailable()) { item.contentPending = "前序错误，未执行"; return; }
+              const download = completed[index];
+              if (download.status === "fulfilled") {
+                await executeContent(key, item, runtime.file(key, undefined, item.remote, download.value, true), true, group);
+              } else recordDownloadFailure(item, download.reason);
+            };
+            if (result.errors.length + entries.length <= 10) {
+              const outcomes = await Promise.allSettled(entries.map(apply));
               for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
             } else {
-              for (const [j, entry] of chunk.entries()) await apply(entry, j, group);
+              for (const [index, entry] of entries.entries()) await apply(entry, index);
             }
-            if (!result.contentSummary!.blocked)
-              await checkVaultStages(input.db, input.vaultRandomID, runtime.guard, moveScope);
-          } else {
-            for (const [j, entry] of chunk.entries()) await apply(entry, j);
+            if (!result.contentSummary!.blocked) await checkVaultStages(input.db, input.vaultRandomID, runtime.guard, moveScope);
+            active.release();
+            active = undefined;
           }
-          activeDownload.release();
-          activeDownload = undefined;
-          if (reservation && next === collectionEnd) {
-            reservation.release();
-            reservation = undefined;
-            if (!result.contentSummary!.blocked && next < downloads.length) await runtime.collect();
-          }
-        }
-      } finally {
-        reservation?.release();
-        // At most one read-only chunk is ahead of publication. Drain it
-        // before releasing the owner, including after an interrupted commit.
-        await prefetched?.ready;
-        prefetched?.release();
-        activeDownload?.release();
-      }
-      for (const key of attachments) {
-        if (result.contentSummary!.blocked || result.errors.length >= 10) {
-          plan[key].contentPending = "前序错误，未执行";
-          continue;
-        }
-        const item = plan[key];
-        const remote = item.remote!;
-        const size = remote.size ?? remote.sizeRaw;
-        const file = rt.file(key, undefined, remote, undefined, true);
-        if (size > file.bodies.fileLimit) {
-          item.contentPending = "attachment-file-limit-pending";
-          continue;
-        }
-        let reservation: ContentReservation | undefined;
-        try {
-          reservation = await file.bodies.reserveCapacity(new Map([[key, size * 3]]));
-          const download = await file.prefetchInitialDownload(remote);
-          const priorOperations = await rt.operations.list(rt.scope); rt.guard();
-          await executeContent(key, item, rt.file(key, undefined, remote, download, true), true,
-            { reservation, priorOperations, writeLocal: work => work() });
-        } catch (error) {
-          const reason = errorOf(error).message;
-          const status = (error as { status?: number } | undefined)?.status;
-          if (error instanceof SyncConflict || status === 404 || status === 412) {
-            item.contentPending = "首次下载版本变化，待重新扫描";
-            initialNeedsRescan = true;
-          } else if (reason === "attachment-signature-mismatch") {
-            reservation?.release();
-            reservation = undefined;
-            await executeContent(key, item);
-          } else if (["content-limit-pending", "attachment-file-limit-pending", "attachment-storage-quota-pending"].includes(reason)) {
-            item.contentPending = reason === "content-limit-pending" ? "attachment-budget-pending" : reason;
-          } else {
-            item.error = reason;
-            result.errors.push(errorOf(error));
-          }
+          for (const [, item] of downloads.slice(next, end)) item.contentPending = "前序错误，未执行";
         } finally {
-          reservation?.release();
+          await prefetched?.ready;
+          prefetched?.release();
+          active?.release();
+          reservation.release();
         }
+      }
+      for (let cursor = 0; cursor < downloads.length;) {
+        if (unavailable()) {
+          for (const [, item] of downloads.slice(cursor)) item.contentPending = "前序错误，未执行";
+          break;
+        }
+        let end = cursor + 1;
+        let reservation: ContentReservation | undefined;
+        let previousEnd = -1;
+        for (const limit of limits) {
+          end = Math.min(cursor + limit, downloads.length);
+          if (previousEnd === end) continue;
+          previousEnd = end;
+          const budgets = new Map(downloads.slice(cursor, end).map(([key, item]) => [key, 3 * sizeOf(item)]));
+          try {
+            reservation = await runtime.attachments.reserveCapacity(budgets);
+            break;
+          } catch (error) {
+            if (!["content-limit-pending", "attachment-storage-quota-pending"].includes(errorOf(error).message)) throw error;
+            if (end === cursor + 1) recordDownloadFailure(downloads[cursor][1], error);
+          }
+        }
+        if (reservation) await publishGroup(cursor, end, reservation);
+        cursor = end;
+        if (!unavailable() && cursor < downloads.length) await runtime.collect();
       }
       if (!result.contentSummary!.blocked) {
         await rt.collect();

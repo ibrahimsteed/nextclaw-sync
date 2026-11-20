@@ -1,7 +1,11 @@
 import { jsonArrayKeyRange, type IdbStore } from "../../idbStore";
 import { nanoid } from "nanoid";
 import { ATTACHMENT_LIMIT, ATTACHMENT_PROFILE_LIMIT, hashBytes, isHash,
-  matchesAttachmentSignature, NOTE_LIMIT, PROFILE_LIMIT } from "./identity";
+  isAttachmentPath, matchesAttachmentSignature, NOTE_LIMIT, PROFILE_LIMIT } from "./identity";
+
+export const MOBILE_CONTENT_LIMITS = {
+  note: ATTACHMENT_LIMIT, profile: ATTACHMENT_PROFILE_LIMIT, includeImported: true,
+} as const;
 
 export const CONTENT_BODY = "nextclaw-content";
 export const ATTACHMENT_BODY = "nextclaw-attachment";
@@ -25,7 +29,8 @@ const reservations = new WeakMap<ContentTable, Map<string, ReservationState>>();
 export class ContentStore {
   constructor(private readonly table: ContentTable, readonly scope: string,
     private readonly assertOwner: () => void,
-    private readonly limits = { note: NOTE_LIMIT, profile: PROFILE_LIMIT },
+    private readonly limits: { note: number; profile: number; includeImported?: true } =
+      { note: NOTE_LIMIT, profile: PROFILE_LIMIT },
     readonly attachment = false) {
     if (!scope || !Number.isSafeInteger(limits.note) || limits.note < 1 ||
       !Number.isSafeInteger(limits.profile) || limits.profile < limits.note)
@@ -33,7 +38,7 @@ export class ContentStore {
   }
   attachmentStore() {
     return new ContentStore(this.table, this.scope, this.assertOwner,
-      { note: ATTACHMENT_LIMIT, profile: ATTACHMENT_PROFILE_LIMIT }, true);
+      MOBILE_CONTENT_LIMITS, true);
   }
   get fileLimit() { return this.limits.note; }
   private get namespace() { return this.attachment ? ATTACHMENT_BODY : CONTENT_BODY; }
@@ -57,7 +62,7 @@ export class ContentStore {
       !["clean-base", "merge-input"].includes(body.kind) ||
       typeof body.generation !== "string" || ref !== this.key(path, body.generation, namespace) ||
       !(body.bytes instanceof ArrayBuffer) || body.bytes.byteLength > (attachment ? ATTACHMENT_LIMIT : this.attachment ? NOTE_LIMIT : this.limits.note) ||
-      (attachment && !matchesAttachmentSignature(path, body.bytes)) || !isHash(body.hash))
+      (attachment && isAttachmentPath(path) && !matchesAttachmentSignature(path, body.bytes)) || !isHash(body.hash))
       throw new Error("Missing or invalid content object");
     const copy = { ...body, bytes: body.bytes.slice(0) };
     if (await hashBytes(copy.bytes) !== copy.hash) throw new Error("Corrupt content object");
@@ -65,19 +70,21 @@ export class ContentStore {
   }
   private async usedBytes() {
     let used = 0;
+    // The first-import budget includes retained checkpoints written by the old path.
+    const namespaces = this.limits.includeImported ? [ATTACHMENT_BODY, CONTENT_BODY] : [CONTENT_BODY];
     const count = (value: unknown, key: string) => {
       this.assertOwner();
-      if (!this.owns(key)) return;
+      if (!namespaces.some(namespace => this.owns(key, namespace))) return;
       const obj = value as BodyObject | null;
       if (!obj || !(obj.bytes instanceof ArrayBuffer)) throw new Error("Invalid content accounting");
       used += obj.bytes.byteLength;
     };
     if (this.table.iterate) {
-      await this.table.iterate(count, jsonArrayKeyRange([this.namespace, 1, this.scope]));
+      for (const namespace of namespaces) await this.table.iterate(count, jsonArrayKeyRange([namespace, 1, this.scope]));
     } else {
       for (const key of await this.table.keys()) {
         this.assertOwner();
-        if (this.owns(key)) count(await this.table.getItem(key), key);
+        if (namespaces.some(namespace => this.owns(key, namespace))) count(await this.table.getItem(key), key);
       }
     }
     this.assertOwner();
@@ -96,7 +103,7 @@ export class ContentStore {
     if (!Number.isSafeInteger(additionalBytes) || additionalBytes < 0) throw new Error("invalid-content-reservation");
     if (reservations.get(this.table)?.has(this.scope) || await this.usedBytes() + additionalBytes > this.limits.profile)
       throw new Error("content-limit-pending");
-    if (this.attachment && typeof navigator !== "undefined" && navigator.storage?.estimate) {
+    if (this.limits.includeImported && typeof navigator !== "undefined" && navigator.storage?.estimate) {
       const estimate = await navigator.storage.estimate().catch(() => undefined);
       this.assertOwner();
       if (estimate?.quota !== undefined && estimate.usage !== undefined &&
@@ -138,7 +145,7 @@ export class ContentStore {
   }
   async put(path: string, bytes: ArrayBuffer, kind: BodyObject["kind"], reservation?: ContentReservation): Promise<string> {
     if (bytes.byteLength > this.limits.note) throw new Error("content-limit-pending");
-    if (this.attachment && !matchesAttachmentSignature(path, bytes))
+    if (this.attachment && isAttachmentPath(path) && !matchesAttachmentSignature(path, bytes))
       throw new Error("attachment-signature-mismatch");
     const copy = bytes.slice(0);
     return this.enqueue(async () => {
@@ -153,7 +160,7 @@ export class ContentStore {
       this.assertOwner();
       try { await this.table.setItem(ref, body); }
       catch (error) {
-        if (this.attachment && error instanceof Error && error.name === "QuotaExceededError")
+        if (this.limits.includeImported && error instanceof Error && error.name === "QuotaExceededError")
           throw new Error("attachment-storage-quota-pending");
         throw error;
       }

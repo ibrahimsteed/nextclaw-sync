@@ -1,4 +1,4 @@
-import { EMPTY_FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "../../src/nextclaw/content/initialDownloadLimit";
+import { FIRST_B_DOWNLOAD_LIMIT, INITIAL_DOWNLOAD_BYTES } from "../../src/nextclaw/content/initialDownloadLimit";
 import "fake-indexeddb/auto";
 import { strict as assert } from "assert";
 import { prepareDBs, type NextclawSyncRecord } from "../../src/localdb";
@@ -56,7 +56,7 @@ export async function environment() {
     stop() { active=false; journal.retire(); pool.dispose(); }, guard };
 }
 
-describe("Android first B download", () => {
+describe("Mobile first B download", () => {
   async function fixture(count = 1) {
     const t = await environment();
     const stat = t.remote.stat.bind(t.remote);
@@ -138,7 +138,7 @@ describe("Android first B download", () => {
     try {
       const imported = await runSync(t.input);
       assert.equal(imported.fullyConverged, true, JSON.stringify(imported.pendingContent));
-      assert.equal(peak, 1);
+      assert.equal(peak, 4);
       for (const [path, body] of files) {
         assert.deepEqual(await t.local.readFile(path), body);
         assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
@@ -165,8 +165,12 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("resumes first B with existing clean records and fetches only the four held attachments", async () => {
+  for (const platform of ["Android", "iPad"]) it(`${platform} resumes first B with existing clean records and fetches only the four held attachments`, async () => {
     const t = await fixture(36);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
     try {
       assert.ok((await runSync(t.input)).fullyConverged);
       const attachments = new Map(Object.entries({"demo.gif":10843290,"one.png":1653277,"two.png":1317257,"three.png":1392586})
@@ -215,7 +219,7 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("charges attachment bodies separately and rejects a declared file above 50 MiB before GET", async () => {
+  it("counts retained old and new bodies in the import budget and rejects a declared file above 50 MiB before GET", async () => {
     const t = await fixture(0);
     try {
       const rt = contentRuntime(t.input);
@@ -228,8 +232,8 @@ describe("Android first B download", () => {
       const ref = await rt.attachments.put("image.gif", bytes, "clean-base");
       assert.ok(isAttachmentRef(ref));
       assert.deepEqual((await rt.bodies.read(ref, "image.gif")).bytes, bytes);
-      await rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - bytes.byteLength);
-      await assert.rejects(rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - bytes.byteLength + 1), /content-limit-pending/);
+      await rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - PROFILE_LIMIT - bytes.byteLength);
+      await assert.rejects(rt.attachments.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - PROFILE_LIMIT - bytes.byteLength + 1), /content-limit-pending/);
       await assert.rejects(rt.bodies.ensureCapacity(1), /content-limit-pending/);
       t.remote.files.delete("image.gif");
       seedAttachment(t, "too-big.gif", 8);
@@ -351,8 +355,71 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("downloads beyond a normal batch with one full scan and the configured GET ceiling", async () => {
+  for (const platform of ["Android", "iPad"]) {
+    for (const changedVersion of [false, true]) {
+      it(`${platform} first B ${changedVersion ? "stops at an unconfirmed recovery" : "recovers independent operations before one rescan and imports a remote-only PNG"}`, async () => {
+        const t = await fixture(3);
+        if (platform === "iPad") {
+          delete t.input.androidInitialDownload;
+          t.input.ipadInitialDownload = true;
+        }
+        const history = t.db.fileContentHistoryTbl;
+        const persist = history.setItem.bind(history);
+        const runtime = contentRuntime(t.input);
+        history.setItem = async (key, value) => {
+          const result = await persist(key, value);
+          const operation = value as { path?: string; phase?: string } | null;
+          if (operation?.phase === "local-verified") throw Error("interrupted before checkpoint");
+          return result;
+        };
+        try {
+          assert.equal((await runSync(t.input)).fullyConverged, false);
+          history.setItem = persist;
+          const staged = (await runtime.operations.list(runtime.scope)).filter(o => o.phase === "local-verified");
+          assert.equal(staged.length, 3);
+          const png = "remaining.png";
+          const body = seedAttachment(t, png, 128);
+          if (changedVersion) t.seed(staged[1].path, "new remote version");
+          const before = t.reruns();
+          const input = { ...t.input, triggerSource: "auto_sync_on_save" as const };
+          const recovered = await runSync(input);
+          assert.equal(recovered.fullyConverged, false);
+          assert.equal(recovered.errors.length, 0);
+          assert.equal(t.local.files.has(png), false);
+          assert.equal(t.remote.puts, 0);
+          if (changedVersion) {
+            assert.deepEqual(recovered.pendingContent, [
+              { path: staged[0].path, reason: "操作已确认，待重新扫描" },
+              { path: staged[1].path, reason: "remote-changed-after-ack" },
+            ]);
+            assert.equal(t.reruns(), before);
+            assert.equal(await t.rec(staged[1].path), null);
+            assert.equal(await t.rec(staged[2].path), null);
+            assert.equal((await runtime.operations.get(staged[2].id))?.phase, "local-verified");
+          } else {
+            assert.deepEqual(recovered.pendingContent, staged.map(({ path }) => ({ path, reason: "操作已确认，待重新扫描" })));
+            assert.equal(t.reruns(), before + 1);
+            for (const operation of staged) {
+              assert.equal((await runtime.operations.get(operation.id))?.phase, "committed");
+              assert.equal((await t.rec(operation.path))?.content?.status, "clean");
+            }
+            assert.equal((await runSync(input)).fullyConverged, true);
+            assert.deepEqual(await t.local.readFile(png), body);
+            assert.equal((await t.rec(png))?.content?.status, "clean");
+            assert.equal(t.reruns(), before + 1);
+            assert.equal(t.remote.puts, 0);
+          }
+        } finally { t.stop(); }
+      });
+    }
+  }
+
+  for (const platform of ["Android", "iPad"]) it(`${platform} downloads beyond a normal batch with one full scan and the configured GET ceiling`, async () => {
     const t = await fixture(35);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
     let active = 0, peak = 0, reads = 0, fileStats = 0, recordScans = 0, capacityScans = 0;
     const records = t.db.prevSyncRecordsTbl;
     const iterate = records.iterate.bind(records);
@@ -382,10 +449,10 @@ describe("Android first B download", () => {
     };
     try {
       assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.equal(peak, EMPTY_FIRST_B_DOWNLOAD_LIMIT);
+      assert.equal(peak, FIRST_B_DOWNLOAD_LIMIT);
       assert.equal(reads, 35);
       // The test transport validates each conditional GET with an extra stat.
-      assert.equal(fileStats - reads, 35 * 4);
+      assert.equal(fileStats - reads, 35 * 5);
       assert.equal(recordScans, 3);
       assert.equal(capacityScans, 1);
       assert.equal(t.remote.calls.filter(x => x.op === "walk").length, 1);
@@ -399,12 +466,77 @@ describe("Android first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("prefetches the next group while the first group publishes", async () => {
-    const t = await fixture(2 * EMPTY_FIRST_B_DOWNLOAD_LIMIT);
-    const held: number[] = [];
+  for (const platform of ["Android", "iPad"]) it(`${platform} imports mixed formats with ten GETs and the shared larger budget`, async () => {
+    const t = await fixture(0);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const source = new Map<string, ArrayBuffer>();
+    source.set("a.md", bytes("x".repeat(NOTE_LIMIT + 1)));
+    source.set("b.jpeg", Uint8Array.of(0xff, 0xd8, 0xff, 1).buffer);
+    source.set("c.png", seedAttachment(t, "c.png", 20));
+    source.set("d.gif", seedAttachment(t, "d.gif", 20));
+    source.set("e.html", Uint8Array.of(0xef, 0xbb, 0xbf, 60, 62, 13, 10, 0xff).buffer);
+    source.set("f.pdf", bytes("%PDF-1.7"));
+    for (const [path, value] of [["g.any", ""], ["h.bin", "opaque"], ["i.md", "# hi"], ["j.htm", "html"]]) {
+      source.set(path, bytes(value));
+    }
+    for (const [path, body] of source) {
+      t.seed(path, "");
+      const row = t.remote.files.get(path)!;
+      row.bytes = body;
+      row.entity.size = row.entity.sizeRaw = body.byteLength;
+    }
+    const read = t.remote.readContent.bind(t.remote);
+    let active = 0, peak = 0;
+    t.remote.readContent = async (...args) => {
+      peak = Math.max(peak, ++active);
+      try {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        return await read(...args);
+      } finally { active--; }
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, true, JSON.stringify(result.pendingContent));
+      assert.equal(peak, 10);
+      assert.equal(t.remote.calls.filter(c=>c.op==="readFile").length, 10);
+      for (const [path, body] of source) {
+        assert.deepEqual(await t.local.readFile(path), body);
+        assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+      }
+    } finally { t.stop(); }
+  });
+
+  it("limits simultaneous whole responses even when ten download slots are available", async () => {
+    const t = await fixture(2);
+    for (const path of t.paths) {
+      const row = t.remote.files.get(path)!;
+      row.entity.size = row.entity.sizeRaw = 33 * 1024 * 1024;
+    }
     const host = globalThis as { __nextclawSmallFileProbe?: (payload: string) => void };
+    const held: number[] = [];
     host.__nextclawSmallFileProbe = payload => {
       const row = JSON.parse(payload) as { phase: string; bytes: number };
+      if (row.phase === "download-byte-reserve" || row.phase === "download-byte-release") held.push(row.bytes);
+    };
+    try {
+      const result = await runSync(t.input);
+      assert.equal(result.fullyConverged, false);
+      assert.deepEqual(held, [33 * 1024 * 1024, 0, 33 * 1024 * 1024, 0]);
+      assert.equal(t.local.writes().length, 0, "mismatched bodies never publish");
+    } finally { delete host.__nextclawSmallFileProbe; t.stop(); }
+  });
+
+  it("prefetches the next group while the first group publishes", async () => {
+    const t = await fixture(2 * FIRST_B_DOWNLOAD_LIMIT);
+    const held: number[] = [];
+    let nextPath: string | undefined;
+    const host = globalThis as { __nextclawSmallFileProbe?: (payload: string) => void };
+    host.__nextclawSmallFileProbe = payload => {
+      const row = JSON.parse(payload) as { phase: string; bytes: number; group: number; path: string };
+      if (row.phase === "group-dispatch" && row.group === FIRST_B_DOWNLOAD_LIMIT) nextPath ??= row.path;
       if (row.phase === "download-byte-reserve" || row.phase === "download-byte-release") held.push(row.bytes);
     };
     let nextStarted = false;
@@ -412,7 +544,7 @@ describe("Android first B download", () => {
     const firstWrite = new Promise<void>(resolve => { release = resolve; });
     const read = t.remote.readContent.bind(t.remote);
     t.remote.readContent = async (path, expected) => {
-      if (path === t.paths[EMPTY_FIRST_B_DOWNLOAD_LIMIT]) {
+      if (path === nextPath) {
         nextStarted = true;
         await firstWrite;
       }
@@ -433,7 +565,7 @@ describe("Android first B download", () => {
   });
 
   it("validates independent paths concurrently with at most four guarded writers", async () => {
-    const t = await fixture(EMPTY_FIRST_B_DOWNLOAD_LIMIT);
+    const t = await fixture(FIRST_B_DOWNLOAD_LIMIT);
     const stat = t.remote.stat.bind(t.remote);
     const write = t.local.writeFileGuarded.bind(t.local);
     let checksInFlight = 0, checkPeak = 0, writers = 0, writerPeak = 0;
@@ -494,10 +626,15 @@ describe("Android first B download", () => {
     } finally { clearTimeout(limit); release(); t.stop(); }
   });
 
-  it("uses the smaller cleanup group when the full group would exceed capacity", async function () {
+  for (const { count, byteSize, quota, scans } of [
+    { count: 45, byteSize: 300 * 1024, quota: 35 * 1024 * 1024, scans: 4 },
+    { count: 3, byteSize: 4 * 1024 * 1024 - 128, quota: 12 * 1024 * 1024, scans: 5 },
+  ]) it(`collects between reservations when WebView has room for only part of ${count} files`, async function () {
     this.timeout(15000);
-    const t = await fixture(45);
-    for (const path of t.paths) t.seed(path, "x".repeat(300 * 1024));
+    const t = await fixture(count);
+    for (const path of t.paths) t.seed(path, "x".repeat(byteSize));
+    const original = Object.getOwnPropertyDescriptor(navigator, "storage");
+    Object.defineProperty(navigator, "storage", { configurable: true, value: { estimate: async () => ({quota, usage: 0}) } });
     const records = t.db.prevSyncRecordsTbl;
     const iterate = records.iterate.bind(records);
     let recordScans = 0;
@@ -507,30 +644,14 @@ describe("Android first B download", () => {
     };
     try {
       assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.equal(recordScans, 4);
+      assert.equal(recordScans, scans);
       assert.equal(t.remote.puts, 0);
       assert.equal(t.local.writes().length, t.paths.length);
-    } finally { t.stop(); }
-  });
-
-  it("collects between files if the whole download group cannot fit", async function () {
-    this.timeout(15000);
-    const t = await fixture(3);
-    const size = 4 * 1024 * 1024 - 128;
-    for (const [index, path] of t.paths.entries()) t.seed(path, String(index).repeat(size));
-    const records = t.db.prevSyncRecordsTbl;
-    const iterate = records.iterate.bind(records);
-    let recordScans = 0;
-    records.iterate = (...args) => {
-      recordScans++;
-      return iterate(...args);
-    };
-    try {
-      assert.equal((await runSync(t.input)).fullyConverged, true);
-      assert.equal(recordScans, 6);
-      assert.equal(t.remote.puts, 0);
-      for (const path of t.paths) assert.equal((await t.local.stat(path)).sizeRaw, size);
-    } finally { t.stop(); }
+    } finally {
+      if (original) Object.defineProperty(navigator, "storage", original);
+      else Reflect.deleteProperty(navigator, "storage");
+      t.stop();
+    }
   });
 
   it("discards a downloaded version that changes before publication and uses normal rediscovery", async () => {
@@ -550,7 +671,7 @@ describe("Android first B download", () => {
       assert.equal(t.reruns(), 1);
       assert.equal((await runSync(t.input)).fullyConverged, true);
       assert.equal(text(await t.local.readFile(path)), "new remote version");
-      assert.ok(reads > 2, "normal path rereads the body during verification");
+      assert.equal(reads, 2, "rediscovery downloads the new, independently verified version");
       assert.equal(t.remote.puts, 0);
     } finally { t.stop(); }
   });
@@ -663,8 +784,9 @@ describe("Android first B download", () => {
   });
 
   it("resumes after retirement without rewriting the file already committed", async () => {
-    const t = await fixture(EMPTY_FIRST_B_DOWNLOAD_LIMIT + 1);
-    const [first] = t.paths;
+    const t = await fixture(FIRST_B_DOWNLOAD_LIMIT + 1);
+    const first = [...t.paths].sort()[0];
+    const last = [...t.paths].sort().at(-1)!;
     let retired = false;
     t.input.contentRuntime!.assertActive = () => { if (retired) throw Error("retired"); };
     const history = t.db.fileContentHistoryTbl;
@@ -682,7 +804,7 @@ describe("Android first B download", () => {
       assert.equal((await t.rec(first))?.content?.status, "clean");
       const published = new Set(t.paths.filter(path => t.local.files.has(path)));
       assert.ok(published.has(first));
-      assert.equal(t.local.files.has(t.paths.at(-1)!), false);
+      assert.equal(t.local.files.has(last), false);
       t.journal.retire();
       history.setItem = setItem;
       t.local.calls.length = 0;
@@ -701,7 +823,7 @@ describe("Android first B download", () => {
     } finally { resumed.retire(); t.stop(); }
   });
 
-  it("passes the initial-download signal from the real Android B cutover entry only while reload is pending", async () => {
+  it("passes the initial-download signal from the real Android and iPad B cutover entry only while reload is pending", async () => {
     const t = await fixture();
     const entries: SyncInput[] = [];
     const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, async input => {
@@ -721,10 +843,109 @@ describe("Android first B download", () => {
       m.platform.isAndroidApp = false;
       assert.equal(await m.run(), "ok");
       assert.equal(entries.at(-1)?.androidInitialDownload, undefined);
+      m.platform.isIosApp = true;
+      assert.equal(await m.run(), "ok");
+      assert.equal(entries.at(-1)?.ipadInitialDownload, undefined);
+      m.platform.isTablet = true;
+      assert.equal(await m.run(), "ok");
+      assert.equal(entries.at(-1)?.ipadInitialDownload, true);
+      assert.equal(entries.at(-1)?.androidInitialDownload, undefined);
       m.platform.isAndroidApp = true;
       m.plugin.settings.nextclawReloadAfterFirstBSync = false;
       assert.equal(await m.run(), "ok");
       assert.equal(entries.at(-1)?.androidInitialDownload, undefined);
+      assert.equal(entries.at(-1)?.ipadInitialDownload, undefined);
+    } finally { t.stop(); }
+  });
+
+  for (const platform of ["Android", "iPad"]) it(`${platform} daily B uses the raised budget for local and remote file changes`, async function () {
+    this.timeout(20000);
+    const t = await fixture(0);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const path = "imported.md";
+    const base = "x".repeat(NOTE_LIMIT + 1);
+    t.seed(path, base);
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      assert.ok(isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+      const m = mainHarness({...harness(), local:t.local, remote:t.remote, input:t.input}, runSync);
+      m.plugin.databaseConnections = t.pool;
+      m.plugin.nativeWrites = t.journal;
+      m.plugin.vaultRandomID = t.input.vaultRandomID;
+      m.plugin.settings.webdav = {address:"https://synthetic.invalid/vault", username:"s00000", password:"synthetic"};
+      m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+      if (platform === "Android") m.platform.isAndroidApp = true;
+      else { m.platform.isIosApp = true; m.platform.isTablet = true; }
+      const upload = "L" + base;
+      t.local.put(path, upload);
+      assert.equal(await m.run("manual"), "ok");
+      assert.equal(t.remote.puts, 1);
+      assert.equal(text(await t.remote.readFile(path)), upload);
+      assert.equal((await t.rec(path))?.content?.status, "clean");
+      assert.ok(!isAttachmentRef((await t.rec(path))?.content?.cleanBaseRef));
+      const download = "R" + base;
+      t.seed(path, download);
+      assert.equal(await m.run("auto"), "ok");
+      assert.equal(text(await t.local.readFile(path)), download);
+      assert.equal(m.plugin.pendingContent.pending, 0);
+      assert.equal(await m.run("manual"), "ok", "a later sweep can verify the new large baseline");
+      assert.equal(m.plugin.pendingContent.pending, 0);
+      assert.equal(t.remote.puts, 1);
+    } finally { t.stop(); }
+  });
+
+  it("limits enlarged daily B to Android and iPad", async () => {
+    const t = await fixture();
+    const seen: SyncInput[] = [];
+    const m = mainHarness({...harness(), local:t.local, remote:t.remote, input:t.input}, async input => {
+      seen.push(input);
+      return {ok:true, fullyConverged:false, pendingDirectories:[], counts:{}, errors:[]};
+    });
+    m.plugin.databaseConnections=t.pool;
+    m.plugin.nativeWrites=t.journal;
+    m.plugin.vaultRandomID=t.input.vaultRandomID;
+    m.plugin.settings.webdav={address:"https://synthetic.invalid/vault", username:"s00000", password:"synthetic"};
+    try {
+      m.platform.isIosApp = true;
+      await m.run();
+      assert.equal(seen.at(-1)?.mobileDailyContentBudget, undefined);
+      m.platform.isTablet = true;
+      m.plugin.settings.nextclawReloadAfterFirstBSync = true;
+      await m.run();
+      assert.equal(seen.at(-1)?.mobileDailyContentBudget, undefined);
+      assert.equal(seen.at(-1)?.ipadInitialDownload, true);
+      m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+      await m.run();
+      assert.equal(seen.at(-1)?.mobileDailyContentBudget, true);
+      m.platform.isIosApp = m.platform.isTablet = false;
+      await m.run();
+      assert.equal(seen.at(-1)?.mobileDailyContentBudget, undefined);
+    } finally { t.stop(); }
+  });
+
+  it("rejects daily B files above 50 MiB before GET and charges both stores to 1,000 MiB", async () => {
+    const t = await fixture(0);
+    delete t.input.androidInitialDownload;
+    t.input.mobileDailyContentBudget = true;
+    const rt = contentRuntime(t.input);
+    const old = bytes("imported");
+    const daily = bytes("daily update");
+    try {
+      await rt.attachments.put("old.html", old, "clean-base");
+      await rt.bodies.put("today.md", daily, "clean-base");
+      assert.equal(rt.bodies.fileLimit, ATTACHMENT_LIMIT);
+      await rt.bodies.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - old.byteLength - daily.byteLength);
+      await assert.rejects(rt.bodies.ensureCapacity(ATTACHMENT_PROFILE_LIMIT - old.byteLength - daily.byteLength + 1), /content-limit-pending/);
+      t.seed("oversized.pdf", "fixture");
+      const row = t.remote.files.get("oversized.pdf")!;
+      row.entity.size = row.entity.sizeRaw = ATTACHMENT_LIMIT + 1;
+      const result = await runSync(t.input);
+      assert.deepEqual(result.pendingContent, [{path:"oversized.pdf", reason:"内容超过安全预算，待处理"}]);
+      assert.equal(t.remote.calls.some(c=>c.op==="readFile"), false);
+      assert.deepEqual(t.local.writes(), []);
     } finally { t.stop(); }
   });
 

@@ -55,7 +55,7 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
   // 保护弹窗：默认用户点"继续"，并记下弹过哪些。
   const guardUi = { answer: true, asked: [] as any[] };
   // 运行平台：默认移动端；测桌面端拦截时改成 true。
-  const platform = { isDesktopApp: false, isAndroidApp: false };
+  const platform = { isDesktopApp: false, isAndroidApp: false, isIosApp: false, isTablet: false };
   const globals: Record<string, any> = {
     checkVaultStages, assertContentResetSafe, ContentStagePaused,
     fence,

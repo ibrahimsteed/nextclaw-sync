@@ -1,5 +1,5 @@
-# NextClaw Sync 0.2.4
+# NextClaw Sync 0.2.5
 
-- The first Android account sync can download up to eight ordinary remote-only files concurrently in a new vault. Guarded local writes remain limited to four concurrent operations. Each publication retains remote file identity and version checks and protects occupied local paths.
-- First-sync Android GIF and PNG imports use a separate content budget, with a 50 MiB per-file limit and one attachment at a time. Previously deferred downloads can resume, and verified clean files can be reused without downloading their bodies again.
-- In a test with a fixed snapshot containing 1,485 ordinary files on a MacBook Android 15 emulator, the full vault converged and the designated note opened after automatic reload in 7 minutes 0 seconds. Independent verification passed. Times depend on the device, snapshot and network.
+- First account sync on Android and iPad can download up to ten eligible remote-only files concurrently. Guarded local writes retain their four-operation limit and version checks.
+- Android and iPad apply a 50 MiB per-file limit and a 1,000 MiB content budget during daily account sync. Eligible larger files retain guarded downloads and conditional uploads.
+- During interrupted content recovery, independently confirmable operations can finish in one pass before a single rescan. An operation that cannot be confirmed still stops recovery.
