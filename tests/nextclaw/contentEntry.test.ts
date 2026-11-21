@@ -8,6 +8,7 @@ import { runSync } from "../../src/nextclaw/syncEngine";
 import { ContentStore, isAttachmentRef } from "../../src/nextclaw/content/store";
 import { ATTACHMENT_LIMIT, ATTACHMENT_PROFILE_LIMIT, NOTE_LIMIT, PROFILE_LIMIT } from "../../src/nextclaw/content/identity";
 import { contentRuntime, assertContentResetSafe, checkVaultStages } from "../../src/nextclaw/content/runtime";
+import { SyncQueue } from "../../src/nextclaw/syncQueue";
 import { PRESET_B } from "../../src/nextclaw/presets";
 import { mainHarness } from "./engine/mainHarness";
 import { harness } from "./engine/helpers";
@@ -999,6 +1000,76 @@ describe("Mobile first B download", () => {
       assert.equal(queued, 0);
       assert.equal(t.remote.puts, 0);
     } finally { t.stop(); }
+  });
+
+  for (const platform of ["Android", "iPad"]) it(`${platform} daily B saves same-size same-mtime edits without queuing clean files and keeps merged full requests`, async function () {
+    this.timeout(10000);
+    const t = await fixture(36);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const runs: { input: SyncInput; result: Awaited<ReturnType<typeof runSync>> }[] = [];
+    const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, async input => {
+      const result = await runSync(input);
+      runs.push({ input, result });
+      return result;
+    });
+    m.plugin.databaseConnections = t.pool;
+    m.plugin.nativeWrites = t.journal;
+    m.plugin.vaultRandomID = t.input.vaultRandomID;
+    m.plugin.settings.webdav = { address: "https://synthetic.invalid/vault", username: "s00000", password: "synthetic" };
+    m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+    if (platform === "Android") m.platform.isAndroidApp = true;
+    else { m.platform.isIosApp = true; m.platform.isTablet = true; }
+    let timer: (() => void) | undefined, inProgress: Promise<"ok" | "failed" | "blocked"> | undefined;
+    const queue = new SyncQueue((saveOnly, recovery) => {
+      inProgress = m.run("auto_sync_on_save", saveOnly, recovery);
+      return inProgress!;
+    }, {
+      setTimeout(fn) { timer = fn; return 1; },
+      clearTimeout() { timer = undefined; },
+    });
+    m.plugin.syncQueue = queue;
+    const changed = t.paths[0], remoteUpdate = t.paths[1];
+    const edit = async (replacement: string) => {
+      const before = await t.local.stat(changed);
+      const original = text(await t.local.readFile(changed));
+      t.local.put(changed, replacement + original.slice(1), before.mtimeCli);
+      const after = await t.local.stat(changed);
+      assert.equal(after.mtimeCli, before.mtimeCli);
+      assert.equal(after.sizeRaw, before.sizeRaw);
+      await m.fileChanged();
+    };
+    const flush = async () => {
+      assert.ok(timer);
+      const callback = timer;
+      timer = undefined;
+      t.remote.calls.length = 0;
+      callback();
+      assert.equal(await inProgress, "ok");
+      assert.equal(runs.at(-1)?.result.fullyConverged, true);
+      assert.deepEqual(runs.at(-1)?.result.contentSummary, { pending: 0, conflicts: 0, blocked: false });
+      assert.equal(timer, undefined);
+      return new Set(t.remote.calls.filter(x => x.op === "readFile").map(x => x.key));
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      await edit("L");
+      assert.deepEqual(await flush(), new Set([changed]));
+      assert.equal(runs.at(-1)?.input.androidSaveOnly, platform === "Android" ? true : undefined);
+      assert.ok(text(await t.remote.readFile(changed)).startsWith("L"));
+      assert.equal(t.remote.puts, 1);
+
+      t.seed(remoteUpdate, "new remote bytes");
+      await edit("M");
+      queue.request(0, false);
+      assert.deepEqual(await flush(), new Set([changed, remoteUpdate]));
+      assert.equal(runs.at(-1)?.input.androidSaveOnly, undefined);
+      assert.ok(text(await t.remote.readFile(changed)).startsWith("M"));
+      assert.equal(text(await t.local.readFile(remoteUpdate)), "new remote bytes");
+      assert.equal(t.remote.puts, 2);
+    } finally { queue.dispose(); t.stop(); }
   });
 
   it("limits enlarged daily B to Android and iPad", async () => {
