@@ -229,7 +229,7 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         !(key.endsWith("/") || inConfig(key, input.configDir)) || (!item.change && !item.pending));
     // Recheck the same evidence on queued follow-ups so clean paths stay out of the batch.
     const verifyDaily = canVerifyClean && input.mobileDailyContentBudget && !saveOnly &&
-      (source === "manual" || source === "auto_sync_on_save");
+      (source === "manual" || source === "auto" || source === "auto_sync_on_save");
     const verifyIndependently = resumeFirstB || verifyDaily;
     if (verifyIndependently || verifyAfterReload) {
       const runtime = rt;

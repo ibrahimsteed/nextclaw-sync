@@ -8,6 +8,7 @@ import { runSync } from "../../src/nextclaw/syncEngine";
 import { ContentStore, isAttachmentRef } from "../../src/nextclaw/content/store";
 import { ATTACHMENT_LIMIT, ATTACHMENT_PROFILE_LIMIT, NOTE_LIMIT, PROFILE_LIMIT } from "../../src/nextclaw/content/identity";
 import { contentRuntime, assertContentResetSafe, checkVaultStages } from "../../src/nextclaw/content/runtime";
+import { PRESET_B } from "../../src/nextclaw/presets";
 import { mainHarness } from "./engine/mainHarness";
 import { harness } from "./engine/helpers";
 import { MemoryFs, bytes, text } from "./engine/helpers";
@@ -949,6 +950,57 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
+  for (const platform of ["Android", "iPad"]) it(`${platform} daily B timer verifies clean files on repeated ticks and downloads a remote change`, async function () {
+    this.timeout(10000);
+    const t = await fixture(36);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const runs: { input: SyncInput; result: Awaited<ReturnType<typeof runSync>> }[] = [];
+    const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, async input => {
+      const result = await runSync(input);
+      runs.push({ input, result });
+      return result;
+    });
+    m.plugin.databaseConnections = t.pool;
+    m.plugin.nativeWrites = t.journal;
+    m.plugin.vaultRandomID = t.input.vaultRandomID;
+    m.plugin.settings.webdav = { address: "https://synthetic.invalid/vault", username: "s00000", password: "synthetic" };
+    m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+    if (platform === "Android") m.platform.isAndroidApp = true;
+    else { m.platform.isIosApp = true; m.platform.isTablet = true; }
+    let queued = 0;
+    m.plugin.syncQueue = { request: () => { queued++; }, finished: () => {} };
+    const gets = () => t.remote.calls.filter(x => x.op === "readFile").map(x => x.key);
+    const png = "imported.png";
+    seedAttachment(t, png, 128);
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      m.enableTimer(PRESET_B.autoRunEveryMilliseconds);
+      for (let tick = 0; tick < 2; tick++) {
+        t.remote.calls.length = 0;
+        assert.equal(await m.fireTimer(), "ok");
+        const { input, result } = runs.at(-1)!;
+        assert.equal(input.triggerSource, "auto");
+        assert.equal(input.mobileDailyContentBudget, true);
+        assert.equal(result.fullyConverged, true);
+        assert.deepEqual(result.contentSummary, { pending: 0, conflicts: 0, blocked: false });
+        assert.deepEqual(gets(), []);
+        assert.equal(queued, 0);
+      }
+      const changed = t.paths[0];
+      t.seed(changed, "new remote bytes");
+      t.remote.calls.length = 0;
+      assert.equal(await m.fireTimer(), "ok");
+      assert.equal(runs.at(-1)?.result.fullyConverged, true);
+      assert.deepEqual(new Set(gets()), new Set([changed]));
+      assert.equal(text(await t.local.readFile(changed)), "new remote bytes");
+      assert.equal(queued, 0);
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
   it("limits enlarged daily B to Android and iPad", async () => {
     const t = await fixture();
     const seen: SyncInput[] = [];
@@ -1233,8 +1285,9 @@ describe("Android save sync skips only verified clean remote bodies", () => {
       m.platform.isAndroidApp = true;
       assert.equal(await m.run("auto_sync_on_save", true), "ok");
       assert.equal(t.reads.length, 1);
+      // Periodic full sweeps now verify clean content independently of save provenance.
       assert.equal(await m.run("auto", true), "ok");
-      assert.equal(t.reads.length, 2);
+      assert.equal(t.reads.length, 1);
     } finally { t.stop(); }
   });
 });
