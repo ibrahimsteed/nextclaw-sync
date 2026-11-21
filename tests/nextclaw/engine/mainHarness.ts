@@ -45,17 +45,19 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
   );
   let method = "";
   let timerMethod = "";
+  let initMethod = "";
   let saveMethod = "";
   const visit = (node: ts.Node) => {
     if (ts.isMethodDeclaration(node)) {
       if (node.name.getText(source) === "syncRun") method = node.getText(source);
       if (node.name.getText(source) === "enableAutoSyncIfSet") timerMethod = node.getText(source);
+      if (node.name.getText(source) === "enableInitSyncIfSet") initMethod = node.getText(source);
       if (node.name.getText(source) === "_checkCurrFileModified") saveMethod = node.getText(source);
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
-  assert.ok(method && timerMethod && saveMethod);
+  assert.ok(method && timerMethod && initMethod && saveMethod);
   let interval: (() => void) | undefined;
   const notices: string[] = [];
   // 保护弹窗：默认用户点"继续"，并记下弹过哪些。
@@ -120,6 +122,7 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
     [
       method.replace(/^async syncRun/, "async function syncRun"),
       `function ${timerMethod}`,
+      `function ${initMethod}`,
       saveMethod.replace(/^async _checkCurrFileModified/, "async function _checkCurrFileModified"),
     ].join("\n"),
     {
@@ -129,9 +132,9 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
       },
     }
   ).outputText;
-  const { syncRun, enableAutoSyncIfSet, _checkCurrFileModified } = new Function(
+  const { syncRun, enableAutoSyncIfSet, enableInitSyncIfSet, _checkCurrFileModified } = new Function(
     ...Object.keys(globals),
-    `${compiled}; return { syncRun, enableAutoSyncIfSet, _checkCurrFileModified };`
+    `${compiled}; return { syncRun, enableAutoSyncIfSet, enableInitSyncIfSet, _checkCurrFileModified };`
   )(...Object.values(globals));
   const executed: string[] = [];
   const plugin: any = {
@@ -168,6 +171,27 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
   };
   let timerRun: Promise<unknown> | undefined;
   return {
+    async runInit(delay: number) {
+      let fire: (() => void) | undefined;
+      plugin.deferredTasks = new DeferredTasks({
+        setTimeout(fn, scheduledDelay) {
+          assert.equal(scheduledDelay, delay);
+          fire = fn;
+          return 1;
+        },
+        clearTimeout() {},
+      });
+      plugin.settings.initRunAfterMilliseconds = delay;
+      plugin.app.workspace = { onLayoutReady: (ready: () => void) => ready() };
+      plugin.syncRun = (source: string) => { timerRun = syncRun.call(plugin, source); return timerRun; };
+      timerRun = undefined;
+      enableInitSyncIfSet.call(plugin);
+      assert.ok(fire);
+      fire();
+      await Promise.resolve();
+      assert.ok(timerRun);
+      return timerRun;
+    },
     enableTimer(delay: number) {
       plugin.settings.autoRunEveryMilliseconds = delay;
       plugin.app.workspace = { onLayoutReady: (ready: () => void) => ready() };

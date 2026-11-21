@@ -9,7 +9,7 @@ import { ContentStore, isAttachmentRef } from "../../src/nextclaw/content/store"
 import { ATTACHMENT_LIMIT, ATTACHMENT_PROFILE_LIMIT, NOTE_LIMIT, PROFILE_LIMIT } from "../../src/nextclaw/content/identity";
 import { contentRuntime, assertContentResetSafe, checkVaultStages } from "../../src/nextclaw/content/runtime";
 import { SyncQueue } from "../../src/nextclaw/syncQueue";
-import { PRESET_B } from "../../src/nextclaw/presets";
+import { PRESET_B, PRESET_B_MOBILE_OVERRIDES } from "../../src/nextclaw/presets";
 import { mainHarness } from "./engine/mainHarness";
 import { harness } from "./engine/helpers";
 import { MemoryFs, bytes, text } from "./engine/helpers";
@@ -951,7 +951,8 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
-  for (const platform of ["Android", "iPad"]) it(`${platform} daily B timer verifies clean files on repeated ticks and downloads a remote change`, async function () {
+  for (const platform of ["Android", "iPad"]) for (const trigger of ["auto", "auto_once_init"]) it(
+    `${platform} daily B ${trigger === "auto" ? "timer" : "startup"} verifies clean files and downloads a remote change`, async function () {
     this.timeout(10000);
     const t = await fixture(36);
     if (platform === "iPad") {
@@ -978,12 +979,13 @@ describe("Mobile first B download", () => {
     seedAttachment(t, png, 128);
     try {
       assert.equal((await runSync(t.input)).fullyConverged, true);
-      m.enableTimer(PRESET_B.autoRunEveryMilliseconds);
-      for (let tick = 0; tick < 2; tick++) {
+      if (trigger === "auto") m.enableTimer(PRESET_B.autoRunEveryMilliseconds);
+      const runScheduled = () => trigger === "auto" ? m.fireTimer() : m.runInit(PRESET_B_MOBILE_OVERRIDES.initRunAfterMilliseconds);
+      for (let tick = 0; tick < (trigger === "auto" ? 2 : 1); tick++) {
         t.remote.calls.length = 0;
-        assert.equal(await m.fireTimer(), "ok");
+        assert.equal(await runScheduled(), "ok");
         const { input, result } = runs.at(-1)!;
-        assert.equal(input.triggerSource, "auto");
+        assert.equal(input.triggerSource, trigger);
         assert.equal(input.mobileDailyContentBudget, true);
         assert.equal(result.fullyConverged, true);
         assert.deepEqual(result.contentSummary, { pending: 0, conflicts: 0, blocked: false });
@@ -993,7 +995,7 @@ describe("Mobile first B download", () => {
       const changed = t.paths[0];
       t.seed(changed, "new remote bytes");
       t.remote.calls.length = 0;
-      assert.equal(await m.fireTimer(), "ok");
+      assert.equal(await runScheduled(), "ok");
       assert.equal(runs.at(-1)?.result.fullyConverged, true);
       assert.deepEqual(new Set(gets()), new Set([changed]));
       assert.equal(text(await t.local.readFile(changed)), "new remote bytes");
