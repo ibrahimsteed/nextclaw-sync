@@ -21,7 +21,7 @@ export type { SyncCallbacks, SyncInput, SyncResult } from "./engine/model";
 const running = new WeakSet<NativeWriteJournal>();
 type MoveCollision = { source: string; target: string; fileId: string; hash: string };
 const INITIAL_PUBLICATION_CONCURRENCY = 4;
-const FIRST_B_RECOVERY_CONCURRENCY = 4;
+const FIRST_B_RECOVERY_CONCURRENCY = 8;
 const INITIAL_COLLECTION_BATCH = 128;
 const INITIAL_SMALL_COLLECTION_BATCH = 32;
 export async function runSync(input: SyncInput): Promise<SyncResult> {
@@ -228,8 +228,8 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
       Object.entries(plan).every(([key, item]) =>
         !(key.endsWith("/") || inConfig(key, input.configDir)) || (!item.change && !item.pending));
     // Recheck the same evidence on queued follow-ups so clean paths stay out of the batch.
-    const verifyDaily = canVerifyClean && input.mobileDailyContentBudget && !saveOnly &&
-      (source === "manual" || source === "auto_sync_on_save");
+    const verifyDaily = canVerifyClean && input.mobileDailyContentBudget &&
+      (source === "manual" || source === "auto" || source === "auto_once_init" || source === "auto_sync_on_save");
     const verifyIndependently = resumeFirstB || verifyDaily;
     if (verifyIndependently || verifyAfterReload) {
       const runtime = rt;
@@ -239,22 +239,67 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         (!verifyDaily || Math.max(item.local.size ?? item.local.sizeRaw ?? 0,
           item.remote.size ?? item.remote.sizeRaw ?? 0) <= ATTACHMENT_LIMIT)) : contentEntries;
       const verified = new Map<string, NonNullable<PlanItem["content"]>>();
-      for (let i = 0; i < candidates.length;) {
-        const next = candidates.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
-        const large = next.findIndex(([, item]) => largeImported(item));
-        const chunk = large < 0 ? next : next.slice(0, Math.max(1, large));
-        const checked = await Promise.allSettled(chunk.map(async ([key, item]) => {
+      if (verifyDaily) {
+        // Rolling window: keep FIRST_B_RECOVERY_CONCURRENCY ordinary items in flight and
+        // backfill on each completion instead of waiting for the slowest item in a batch.
+        // Large attachments stay isolated: drain the window, verify the large item alone.
+        const verifyItem = async (entry: typeof candidates[number], trust: boolean) => {
+          const [key, item] = entry;
           const file = fileForPlan(key, item);
-          return (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
-        }));
-        runtime.guard();
-        for (const [index, check] of checked.entries()) {
-          if (!verifyDaily && check.status === "rejected" && !(check.reason instanceof SyncConflict) &&
-              (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
-          if (check.status === "fulfilled" && check.value) verified.set(chunk[index][0], check.value);
+          try {
+            const l = await file.readLocal();
+            const clean = (trust ? await file.readForPlanTrusted(l, item.record) : await file.readForPlan(l, item.record, true)).clean;
+            if (clean) verified.set(key, clean);
+          } catch { /* rejected paths stay unresolved and fall through to the ordinary sweep */ }
+          runtime.guard();
+        };
+        const runWindow = async (run: typeof candidates, trust: boolean) => {
+          let idx = 0;
+          const worker = async () => { while (idx < run.length) await verifyItem(run[idx++], trust); };
+          await Promise.all(Array.from({ length: Math.min(FIRST_B_RECOVERY_CONCURRENCY, run.length) }, () => worker()));
+        };
+        const runAll = async (trust: boolean) => {
+          let run: typeof candidates = [];
+          for (const entry of candidates) {
+            if (largeImported(entry[1])) {
+              if (run.length) { await runWindow(run, trust); run = []; }
+              await verifyItem(entry, trust);
+            } else run.push(entry);
+          }
+          if (run.length) await runWindow(run, trust);
+        };
+        // Trust this round's walk etags for the clean proofs, then re-confirm the baseDir
+        // collection etag held since round start before accepting them. An unchanged strong
+        // root etag proves no remote mutation touched any walk entry; if it moved (or the
+        // server gives no strong root etag), re-verify with fresh per-file probes so the
+        // proofs carry the same guarantee as the ordinary read-only path.
+        const startTag = runtime.startRootEtag;
+        const canTrust = typeof startTag === "string" && strongEtag(startTag);
+        await runAll(canTrust);
+        if (canTrust) {
+          let unchanged = false;
+          try { const endRoot = await input.fsRemote.stat("/"); runtime.guard(); unchanged = endRoot.etag === startTag; }
+          catch { unchanged = false; }
+          if (!unchanged) { verified.clear(); await runAll(false); }
         }
-        i += chunk.length;
-        if (!verifyIndependently && verified.size !== i) break;
+      } else {
+        for (let i = 0; i < candidates.length;) {
+          const next = candidates.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
+          const large = next.findIndex(([, item]) => largeImported(item));
+          const chunk = large < 0 ? next : next.slice(0, Math.max(1, large));
+          const checked = await Promise.allSettled(chunk.map(async ([key, item]) => {
+            const file = fileForPlan(key, item);
+            return (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
+          }));
+          runtime.guard();
+          for (const [index, check] of checked.entries()) {
+            if (!verifyDaily && check.status === "rejected" && !(check.reason instanceof SyncConflict) &&
+                (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
+            if (check.status === "fulfilled" && check.value) verified.set(chunk[index][0], check.value);
+          }
+          i += chunk.length;
+          if (!verifyIndependently && verified.size !== i) break;
+        }
       }
       if (verifyIndependently || verified.size === contentEntries.length) {
         for (const [key, clean] of verified) {

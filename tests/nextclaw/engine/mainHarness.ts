@@ -44,13 +44,21 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
     true
   );
   let method = "";
+  let timerMethod = "";
+  let initMethod = "";
+  let saveMethod = "";
   const visit = (node: ts.Node) => {
-    if (ts.isMethodDeclaration(node) && node.name.getText(source) === "syncRun")
-      method = node.getText(source);
+    if (ts.isMethodDeclaration(node)) {
+      if (node.name.getText(source) === "syncRun") method = node.getText(source);
+      if (node.name.getText(source) === "enableAutoSyncIfSet") timerMethod = node.getText(source);
+      if (node.name.getText(source) === "enableInitSyncIfSet") initMethod = node.getText(source);
+      if (node.name.getText(source) === "_checkCurrFileModified") saveMethod = node.getText(source);
+    }
     ts.forEachChild(node, visit);
   };
   visit(source);
-  assert.ok(method);
+  assert.ok(method && timerMethod && initMethod && saveMethod);
+  let interval: (() => void) | undefined;
   const notices: string[] = [];
   // 保护弹窗：默认用户点"继续"，并记下弹过哪些。
   const guardUi = { answer: true, asked: [] as any[] };
@@ -90,7 +98,11 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
     shouldReloadAfterFirstASync,
     clearAllPrevSyncRecordByVault,
     // 提示等待不真的等 2.5 秒。
-    window: { localStorage: { getItem: () => null, setItem() {}, removeItem() {} }, setTimeout: (fn: () => void) => (fn(), 0) },
+    window: {
+      localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+      setTimeout: (fn: () => void) => (fn(), 0),
+      setInterval: (fn: () => void) => { interval = fn; return 1; },
+    },
     effectiveIgnorePaths,
     formatReceipt: () => "test switch receipt",
     Notice: class {
@@ -107,7 +119,12 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
     AggregateError,
   };
   const compiled = ts.transpileModule(
-    method.replace(/^async syncRun/, "async function syncRun"),
+    [
+      method.replace(/^async syncRun/, "async function syncRun"),
+      `function ${timerMethod}`,
+      `function ${initMethod}`,
+      saveMethod.replace(/^async _checkCurrFileModified/, "async function _checkCurrFileModified"),
+    ].join("\n"),
     {
       compilerOptions: {
         target: ts.ScriptTarget.ES2020,
@@ -115,9 +132,9 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
       },
     }
   ).outputText;
-  const fn = new Function(
+  const { syncRun, enableAutoSyncIfSet, enableInitSyncIfSet, _checkCurrFileModified } = new Function(
     ...Object.keys(globals),
-    `${compiled}; return syncRun;`
+    `${compiled}; return { syncRun, enableAutoSyncIfSet, enableInitSyncIfSet, _checkCurrFileModified };`
   )(...Object.values(globals));
   const executed: string[] = [];
   const plugin: any = {
@@ -152,13 +169,50 @@ export function mainHarness(h = harness(), engine: typeof runSync = runSync) {
     updateLastSyncMsg: () => {},
     setCurrSyncMsg: () => {},
   };
+  let timerRun: Promise<unknown> | undefined;
   return {
+    async runInit(delay: number) {
+      let fire: (() => void) | undefined;
+      plugin.deferredTasks = new DeferredTasks({
+        setTimeout(fn, scheduledDelay) {
+          assert.equal(scheduledDelay, delay);
+          fire = fn;
+          return 1;
+        },
+        clearTimeout() {},
+      });
+      plugin.settings.initRunAfterMilliseconds = delay;
+      plugin.app.workspace = { onLayoutReady: (ready: () => void) => ready() };
+      plugin.syncRun = (source: string) => { timerRun = syncRun.call(plugin, source); return timerRun; };
+      timerRun = undefined;
+      enableInitSyncIfSet.call(plugin);
+      assert.ok(fire);
+      fire();
+      await Promise.resolve();
+      assert.ok(timerRun);
+      return timerRun;
+    },
+    enableTimer(delay: number) {
+      plugin.settings.autoRunEveryMilliseconds = delay;
+      plugin.app.workspace = { onLayoutReady: (ready: () => void) => ready() };
+      plugin.registerInterval = () => {};
+      plugin.syncRun = (source: string) => { timerRun = syncRun.call(plugin, source); return timerRun; };
+      enableAutoSyncIfSet.call(plugin);
+    },
+    fireTimer() {
+      assert.ok(interval);
+      timerRun = undefined;
+      interval();
+      assert.ok(timerRun);
+      return timerRun;
+    },
+    fileChanged: () => _checkCurrFileModified.call(plugin, "FILE_CHANGES"),
     h,
     plugin,
     notices,
     executed,
     guardUi,
     platform,
-    run: (trigger = "manual", saveOnly = false, firstBRecovery?: string) => fn.call(plugin, trigger, saveOnly, firstBRecovery),
+    run: (trigger = "manual", saveOnly = false, firstBRecovery?: string) => syncRun.call(plugin, trigger, saveOnly, firstBRecovery),
   };
 }

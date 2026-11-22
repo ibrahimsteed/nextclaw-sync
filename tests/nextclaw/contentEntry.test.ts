@@ -8,6 +8,8 @@ import { runSync } from "../../src/nextclaw/syncEngine";
 import { ContentStore, isAttachmentRef } from "../../src/nextclaw/content/store";
 import { ATTACHMENT_LIMIT, ATTACHMENT_PROFILE_LIMIT, NOTE_LIMIT, PROFILE_LIMIT } from "../../src/nextclaw/content/identity";
 import { contentRuntime, assertContentResetSafe, checkVaultStages } from "../../src/nextclaw/content/runtime";
+import { SyncQueue } from "../../src/nextclaw/syncQueue";
+import { PRESET_B, PRESET_B_MOBILE_OVERRIDES } from "../../src/nextclaw/presets";
 import { mainHarness } from "./engine/mainHarness";
 import { harness } from "./engine/helpers";
 import { MemoryFs, bytes, text } from "./engine/helpers";
@@ -949,6 +951,129 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
+  for (const platform of ["Android", "iPad"]) for (const trigger of ["auto", "auto_once_init"]) it(
+    `${platform} daily B ${trigger === "auto" ? "timer" : "startup"} verifies clean files and downloads a remote change`, async function () {
+    this.timeout(10000);
+    const t = await fixture(36);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const runs: { input: SyncInput; result: Awaited<ReturnType<typeof runSync>> }[] = [];
+    const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, async input => {
+      const result = await runSync(input);
+      runs.push({ input, result });
+      return result;
+    });
+    m.plugin.databaseConnections = t.pool;
+    m.plugin.nativeWrites = t.journal;
+    m.plugin.vaultRandomID = t.input.vaultRandomID;
+    m.plugin.settings.webdav = { address: "https://synthetic.invalid/vault", username: "s00000", password: "synthetic" };
+    m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+    if (platform === "Android") m.platform.isAndroidApp = true;
+    else { m.platform.isIosApp = true; m.platform.isTablet = true; }
+    let queued = 0;
+    m.plugin.syncQueue = { request: () => { queued++; }, finished: () => {} };
+    const gets = () => t.remote.calls.filter(x => x.op === "readFile").map(x => x.key);
+    const png = "imported.png";
+    seedAttachment(t, png, 128);
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      if (trigger === "auto") m.enableTimer(PRESET_B.autoRunEveryMilliseconds);
+      const runScheduled = () => trigger === "auto" ? m.fireTimer() : m.runInit(PRESET_B_MOBILE_OVERRIDES.initRunAfterMilliseconds);
+      for (let tick = 0; tick < (trigger === "auto" ? 2 : 1); tick++) {
+        t.remote.calls.length = 0;
+        assert.equal(await runScheduled(), "ok");
+        const { input, result } = runs.at(-1)!;
+        assert.equal(input.triggerSource, trigger);
+        assert.equal(input.mobileDailyContentBudget, true);
+        assert.equal(result.fullyConverged, true);
+        assert.deepEqual(result.contentSummary, { pending: 0, conflicts: 0, blocked: false });
+        assert.deepEqual(gets(), []);
+        assert.equal(queued, 0);
+      }
+      const changed = t.paths[0];
+      t.seed(changed, "new remote bytes");
+      t.remote.calls.length = 0;
+      assert.equal(await runScheduled(), "ok");
+      assert.equal(runs.at(-1)?.result.fullyConverged, true);
+      assert.deepEqual(new Set(gets()), new Set([changed]));
+      assert.equal(text(await t.local.readFile(changed)), "new remote bytes");
+      assert.equal(queued, 0);
+      assert.equal(t.remote.puts, 0);
+    } finally { t.stop(); }
+  });
+
+  for (const platform of ["Android", "iPad"]) it(`${platform} daily B saves same-size same-mtime edits without queuing clean files and keeps merged full requests`, async function () {
+    this.timeout(10000);
+    const t = await fixture(36);
+    if (platform === "iPad") {
+      delete t.input.androidInitialDownload;
+      t.input.ipadInitialDownload = true;
+    }
+    const runs: { input: SyncInput; result: Awaited<ReturnType<typeof runSync>> }[] = [];
+    const m = mainHarness({ ...harness(), local: t.local, remote: t.remote, input: t.input }, async input => {
+      const result = await runSync(input);
+      runs.push({ input, result });
+      return result;
+    });
+    m.plugin.databaseConnections = t.pool;
+    m.plugin.nativeWrites = t.journal;
+    m.plugin.vaultRandomID = t.input.vaultRandomID;
+    m.plugin.settings.webdav = { address: "https://synthetic.invalid/vault", username: "s00000", password: "synthetic" };
+    m.plugin.settings.nextclawReloadAfterFirstBSync = false;
+    if (platform === "Android") m.platform.isAndroidApp = true;
+    else { m.platform.isIosApp = true; m.platform.isTablet = true; }
+    let timer: (() => void) | undefined, inProgress: Promise<"ok" | "failed" | "blocked"> | undefined;
+    const queue = new SyncQueue((saveOnly, recovery) => {
+      inProgress = m.run("auto_sync_on_save", saveOnly, recovery);
+      return inProgress!;
+    }, {
+      setTimeout(fn) { timer = fn; return 1; },
+      clearTimeout() { timer = undefined; },
+    });
+    m.plugin.syncQueue = queue;
+    const changed = t.paths[0], remoteUpdate = t.paths[1];
+    const edit = async (replacement: string) => {
+      const before = await t.local.stat(changed);
+      const original = text(await t.local.readFile(changed));
+      t.local.put(changed, replacement + original.slice(1), before.mtimeCli);
+      const after = await t.local.stat(changed);
+      assert.equal(after.mtimeCli, before.mtimeCli);
+      assert.equal(after.sizeRaw, before.sizeRaw);
+      await m.fileChanged();
+    };
+    const flush = async () => {
+      assert.ok(timer);
+      const callback = timer;
+      timer = undefined;
+      t.remote.calls.length = 0;
+      callback();
+      assert.equal(await inProgress, "ok");
+      assert.equal(runs.at(-1)?.result.fullyConverged, true);
+      assert.deepEqual(runs.at(-1)?.result.contentSummary, { pending: 0, conflicts: 0, blocked: false });
+      assert.equal(timer, undefined);
+      return new Set(t.remote.calls.filter(x => x.op === "readFile").map(x => x.key));
+    };
+    try {
+      assert.equal((await runSync(t.input)).fullyConverged, true);
+      await edit("L");
+      assert.deepEqual(await flush(), new Set([changed]));
+      assert.equal(runs.at(-1)?.input.androidSaveOnly, platform === "Android" ? true : undefined);
+      assert.ok(text(await t.remote.readFile(changed)).startsWith("L"));
+      assert.equal(t.remote.puts, 1);
+
+      t.seed(remoteUpdate, "new remote bytes");
+      await edit("M");
+      queue.request(0, false);
+      assert.deepEqual(await flush(), new Set([changed, remoteUpdate]));
+      assert.equal(runs.at(-1)?.input.androidSaveOnly, undefined);
+      assert.ok(text(await t.remote.readFile(changed)).startsWith("M"));
+      assert.equal(text(await t.local.readFile(remoteUpdate)), "new remote bytes");
+      assert.equal(t.remote.puts, 2);
+    } finally { queue.dispose(); t.stop(); }
+  });
+
   it("limits enlarged daily B to Android and iPad", async () => {
     const t = await fixture();
     const seen: SyncInput[] = [];
@@ -1001,7 +1126,7 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("rechecks the clean first-B vault in one run with four read-only lanes", async () => {
+  it("rechecks the clean first-B vault in one run with eight read-only lanes", async () => {
     const t = await fixture(35);
     try {
       assert.ok((await runSync(t.input)).fullyConverged);
@@ -1016,8 +1141,8 @@ describe("Mobile first B download", () => {
         const position = ++started;
         peak = Math.max(peak, ++active);
         try {
-          if (position === 4) releaseFirstBatch();
-          if (position <= 4) await firstBatch;
+          if (position === 8) releaseFirstBatch();
+          if (position <= 8) await firstBatch;
           else await new Promise<void>(resolve => setImmediate(resolve));
           return await stat(path);
         } finally { active--; }
@@ -1025,13 +1150,96 @@ describe("Mobile first B download", () => {
       const recovery = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: true as const,
         triggerSource: "auto_sync_on_save" as const };
       assert.ok((await runSync(recovery)).fullyConverged);
-      assert.equal(peak,4);
+      assert.equal(peak,8);
       assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length,70);
       assert.equal(t.remote.calls.filter(x=>x.op==="walk").length,1);
       assert.equal(t.remote.calls.filter(x=>x.op==="readFile").length,0);
       assert.deepEqual(t.local.writes(),[]);
       assert.equal(t.remote.puts,0);
       assert.equal(t.reruns(),0);
+    } finally { t.stop(); }
+  });
+
+  it("daily B rolling window keeps eight read-only lanes in flight and converges clean", async () => {
+    const t = await fixture(35);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      t.local.calls.length = 0;
+      t.remote.calls.length = 0;
+      const stat = t.remote.stat.bind(t.remote);
+      let active = 0;
+      let peak = 0;
+      let started = 0;
+      let releaseFirstBatch!: () => void;
+      const firstBatch = new Promise<void>(resolve => { releaseFirstBatch = resolve; });
+      t.remote.stat = async path => {
+        if (path === "/") return stat(path);
+        const position = ++started;
+        peak = Math.max(peak, ++active);
+        try {
+          if (position === 8) releaseFirstBatch();
+          if (position <= 8) await firstBatch;
+          else await new Promise<void>(resolve => setImmediate(resolve));
+          return await stat(path);
+        } finally { active--; }
+      };
+      const daily = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: undefined,
+        mobileDailyContentBudget: true as const, triggerSource: "manual" as const };
+      assert.ok((await runSync(daily)).fullyConverged);
+      assert.equal(peak,8);
+      assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length,70);
+      assert.equal(t.remote.calls.filter(x=>x.op==="walk").length,1);
+      assert.equal(t.remote.calls.filter(x=>x.op==="readFile").length,0);
+      assert.deepEqual(t.local.writes(),[]);
+      assert.equal(t.remote.puts,0);
+      assert.equal(t.reruns(),0);
+    } finally { t.stop(); }
+  });
+
+  it("daily B trusts the walk etag when the baseDir root etag holds across the round", async () => {
+    const t = await fixture(35);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      t.local.calls.length = 0;
+      t.remote.calls.length = 0;
+      const stat = t.remote.stat.bind(t.remote);
+      const rootEtag = '"root-1"';
+      t.remote.stat = async key => key === "/" ? { ...await stat(key), remoteFileId: "root", etag: rootEtag } : stat(key);
+      const daily = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: undefined,
+        mobileDailyContentBudget: true as const, triggerSource: "manual" as const };
+      assert.ok((await runSync(daily)).fullyConverged);
+      assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length,0);
+      assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key==="/").length,2);
+      assert.equal(t.remote.calls.filter(x=>x.op==="walk").length,1);
+      assert.equal(t.remote.calls.filter(x=>x.op==="readFile").length,0);
+      assert.deepEqual(t.local.writes(),[]);
+      assert.equal(t.remote.puts,0);
+      assert.equal(t.reruns(),0);
+    } finally { t.stop(); }
+  });
+
+  it("daily B re-verifies with fresh probes when the baseDir root etag moves mid-round", async () => {
+    const t = await fixture(4);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      const path = t.paths[0];
+      const stat = t.remote.stat.bind(t.remote);
+      let rootEtag = '"root-1"';
+      t.remote.stat = async key => key === "/" ? { ...await stat(key), remoteFileId: "root", etag: rootEtag } : stat(key);
+      // An external remote edit lands during the round: the collection etag propagates the
+      // change (as Nextcloud does) and the file is replaced, triggered off the local clean read.
+      const readFile = t.local.readFile.bind(t.local);
+      let triggered = false;
+      t.local.readFile = async key => {
+        if (!triggered && key === path) { triggered = true; t.seed(path,"replacement"); rootEtag = '"root-2"'; }
+        return readFile(key);
+      };
+      const daily = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: undefined,
+        mobileDailyContentBudget: true as const, triggerSource: "manual" as const };
+      assert.ok((await runSync(daily)).fullyConverged);
+      assert.equal(text(await t.local.readFile(path)),"replacement");
+      assert.ok(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length > 0);
+      assert.equal(t.remote.puts,0);
     } finally { t.stop(); }
   });
 
@@ -1233,8 +1441,9 @@ describe("Android save sync skips only verified clean remote bodies", () => {
       m.platform.isAndroidApp = true;
       assert.equal(await m.run("auto_sync_on_save", true), "ok");
       assert.equal(t.reads.length, 1);
+      // Periodic full sweeps now verify clean content independently of save provenance.
       assert.equal(await m.run("auto", true), "ok");
-      assert.equal(t.reads.length, 2);
+      assert.equal(t.reads.length, 1);
     } finally { t.stop(); }
   });
 });

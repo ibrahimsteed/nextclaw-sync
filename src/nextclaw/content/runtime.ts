@@ -121,7 +121,7 @@ export function contentRuntime(input: SyncInput) {
   }
   async function ensureRoot(records: NextclawSyncRecord[]) {
     if ((await rootReseed.read())?.phase === "rejected") throw new Error("root-reseed-rejected-requires-review");
-    try { const root = await input.fsRemote.stat("/"); guard(); await bindRoot(root); return root.remoteFileId; }
+    try { const root = await input.fsRemote.stat("/"); guard(); await bindRoot(root); startRootEtag = root.etag; return root.remoteFileId; }
     catch (e) {
       guard(); const code = e as { status?: number; code?: string };
       if (code.status !== 404 || input.triggerSource === "dry") throw e;
@@ -146,9 +146,10 @@ export function contentRuntime(input: SyncInput) {
     }
     await input.fsRemote.checkContentRootParent(); guard();
     await rootReseed.restore(() => { guard(); return input.fsRemote.restoreContentRoot(); }, binding.nativeManaged);
-    guard(); const root = await input.fsRemote.stat("/"); await bindRoot(root); guard(); return root.remoteFileId;
+    guard(); const root = await input.fsRemote.stat("/"); await bindRoot(root); startRootEtag = root.etag; guard(); return root.remoteFileId;
   }
   const deletions = new DeletionLedger(input.db.fileContentHistoryTbl, scope, guard);
+  let startRootEtag: string | undefined;
   let manifestUnsafe = false;
   let manifestLocal: Entity[] = [], manifestRemote: Entity[] = [], manifestRecords: NextclawSyncRecord[] = [];
   const setManifest = (l: Entity[], r: Entity[], records: NextclawSyncRecord[], unsafe = false) => {
@@ -258,6 +259,14 @@ export function contentRuntime(input: SyncInput) {
         before.remoteFileId === after.remoteFileId && before.remoteChecksum === after.remoteChecksum) return { clean };
       return cleanOnly ? {} : { remote: await readRemoteVersion(after) };
     }
+    // Clean proof against this round's walk manifest entry, without per-file remote probes.
+    // Freshness is guaranteed by the caller's round-end baseDir etag recheck, not a per-file after stat.
+    async function readForPlanTrusted(l?: Snapshot, record?: NextclawSyncRecord): Promise<{ clean?: ContentPlan; remote?: InitialDownload }> {
+      if (initial) return { remote: initial };
+      if (!remote) return {};
+      const clean = l && record ? await cleanSavePlan(l, record, remote) : undefined;
+      return clean ? { clean } : {};
+    }
     async function readLocal() {
       const e = await fresh(input.fsLocal, lp); if (!e) return;
       return localSnapshot(input.fsLocal, lp, e, guard, fileBodies.fileLimit);
@@ -338,7 +347,7 @@ export function contentRuntime(input: SyncInput) {
         });
       }, requestRerun: () => { guard(); runtime!.requestRerun(); },
     };
-    return { io, checkpoint, bodies: fileBodies, readLocal, readForPlan, prefetchInitialDownload, deletion: new DeleteExecutor(deletions, io, runtime!.journal, guard, input.configDir), executor: new ContentExecutor(scope, path, fileBodies, operations, io, runtime!.journal,
+    return { io, checkpoint, bodies: fileBodies, readLocal, readForPlan, readForPlanTrusted, prefetchInitialDownload, deletion: new DeleteExecutor(deletions, io, runtime!.journal, guard, input.configDir), executor: new ContentExecutor(scope, path, fileBodies, operations, io, runtime!.journal,
       endpoint, () => { try { runtime!.assertActive(); return true; } catch { return false; } }, input.configDir, initial) };
   }
   async function collect() {
@@ -356,5 +365,6 @@ export function contentRuntime(input: SyncInput) {
   const move = (rootId: string) => binding.nativeManaged ? new ContentMove({ pool: runtime.pool, records: input.db.prevSyncRecordsTbl,
     history: input.db.fileContentHistoryTbl, vault: input.vaultRandomID, profile: input.profileID, configDir: input.configDir,
     journal: runtime.journal, assertActive: guard, local: input.fsLocal, remote: input.fsRemote, rootId }) : undefined;
-  return { scope, bodies, attachments, operations, rootReseed, ensureRoot, deletions, deletionEvidence, setManifest, file, guard, collect, move };
+  return { scope, bodies, attachments, operations, rootReseed, ensureRoot, deletions, deletionEvidence, setManifest, file, guard, collect, move,
+    get startRootEtag() { return startRootEtag; } };
 }
