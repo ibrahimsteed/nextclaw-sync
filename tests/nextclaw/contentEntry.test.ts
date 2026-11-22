@@ -1126,7 +1126,7 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
-  it("rechecks the clean first-B vault in one run with four read-only lanes", async () => {
+  it("rechecks the clean first-B vault in one run with eight read-only lanes", async () => {
     const t = await fixture(35);
     try {
       assert.ok((await runSync(t.input)).fullyConverged);
@@ -1141,8 +1141,8 @@ describe("Mobile first B download", () => {
         const position = ++started;
         peak = Math.max(peak, ++active);
         try {
-          if (position === 4) releaseFirstBatch();
-          if (position <= 4) await firstBatch;
+          if (position === 8) releaseFirstBatch();
+          if (position <= 8) await firstBatch;
           else await new Promise<void>(resolve => setImmediate(resolve));
           return await stat(path);
         } finally { active--; }
@@ -1150,7 +1150,7 @@ describe("Mobile first B download", () => {
       const recovery = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: true as const,
         triggerSource: "auto_sync_on_save" as const };
       assert.ok((await runSync(recovery)).fullyConverged);
-      assert.equal(peak,4);
+      assert.equal(peak,8);
       assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length,70);
       assert.equal(t.remote.calls.filter(x=>x.op==="walk").length,1);
       assert.equal(t.remote.calls.filter(x=>x.op==="readFile").length,0);

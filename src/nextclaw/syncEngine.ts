@@ -21,7 +21,7 @@ export type { SyncCallbacks, SyncInput, SyncResult } from "./engine/model";
 const running = new WeakSet<NativeWriteJournal>();
 type MoveCollision = { source: string; target: string; fileId: string; hash: string };
 const INITIAL_PUBLICATION_CONCURRENCY = 4;
-const FIRST_B_RECOVERY_CONCURRENCY = 4;
+const FIRST_B_RECOVERY_CONCURRENCY = 8;
 const INITIAL_COLLECTION_BATCH = 128;
 const INITIAL_SMALL_COLLECTION_BATCH = 32;
 export async function runSync(input: SyncInput): Promise<SyncResult> {
