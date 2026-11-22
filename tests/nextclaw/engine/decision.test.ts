@@ -4,7 +4,7 @@ import {
   decodeRecord,
   decideFile,
 } from "../../../src/nextclaw/engine/model";
-import { runLegacySync as runSync } from "../../../src/nextclaw/engine/legacy";
+import { runSync } from "../../../src/nextclaw/syncEngine";
 import { harness, record } from "./helpers";
 
 describe("§5 单侧状态和版本", () => {

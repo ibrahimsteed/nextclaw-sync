@@ -1,4 +1,3 @@
-import type { ContentRecord } from "./nextclaw/content/identity";
 import { IdbStore, type IdbConnectionPool } from "./idbStore";
 import { nanoid } from "nanoid";
 
@@ -19,8 +18,6 @@ export interface NextclawSyncRecord extends Entity {
   remoteList?: string[];
   /** Acknowledged remote snapshot exists; local bytes still need rediscovery/upload. */
   pendingLocalUpload?: boolean;
-  /** Optional content capability; absence is a legacy record, never a migration failure. */
-  content?: ContentRecord;
 }
 
 export const DEFAULT_DB_VERSION_NUMBER: number = 20240220;

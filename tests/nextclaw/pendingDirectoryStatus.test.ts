@@ -23,15 +23,6 @@ describe("pending directories stay visible without becoming fatal errors",()=>{
   const h=fixture(0);run.call(h.p,undefined,"not_syncing",Date.now(),null);
   assert(!h.text().includes("待处理"));assert.equal(h.states[0].isSuccess,true);
  });
- it("shows unresolved content and directory work together without fading as complete",()=>{
-  const h=fixture(3);h.p.pendingContent={pending:12,conflicts:11,blocked:false};run.call(h.p,undefined,"not_syncing",Date.now()-60000,null);
-  assert.match(h.text(),/目录待处理 3/);assert.match(h.text(),/内容待处理 12/);assert.match(h.text(),/冲突 11/);assert.equal(h.states[0].isSuccess,false);
- });
- it("shows content pending with zero fatal errors, and clears only when the summary clears",()=>{
-  const h=fixture(0);h.p.pendingContent={pending:1,conflicts:1,blocked:false};run.call(h.p,undefined,"not_syncing",Date.now(),null);
-  assert.match(h.text(),/内容待处理 1/);assert.match(h.text(),/未全部收敛/);assert.equal(h.states[0].isSuccess,false);
-  h.p.pendingContent={pending:0,conflicts:0,blocked:false};run.call(h.p,undefined,"not_syncing",Date.now(),null);assert(!h.text().includes("待处理"));
- });
  it("persists the count for a replacement plugin load and clears it explicitly",async()=>{
   const data=new Map<string,unknown>();const db:any={simpleKVForMiscTbl:{async setItem(k:string,v:unknown){data.set(k,v);},async getItem(k:string){return data.get(k)??null;}}};
   assert.equal(await getPendingDirectoryCountByVault(db,"v"),0);

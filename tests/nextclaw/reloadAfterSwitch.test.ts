@@ -7,46 +7,11 @@ import {
   RELOAD_NOTICE_A,
   RELOAD_NOTICE_MS,
   markReloadPending,
-  dispatchFirstBReload,
-  takeFirstBRecovery,
   reloadAfterFirstASync,
   reloadAfterFirstBSync,
   shouldReloadAfterFirstASync,
   shouldReloadAfterSync,
 } from "../../src/nextclaw/reloadAfterSwitch";
-
-describe("Android first-B reload recovery handoff", () => {
-  const makePages = () => {
-    const values = new Map<string, string>();
-    const sessionStorage = {
-      getItem: (key: string) => values.get(key) ?? null,
-      setItem: (key: string, value: string) => values.set(key, value),
-      removeItem: (key: string) => values.delete(key),
-    } as unknown as Storage;
-    const page = (timeOrigin: number) => ({sessionStorage,performance:{timeOrigin} as Performance});
-    return page;
-  };
-  it("carries only an accepted dispatch to one later document in the same scope", () => {
-    const page = makePages();
-    let dispatched = 0;
-    assert.equal(dispatchFirstBReload(page(9),"A",()=>{dispatched++;return true;}),true);
-    assert.equal(dispatched,1);
-    assert.equal(takeFirstBRecovery(page(10),"A"),"A");
-    assert.equal(takeFirstBRecovery(page(10),"A"),undefined);
-    for (const [time,scope] of [[9,"A"],[10,"B"]] as const) {
-      dispatchFirstBReload(page(9),"A",()=>true);
-      assert.equal(takeFirstBRecovery(page(time),scope),undefined);
-      assert.equal(takeFirstBRecovery(page(10),"A"),undefined);
-    }
-  });
-  it("clears the marker after a rejected or throwing dispatch", () => {
-    const page = makePages();
-    assert.equal(dispatchFirstBReload(page(9),"A",()=>false),false);
-    assert.equal(takeFirstBRecovery(page(10),"A"),undefined);
-    assert.throws(()=>dispatchFirstBReload(page(9),"A",()=>{throw Error("dispatch");}),/dispatch/);
-    assert.equal(takeFirstBRecovery(page(10),"A"),undefined);
-  });
-});
 
 const base = {
   pending: true as boolean | undefined,
@@ -223,7 +188,7 @@ describe("NextClaw：切换后重新加载——main.ts 接线", () => {
     const iReload = m.indexOf("await reloadAfterFirstBSync(");
     assert.ok(iSync < iShould && iShould < iReload);
     const call = m.slice(iShould, iReload);
-    assert.match(call, /ok: result\.fullyConverged/);
+    assert.match(call, /ok: result\.ok/);
     assert.match(call, /pending: this\.settings\.nextclawReloadAfterFirstBSync/);
     assert.match(call, /triggerSource/);
     assert.match(call, /mode/);

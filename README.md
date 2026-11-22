@@ -88,18 +88,17 @@ you can actually reach. It is a hidden folder, so it is never synced to the
 server — but it is also never cleaned up automatically. Delete it yourself if it
 grows.
 
-Directory deletion stays pending while unrelated safe operations continue.
-In two-way sync, a file deletion can propagate when the surviving copy still
-matches the last synced version. If the surviving copy was edited, the edited
-content is preserved. An unresolved rename collision can defer deletions of
-other files in the same vault.
+Directory deletion is temporarily paused, including empty directories. It appears
+as an error in the sync plan; unrelated safe file operations continue. Renames
+can leave old empty folders behind. Review those folders before removing them
+manually.
 
-## Conflicts and suspected renames
+## Conflicts
 
-Two-way sync can merge non-overlapping Markdown edits. Overlapping edits are
-preserved with conflict markers for review. Suspected renames stay pending so
-both sides retain their content. Android does not automatically send WebDAV
-`MOVE` requests for renames.
+If the same note changed on both sides since the last sync, the newer
+modification time normally determines the main copy. The other content is kept
+beside it as a `.sync-conflict-…` file for you to review. These copies can sync
+to your other devices.
 
 Uploads, downloads and file deletions check the expected remote ETag. If another
 writer changed that version after scanning, the operation stops instead of
@@ -112,10 +111,8 @@ Binary replacement and deletion retain the removed version under
 after an interrupted operation, review them manually. Changes made by external
 programs outside Obsidian's adapter are not guaranteed to be atomic.
 
-If a native write has an unknown result, write operations stay paused across
-plugin reload and app restart. Keep the files and sync records available for
-investigation. For this release's tested platforms and known limits, see the
-[release notes](RELEASE_NOTES.md).
+Deletions propagate: a note deleted on one side is deleted on the other, unless it
+was modified there in the meantime, in which case the modified copy is kept.
 
 ## Your password
 
@@ -137,3 +134,8 @@ NextClaw Sync started as a fork of
 [Remotely Save](https://github.com/remotely-save/remotely-save) (Apache License
 2.0). The sync engine has been rewritten, and support for services other than
 WebDAV, end-to-end encryption and settings import/export have been removed.
+
+
+### 0.1.13 同步保护说明
+
+目录删除会显示为待处理并安全跳过，不阻塞其它安全文件同步；存在待处理目录时不能视为全部收敛。原生写入结果未知时会持久暂停，重载、重启、等待或读取成功均不会自动解锁；请保留本地文件和记录并联系管理员核对，勿通过清除记录强行恢复。675项回归与Android模拟器短时组合链路已验证，24小时资源稳定性尚未完成；实体Android、iOS和真实OpenClaw验收另行进行。详见[发布说明](RELEASE_NOTES.md)。

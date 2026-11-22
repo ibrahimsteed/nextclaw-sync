@@ -113,13 +113,6 @@ export class IdbConnectionPool {
 // Compatibility for standalone consumers. Production supplies its own owner.
 const defaultConnections = new IdbConnectionPool();
 
-/** Bounds all canonical JSON array keys beginning with these fields. */
-export function jsonArrayKeyRange(fields: readonly unknown[]) {
-  const prefix = JSON.stringify(fields).slice(0, -1);
-  // "," and "-" are adjacent code points, so the upper bound is exclusive.
-  return IDBKeyRange.bound(prefix + ",", prefix + "-", false, true);
-}
-
 export class IdbStore {
   constructor(
     readonly dbName: string,
@@ -178,15 +171,6 @@ export class IdbStore {
     return keys as string[];
   }
 
-  async getEntries(range: IDBKeyRange): Promise<[string, unknown][]> {
-    const { store, done } = await this.store("readonly");
-    const [keys, values] = await Promise.all([
-      promisify(store.getAllKeys(range)), promisify(store.getAll(range)), done,
-    ]);
-    if (keys.length !== values.length) throw new Error("IndexedDB range key/value mismatch");
-    return keys.map((key, index) => [key as string, values[index]]);
-  }
-
   /** 全部条目，键 → 值。 */
   async getItems(): Promise<Record<string, unknown>> {
     const out: Record<string, unknown> = {};
@@ -198,12 +182,11 @@ export class IdbStore {
 
   /** 依次访问每个条目；回调返回非 undefined 的值时提前结束并返回它。 */
   async iterate<R>(
-    callback: (value: unknown, key: string, iterationNumber: number) => R | undefined,
-    range?: IDBKeyRange
+    callback: (value: unknown, key: string, iterationNumber: number) => R | undefined
   ): Promise<R | undefined> {
     const { store, done } = await this.store("readonly");
     const result = await new Promise<R | undefined>((resolve, reject) => {
-      const request = store.openCursor(range);
+      const request = store.openCursor();
       let n = 1;
       request.onsuccess = () => {
         const cursor = request.result;
@@ -211,14 +194,7 @@ export class IdbStore {
           resolve(undefined);
           return;
         }
-        let r: R | undefined;
-        try {
-          r = callback(cursor.value, cursor.key as string, n++);
-        } catch (error) {
-          // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Preserve the callback's original rejection reason.
-          reject(error);
-          return;
-        }
+        const r = callback(cursor.value, cursor.key as string, n++);
         if (r !== undefined) {
           resolve(r);
           return;
@@ -227,9 +203,8 @@ export class IdbStore {
       };
       request.onerror = () => reject(asError(request.error, "IndexedDB request failed"));
     });
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- Keep the transaction completion and resolved cursor result in the same promise.
-    const [value] = await Promise.all([result, done]);
-    return value;
+    await done;
+    return result;
   }
 
   async clear(): Promise<void> {

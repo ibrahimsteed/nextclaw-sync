@@ -8,7 +8,7 @@ import {
 import { accountAddressFor } from "../../src/nextclaw/branch";
 import { NEXTCLAW_PUBLIC_WEBDAV_URL } from "../../src/nextclaw/constants";
 
-const student = (address: string) => ({ username: "s00000", address });
+const student = (address: string) => ({ username: "s10012", address });
 
 describe("NextClaw：桌面端不同步学生账号", () => {
   it("主机名从账号地址模板推出", () => {
@@ -17,14 +17,14 @@ describe("NextClaw：桌面端不同步学生账号", () => {
 
   it("桌面端 + 学生账号 → 拦下", () => {
     assert.equal(
-      isStudentAccountOnDesktop(student(accountAddressFor("s00000")), true),
+      isStudentAccountOnDesktop(student(accountAddressFor("s10012")), true),
       true
     );
   });
 
   it("移动端 + 学生账号 → 放行", () => {
     assert.equal(
-      isStudentAccountOnDesktop(student(accountAddressFor("s00000")), false),
+      isStudentAccountOnDesktop(student(accountAddressFor("s10012")), false),
       false
     );
   });
@@ -60,14 +60,14 @@ describe("NextClaw：桌面端不同步学生账号", () => {
 
   it("在折叠区块里改地址绕不过去：按主机名判断", () => {
     for (const a of [
-      "https://cloud.nextclaw.chat/remote.php/dav/files/s00000/Documents/",
+      "https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents/",
       "https://cloud.nextclaw.chat/remote.php/webdav/",
-      "https://cloud.nextclaw.chat/remote.php/dav/files/s00000",
-      "https://CLOUD.NextClaw.Chat/remote.php/dav/files/s00000/Documents",
-      "https://cloud.nextclaw.chat./remote.php/dav/files/s00000/Documents",
-      "https://cloud.nextclaw.chat:443/remote.php/dav/files/s00000/Documents",
-      "http://cloud.nextclaw.chat/remote.php/dav/files/s00000/Documents",
-      "  https://cloud.nextclaw.chat/remote.php/dav/files/s00000/Documents  ",
+      "https://cloud.nextclaw.chat/remote.php/dav/files/s10012",
+      "https://CLOUD.NextClaw.Chat/remote.php/dav/files/s10012/Documents",
+      "https://cloud.nextclaw.chat./remote.php/dav/files/s10012/Documents",
+      "https://cloud.nextclaw.chat:443/remote.php/dav/files/s10012/Documents",
+      "http://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents",
+      "  https://cloud.nextclaw.chat/remote.php/dav/files/s10012/Documents  ",
       NEXTCLAW_PUBLIC_WEBDAV_URL, // 填了用户名却指着公开分享
     ]) {
       assert.equal(isStudentAccountOnDesktop(student(a), true), true, a);
@@ -77,7 +77,7 @@ describe("NextClaw：桌面端不同步学生账号", () => {
   it("地址为空或还在填写中也拦：B 分支的地址由用户名自动生成", () => {
     assert.equal(isStudentAccountOnDesktop(student(""), true), true);
     assert.equal(
-      isStudentAccountOnDesktop({ username: "s00000" }, true),
+      isStudentAccountOnDesktop({ username: "s10012" }, true),
       true
     );
   });
@@ -90,16 +90,16 @@ describe("NextClaw：桌面端不同步学生账号", () => {
 });
 
 describe("NextClaw：学生账号没填密码时不同步", () => {
-  const nextclawAddr = accountAddressFor("s00000");
+  const nextclawAddr = accountAddressFor("s10012");
 
   it("填了用户名、没填密码 → 拦下", () => {
     assert.equal(
-      needsPasswordBeforeSync({ username: "s00000", address: nextclawAddr }),
+      needsPasswordBeforeSync({ username: "s10012", address: nextclawAddr }),
       true
     );
     assert.equal(
       needsPasswordBeforeSync({
-        username: "s00000",
+        username: "s10012",
         address: nextclawAddr,
         password: "",
       }),
@@ -115,7 +115,7 @@ describe("NextClaw：学生账号没填密码时不同步", () => {
   it("用户名和密码都填了 → 放行", () => {
     assert.equal(
       needsPasswordBeforeSync({
-        username: "s00000",
+        username: "s10012",
         address: nextclawAddr,
         password: "x",
       }),

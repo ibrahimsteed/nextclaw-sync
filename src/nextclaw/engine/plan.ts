@@ -207,7 +207,6 @@ export function protection(plan: Record<string, PlanItem>, pct: number) {
     ([, p]) =>
       (p.decision === "pull" && p.local) ||
       (p.decision === "push" && p.remote) ||
-      (p.decision === "content" && p.change && (p.local || p.remote)) ||
       p.decision === "deleteLocal" ||
       p.decision === "deleteRemote"
   ).length;

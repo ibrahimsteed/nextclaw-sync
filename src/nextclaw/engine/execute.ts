@@ -74,7 +74,7 @@ export async function executePlan(
   let writePaused = false;
   let done = 0;
   const operations = Object.entries(plan).filter(
-    ([, p]) => p.decision !== "none" && p.decision !== "error" && p.decision !== "content"
+    ([, p]) => p.decision !== "none" && p.decision !== "error"
   );
   const total = operations.length;
   const completed = new Set<string>();

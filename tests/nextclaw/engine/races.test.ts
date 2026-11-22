@@ -145,7 +145,7 @@ describe("restart reconstructs work from files and journal", () => {
     h.seed(record());
     const previous = structuredClone(h.records);
     h.remote.fail = (op) => op === "writeFile";
-    const { runLegacySync: runSync } = await import("../../../src/nextclaw/engine/legacy");
+    const { runSync } = await import("../../../src/nextclaw/syncEngine");
     assert.equal((await runSync(h.input)).ok, false);
     assert.deepEqual(h.records, previous);
     // A new engine run has no scheduler/event state; only disk and journal remain.
@@ -201,7 +201,7 @@ describe("acknowledged upload followed by a local edit", () => {
           }
           return result;
         };
-        const { runLegacySync: runSync } = await import("../../../src/nextclaw/engine/legacy");
+        const { runSync } = await import("../../../src/nextclaw/syncEngine");
         assert.equal((await runSync(h.input)).ok, false);
         assert.equal(text(await h.local.readFile("note.md")), "later");
         assert.equal(text(await h.remote.readFile("note.md")), "first");
@@ -233,7 +233,7 @@ describe("pending upload recovery keeps conditional-write protection", () => {
       h.remote.writeFileGuarded = write;
       return result;
     };
-    const { runLegacySync: runSync } = await import("../../../src/nextclaw/engine/legacy");
+    const { runSync } = await import("../../../src/nextclaw/syncEngine");
     assert.equal((await runSync(h.input)).ok, false);
     assert.equal(h.rec("note.md")?.pendingLocalUpload, true);
     assert.equal((await runSync({ ...h.input })).ok, true);
@@ -251,7 +251,7 @@ describe("pending upload recovery keeps conditional-write protection", () => {
       h.remote.writeFileGuarded = write;
       return result;
     };
-    const { runLegacySync: runSync } = await import("../../../src/nextclaw/engine/legacy");
+    const { runSync } = await import("../../../src/nextclaw/syncEngine");
     assert.equal((await runSync(h.input)).ok, false);
     assert.equal(h.rec("note.md")?.pendingLocalUpload, true);
     h.local.fail = () => false;
@@ -268,7 +268,7 @@ describe("pending upload recovery keeps conditional-write protection", () => {
       h.remote.writeFileGuarded = write;
       return result;
     };
-    const { runLegacySync: runSync } = await import("../../../src/nextclaw/engine/legacy");
+    const { runSync } = await import("../../../src/nextclaw/syncEngine");
     assert.equal((await runSync(h.input)).ok, false);
     h.remote.put("note.md", "third-party remote", 400000);
     assert.equal((await runSync({ ...h.input })).ok, true);

@@ -128,9 +128,6 @@ export interface Entity {
   sizeRaw: number;
   hash?: string;
   etag?: string;
-  /** Optional Nextcloud discovery properties; not substitutes for a strong ETag. */
-  remoteChecksum?: string;
-  remoteFileId?: string;
   synthesizedFolder?: boolean;
   synthesizedFile?: boolean;
 }

@@ -183,68 +183,6 @@ describe("exclusive creation on hidden paths", () => {
     );
     assert.equal(text(h.files.get(".obsidian/new.json")!), "{}");
   });
-  it("retains incoming and occupied bytes while three independent paths publish in the same folder", async () => {
-    const h = host();
-    const adapter = h.fs.vault.adapter;
-    await adapter.mkdir("notes");
-    const rename = adapter.rename;
-    const mkdir = adapter.mkdir;
-    let probes = 0, releases!: () => void;
-    const allStaged = new Promise<void>(resolve => { releases = resolve; });
-    const limit = setTimeout(releases, 750);
-    const targets = new Set<string>();
-    adapter.mkdir = async (p: string) => {
-      if (p.startsWith(".trash/nextclaw-probe-")) probes++;
-      await mkdir(p);
-    };
-    adapter.rename = async (from: string, to: string) => {
-      if (to.startsWith("notes/")) {
-        assert.ok(h.files.has(from));
-        targets.add(to);
-        if (targets.size === 4) {
-          h.files.set("notes/a.md", bytes("occupied"));
-          releases();
-        }
-        await allStaged;
-      }
-      await rename(from, to);
-    };
-    try {
-      const [occupied, ...peers] = await Promise.allSettled([
-        h.fs.writeFileGuarded("notes/a.md", bytes("incoming"), 10000, 10000, null),
-        h.fs.writeFileGuarded("notes/b.md", bytes("peer b"), 10000, 10000, null),
-        h.fs.writeFileGuarded("notes/c.md", bytes("peer c"), 10000, 10000, null),
-        h.fs.writeFileGuarded("notes/d.md", bytes("peer d"), 10000, 10000, null),
-      ]);
-      assert.equal(probes, 1);
-      assert.equal(occupied.status, "rejected");
-      assert.match(occupied.reason.message, /同名/);
-      assert.ok(peers.every(peer => peer.status === "fulfilled"));
-      assert.equal(text(h.files.get("notes/a.md")!), "occupied");
-      for (const peer of ["b", "c", "d"])
-        assert.equal(text(h.files.get(`notes/${peer}.md`)!), `peer ${peer}`);
-      const retained = [...h.files].filter(([key]) => key.startsWith(".trash/nextclaw-staging-"));
-      assert.deepEqual(retained.map(([, value]) => text(value)), ["incoming"]);
-    } finally { clearTimeout(limit); releases(); }
-  });
-
-  it("revalidates a new attachment after staging and retains its bytes on rejection", async () => {
-    const h = host();
-    const path = "new.png";
-    let checked = false;
-    await assert.rejects(h.fs.writeFileGuarded(path, bytes("incoming"), 10000, 10000, null, undefined, undefined,
-      async () => {
-        assert.ok([...h.files].some(([file, body]) => file.startsWith(".trash/nextclaw-staging-") && text(body) === "incoming"));
-        assert.equal(h.files.has(path), false);
-        checked = true;
-        await Promise.resolve();
-        throw new Error("remote version changed");
-      }), /remote version changed/);
-    assert.equal(checked, true);
-    assert.equal(h.files.has(path), false);
-    assert.ok([...h.files].some(([file, body]) => file.startsWith(".trash/nextclaw-staging-") && text(body) === "incoming"));
-  });
-
   it("refuses a same-name creation immediately before exclusive publication", async () => {
     const h = host();
     h.setBeforeCopy(() => h.files.set("new.md", bytes("concurrent")));

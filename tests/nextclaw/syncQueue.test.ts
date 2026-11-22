@@ -32,33 +32,6 @@ function clock() {
   };
 }
 describe("unified follow-up and recovery queue", () => {
-  it("runs the first-B handoff once and leaves mixed or retried work on the normal path", async () => {
-    const c = clock(), seen: Array<[boolean,string | undefined]> = [];
-    const q = new SyncQueue(async (saveOnly, scope) => { seen.push([saveOnly,scope]); return "ok"; },c);
-    q.request(0,false,"vault");
-    await c.tick(0);
-    q.request(0,false,"vault");
-    q.request(0,true);
-    await c.tick(0);
-    q.request(0,false,"vault");
-    q.finished("failed");
-    await c.tick(5000);
-    assert.deepEqual(seen,[[false,"vault"],[false,undefined],[false,undefined]]);
-  });
-  it("preserves save-only provenance and promotes mixed or failed work to a full run", async () => {
-    const c = clock(), modes: boolean[] = [];
-    const q = new SyncQueue(async saveOnly => { modes.push(saveOnly); return "ok"; }, c);
-    q.request(0, true);
-    await c.tick(0);
-    q.request(0, true);
-    q.request();
-    q.request(0, true);
-    await c.tick(0);
-    q.request(0, true);
-    q.finished("failed");
-    await c.tick(5000);
-    assert.deepEqual(modes, [true, false, false]);
-  });
   it("coalesces while busy and runs once after the owner completes", async () => {
     const c = clock();
     let busy = true,

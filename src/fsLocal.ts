@@ -169,15 +169,11 @@ export class FakeFsLocal extends FakeFs {
     mtime: number,
     ctime: number,
     expected: Entity | null,
-    expectedBytes?: ArrayBuffer,
-    assertCurrent: () => void = () => {},
-    verifyStagedCreate?: () => Promise<void>
+    expectedBytes?: ArrayBuffer
   ): Promise<Entity> {
-    if (expected && verifyStagedCreate) throw new SyncConflict("暂存提交检查仅适用于新建");
-    assertCurrent();
     await assertVersion(this, key, expected);
     if (!expected) {
-      assertCurrent(); await this.createExclusive(key, content, mtime, ctime, assertCurrent, verifyStagedCreate);
+      await this.createExclusive(key, content, mtime, ctime);
     } else {
       if (!expectedBytes) throw new SyncConflict("缺少本地版本快照");
       let oldText: string | undefined, newText: string | undefined;
@@ -199,11 +195,11 @@ export class FakeFsLocal extends FakeFs {
         oldText = undefined;
       }
       if (oldText !== undefined && newText !== undefined) {
-        this.assertActive(); assertCurrent();
+        this.assertActive();
         await this.vault.adapter.process(
           key,
           (current) => {
-            this.assertActive(); assertCurrent();
+            this.assertActive();
             if (current !== oldText) throw new SyncConflict();
             return newText;
           },
@@ -213,8 +209,8 @@ export class FakeFsLocal extends FakeFs {
         // No binary CAS in Obsidian: retain the version actually moved, including
         // edits racing the last check. Never unlink that retained version.
         await this.ensureExclusiveRename();
-        assertCurrent(); await this.retainForRemoval(key, expectedBytes, assertCurrent);
-        assertCurrent(); await this.createExclusive(key, content, mtime, ctime, assertCurrent);
+        await this.retainForRemoval(key, expectedBytes);
+        await this.createExclusive(key, content, mtime, ctime);
       }
     }
     const stored = await this.stat(key);
@@ -225,27 +221,27 @@ export class FakeFsLocal extends FakeFs {
 
   private static exclusiveRename = new WeakMap<object, Promise<void>>();
 
-  private async ensureExclusiveRename(assertCurrent: () => void = () => {}) {
+  private async ensureExclusiveRename() {
     const adapter = this.vault.adapter;
     let probe = FakeFsLocal.exclusiveRename.get(adapter);
     if (!probe) {
       probe = (async () => {
         const parent = `.trash/nextclaw-probe-${nanoid()}`;
-        await mkdirpInVault(`${parent}/`, this.vault, () => { this.assertActive(); assertCurrent(); });
+        await mkdirpInVault(`${parent}/`, this.vault, this.assertActive);
         const source = `${parent}/source`,
           target = `${parent}/target`;
         const marker = new TextEncoder().encode("target-must-survive").buffer;
         let rejected = false;
         try {
-          this.assertActive(); assertCurrent();
+          this.assertActive();
           await adapter.writeBinary(
             source,
             new TextEncoder().encode("source").buffer
           );
-          this.assertActive(); assertCurrent();
+          this.assertActive();
           await adapter.writeBinary(target, marker);
           try {
-            this.assertActive(); assertCurrent();
+            this.assertActive();
             await adapter.rename(source, target);
           } catch {
             rejected = true;
@@ -260,10 +256,10 @@ export class FakeFsLocal extends FakeFs {
         } finally {
           for (const file of [source, target])
             if (await adapter.exists(file)) {
-              this.assertActive(); assertCurrent();
+              this.assertActive();
               await adapter.remove(file);
             }
-          this.assertActive(); assertCurrent();
+          this.assertActive();
           await adapter.rmdir(parent, false);
         }
       })();
@@ -283,23 +279,17 @@ export class FakeFsLocal extends FakeFs {
     key: string,
     bytes: ArrayBuffer,
     mtime: number,
-    ctime: number,
-    assertCurrent: () => void = () => {},
-    verifyStagedCreate?: () => Promise<void>
+    ctime: number
   ) {
     // Android copy overwrites despite its SDK contract. Probe the real host's
     // rename behavior before relying on no-clobber publication; fail closed otherwise.
-    await this.ensureExclusiveRename(assertCurrent);
+    await this.ensureExclusiveRename();
     const parent = `.trash/nextclaw-staging-${nanoid()}`;
-    await mkdirpInVault(`${parent}/`, this.vault, () => { this.assertActive(); assertCurrent(); });
+    await mkdirpInVault(`${parent}/`, this.vault, this.assertActive);
     const staged = `${parent}/incoming`;
-    this.assertActive(); assertCurrent();
+    this.assertActive();
     await this.vault.adapter.writeBinary(staged, bytes, { mtime, ctime });
-    this.assertActive(); assertCurrent();
-    if (verifyStagedCreate) {
-      await verifyStagedCreate();
-      this.assertActive(); assertCurrent();
-    }
+    this.assertActive();
     try {
       await this.vault.adapter.rename(staged, key);
     } catch (error) {
@@ -307,21 +297,21 @@ export class FakeFsLocal extends FakeFs {
         `新文件未覆盖同名路径，待传内容保留在 ${staged}：${error instanceof Error ? error.message : String(error)}`
       );
     }
-    this.assertActive(); assertCurrent();
+    this.assertActive();
     await this.vault.adapter.rmdir(parent, false);
   }
 
-  private async retainForRemoval(key: string, expectedBytes: ArrayBuffer, assertCurrent: () => void = () => {}) {
+  private async retainForRemoval(key: string, expectedBytes: ArrayBuffer) {
     const parent = `.trash/nextclaw-recovery-${nanoid()}`;
-    await mkdirpInVault(`${parent}/`, this.vault, () => { this.assertActive(); assertCurrent(); });
+    await mkdirpInVault(`${parent}/`, this.vault, this.assertActive);
     const retained = `${parent}/${key.split("/").pop()!}`;
-    this.assertActive(); assertCurrent();
+    this.assertActive();
     await this.vault.adapter.rename(key, retained);
     const bytes = await this.vault.adapter.readBinary(retained);
     if (!equalBytes(bytes, expectedBytes)) {
       // Restore only via create-if-absent; never overwrite a newly recreated path.
       try {
-        await this.createExclusive(key, bytes, Date.now(), Date.now(), assertCurrent);
+        await this.createExclusive(key, bytes, Date.now(), Date.now());
       } catch {
         /* retained stays intact */
       }
@@ -332,14 +322,13 @@ export class FakeFsLocal extends FakeFs {
   async rmGuarded(
     key: string,
     expected: Entity,
-    expectedBytes?: ArrayBuffer,
-    assertCurrent: () => void = () => {}
+    expectedBytes?: ArrayBuffer
   ): Promise<void> {
     if (key.endsWith("/"))
       throw new SyncConflict("目录删除暂缓，保留可能新建的子文件");
-    assertCurrent(); await assertVersion(this, key, expected); assertCurrent();
+    await assertVersion(this, key, expected);
     if (!expectedBytes) throw new SyncConflict("缺少本地删除快照");
-    await this.retainForRemoval(key, expectedBytes, assertCurrent); assertCurrent();
+    await this.retainForRemoval(key, expectedBytes);
   }
 
   async readFile(key: string): Promise<ArrayBuffer> {
