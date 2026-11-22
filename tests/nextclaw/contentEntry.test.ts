@@ -1196,6 +1196,53 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
+  it("daily B trusts the walk etag when the baseDir root etag holds across the round", async () => {
+    const t = await fixture(35);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      t.local.calls.length = 0;
+      t.remote.calls.length = 0;
+      const stat = t.remote.stat.bind(t.remote);
+      const rootEtag = '"root-1"';
+      t.remote.stat = async key => key === "/" ? { ...await stat(key), remoteFileId: "root", etag: rootEtag } : stat(key);
+      const daily = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: undefined,
+        mobileDailyContentBudget: true as const, triggerSource: "manual" as const };
+      assert.ok((await runSync(daily)).fullyConverged);
+      assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length,0);
+      assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key==="/").length,2);
+      assert.equal(t.remote.calls.filter(x=>x.op==="walk").length,1);
+      assert.equal(t.remote.calls.filter(x=>x.op==="readFile").length,0);
+      assert.deepEqual(t.local.writes(),[]);
+      assert.equal(t.remote.puts,0);
+      assert.equal(t.reruns(),0);
+    } finally { t.stop(); }
+  });
+
+  it("daily B re-verifies with fresh probes when the baseDir root etag moves mid-round", async () => {
+    const t = await fixture(4);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      const path = t.paths[0];
+      const stat = t.remote.stat.bind(t.remote);
+      let rootEtag = '"root-1"';
+      t.remote.stat = async key => key === "/" ? { ...await stat(key), remoteFileId: "root", etag: rootEtag } : stat(key);
+      // An external remote edit lands during the round: the collection etag propagates the
+      // change (as Nextcloud does) and the file is replaced, triggered off the local clean read.
+      const readFile = t.local.readFile.bind(t.local);
+      let triggered = false;
+      t.local.readFile = async key => {
+        if (!triggered && key === path) { triggered = true; t.seed(path,"replacement"); rootEtag = '"root-2"'; }
+        return readFile(key);
+      };
+      const daily = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: undefined,
+        mobileDailyContentBudget: true as const, triggerSource: "manual" as const };
+      assert.ok((await runSync(daily)).fullyConverged);
+      assert.equal(text(await t.local.readFile(path)),"replacement");
+      assert.ok(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length > 0);
+      assert.equal(t.remote.puts,0);
+    } finally { t.stop(); }
+  });
+
   it("falls back to ordinary planning on a version change during the second read-only query", async () => {
     const t = await fixture(4);
     try {

@@ -243,28 +243,45 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         // Rolling window: keep FIRST_B_RECOVERY_CONCURRENCY ordinary items in flight and
         // backfill on each completion instead of waiting for the slowest item in a batch.
         // Large attachments stay isolated: drain the window, verify the large item alone.
-        const verifyItem = async (entry: typeof candidates[number]) => {
+        const verifyItem = async (entry: typeof candidates[number], trust: boolean) => {
           const [key, item] = entry;
           const file = fileForPlan(key, item);
           try {
-            const clean = (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
+            const l = await file.readLocal();
+            const clean = (trust ? await file.readForPlanTrusted(l, item.record) : await file.readForPlan(l, item.record, true)).clean;
             if (clean) verified.set(key, clean);
           } catch { /* rejected paths stay unresolved and fall through to the ordinary sweep */ }
           runtime.guard();
         };
-        const runWindow = async (run: typeof candidates) => {
+        const runWindow = async (run: typeof candidates, trust: boolean) => {
           let idx = 0;
-          const worker = async () => { while (idx < run.length) await verifyItem(run[idx++]); };
+          const worker = async () => { while (idx < run.length) await verifyItem(run[idx++], trust); };
           await Promise.all(Array.from({ length: Math.min(FIRST_B_RECOVERY_CONCURRENCY, run.length) }, () => worker()));
         };
-        let run: typeof candidates = [];
-        for (const entry of candidates) {
-          if (largeImported(entry[1])) {
-            if (run.length) { await runWindow(run); run = []; }
-            await verifyItem(entry);
-          } else run.push(entry);
+        const runAll = async (trust: boolean) => {
+          let run: typeof candidates = [];
+          for (const entry of candidates) {
+            if (largeImported(entry[1])) {
+              if (run.length) { await runWindow(run, trust); run = []; }
+              await verifyItem(entry, trust);
+            } else run.push(entry);
+          }
+          if (run.length) await runWindow(run, trust);
+        };
+        // Trust this round's walk etags for the clean proofs, then re-confirm the baseDir
+        // collection etag held since round start before accepting them. An unchanged strong
+        // root etag proves no remote mutation touched any walk entry; if it moved (or the
+        // server gives no strong root etag), re-verify with fresh per-file probes so the
+        // proofs carry the same guarantee as the ordinary read-only path.
+        const startTag = runtime.startRootEtag;
+        const canTrust = typeof startTag === "string" && strongEtag(startTag);
+        await runAll(canTrust);
+        if (canTrust) {
+          let unchanged = false;
+          try { const endRoot = await input.fsRemote.stat("/"); runtime.guard(); unchanged = endRoot.etag === startTag; }
+          catch { unchanged = false; }
+          if (!unchanged) { verified.clear(); await runAll(false); }
         }
-        if (run.length) await runWindow(run);
       } else {
         for (let i = 0; i < candidates.length;) {
           const next = candidates.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
