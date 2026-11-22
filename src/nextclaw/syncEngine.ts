@@ -239,22 +239,50 @@ export async function runSync(input: SyncInput): Promise<SyncResult> {
         (!verifyDaily || Math.max(item.local.size ?? item.local.sizeRaw ?? 0,
           item.remote.size ?? item.remote.sizeRaw ?? 0) <= ATTACHMENT_LIMIT)) : contentEntries;
       const verified = new Map<string, NonNullable<PlanItem["content"]>>();
-      for (let i = 0; i < candidates.length;) {
-        const next = candidates.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
-        const large = next.findIndex(([, item]) => largeImported(item));
-        const chunk = large < 0 ? next : next.slice(0, Math.max(1, large));
-        const checked = await Promise.allSettled(chunk.map(async ([key, item]) => {
+      if (verifyDaily) {
+        // Rolling window: keep FIRST_B_RECOVERY_CONCURRENCY ordinary items in flight and
+        // backfill on each completion instead of waiting for the slowest item in a batch.
+        // Large attachments stay isolated: drain the window, verify the large item alone.
+        const verifyItem = async (entry: typeof candidates[number]) => {
+          const [key, item] = entry;
           const file = fileForPlan(key, item);
-          return (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
-        }));
-        runtime.guard();
-        for (const [index, check] of checked.entries()) {
-          if (!verifyDaily && check.status === "rejected" && !(check.reason instanceof SyncConflict) &&
-              (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
-          if (check.status === "fulfilled" && check.value) verified.set(chunk[index][0], check.value);
+          try {
+            const clean = (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
+            if (clean) verified.set(key, clean);
+          } catch { /* rejected paths stay unresolved and fall through to the ordinary sweep */ }
+          runtime.guard();
+        };
+        const runWindow = async (run: typeof candidates) => {
+          let idx = 0;
+          const worker = async () => { while (idx < run.length) await verifyItem(run[idx++]); };
+          await Promise.all(Array.from({ length: Math.min(FIRST_B_RECOVERY_CONCURRENCY, run.length) }, () => worker()));
+        };
+        let run: typeof candidates = [];
+        for (const entry of candidates) {
+          if (largeImported(entry[1])) {
+            if (run.length) { await runWindow(run); run = []; }
+            await verifyItem(entry);
+          } else run.push(entry);
         }
-        i += chunk.length;
-        if (!verifyIndependently && verified.size !== i) break;
+        if (run.length) await runWindow(run);
+      } else {
+        for (let i = 0; i < candidates.length;) {
+          const next = candidates.slice(i, i + FIRST_B_RECOVERY_CONCURRENCY);
+          const large = next.findIndex(([, item]) => largeImported(item));
+          const chunk = large < 0 ? next : next.slice(0, Math.max(1, large));
+          const checked = await Promise.allSettled(chunk.map(async ([key, item]) => {
+            const file = fileForPlan(key, item);
+            return (await file.readForPlan(await file.readLocal(), item.record, true)).clean;
+          }));
+          runtime.guard();
+          for (const [index, check] of checked.entries()) {
+            if (!verifyDaily && check.status === "rejected" && !(check.reason instanceof SyncConflict) &&
+                (check.reason as { status?: number } | null)?.status !== 412) throw check.reason;
+            if (check.status === "fulfilled" && check.value) verified.set(chunk[index][0], check.value);
+          }
+          i += chunk.length;
+          if (!verifyIndependently && verified.size !== i) break;
+        }
       }
       if (verifyIndependently || verified.size === contentEntries.length) {
         for (const [key, clean] of verified) {

@@ -1160,6 +1160,42 @@ describe("Mobile first B download", () => {
     } finally { t.stop(); }
   });
 
+  it("daily B rolling window keeps eight read-only lanes in flight and converges clean", async () => {
+    const t = await fixture(35);
+    try {
+      assert.ok((await runSync(t.input)).fullyConverged);
+      t.local.calls.length = 0;
+      t.remote.calls.length = 0;
+      const stat = t.remote.stat.bind(t.remote);
+      let active = 0;
+      let peak = 0;
+      let started = 0;
+      let releaseFirstBatch!: () => void;
+      const firstBatch = new Promise<void>(resolve => { releaseFirstBatch = resolve; });
+      t.remote.stat = async path => {
+        if (path === "/") return stat(path);
+        const position = ++started;
+        peak = Math.max(peak, ++active);
+        try {
+          if (position === 8) releaseFirstBatch();
+          if (position <= 8) await firstBatch;
+          else await new Promise<void>(resolve => setImmediate(resolve));
+          return await stat(path);
+        } finally { active--; }
+      };
+      const daily = { ...t.input, androidInitialDownload: undefined, androidFirstBRecovery: undefined,
+        mobileDailyContentBudget: true as const, triggerSource: "manual" as const };
+      assert.ok((await runSync(daily)).fullyConverged);
+      assert.equal(peak,8);
+      assert.equal(t.remote.calls.filter(x=>x.op==="stat" && x.key!=="/").length,70);
+      assert.equal(t.remote.calls.filter(x=>x.op==="walk").length,1);
+      assert.equal(t.remote.calls.filter(x=>x.op==="readFile").length,0);
+      assert.deepEqual(t.local.writes(),[]);
+      assert.equal(t.remote.puts,0);
+      assert.equal(t.reruns(),0);
+    } finally { t.stop(); }
+  });
+
   it("falls back to ordinary planning on a version change during the second read-only query", async () => {
     const t = await fixture(4);
     try {
