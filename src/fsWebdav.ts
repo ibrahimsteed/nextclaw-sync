@@ -209,6 +209,39 @@ const parseCustomHeaders = (x: string): Record<string, string> => {
   return res;
 };
 
+const ANDROID_COOKIE_ACCOUNT_KEY = "nextclaw-sync-android-cookie-account";
+
+// Android 原生桥对任何显式 Cookie 头都不抑制会话注入（空头还会丢 same-site cookie，
+// 触发 Nextcloud strict-cookie 412），只能在同步账号变化时清 app 级 cookie jar，
+// 让身份回到每请求的 Basic；同账号会话无害，无需清。标记存 localStorage（跨库共享）。
+async function clearAndroidCookiesOnAccountChange(accountKey: string) {
+  if (typeof localStorage === "undefined") {
+    return;
+  }
+  if (localStorage.getItem(ANDROID_COOKIE_ACCOUNT_KEY) === accountKey) {
+    return;
+  }
+  const plugin = (
+    globalThis as {
+      Capacitor?: {
+        Plugins?: {
+          CapacitorCookies?: { clearAllCookies: () => Promise<void> };
+        };
+      };
+    }
+  ).Capacitor?.Plugins?.CapacitorCookies;
+  if (!plugin) {
+    return;
+  }
+  try {
+    await plugin.clearAllCookies();
+  } catch {
+    // 清失败不写标记，下次初始化重试；不阻断同步本身。
+    return;
+  }
+  localStorage.setItem(ANDROID_COOKIE_ACCOUNT_KEY, accountKey);
+}
+
 export class FakeFsWebdav extends FakeFs {
   kind: "webdav";
 
@@ -244,6 +277,11 @@ export class FakeFsWebdav extends FakeFs {
   }
 
   async _init() {
+    if (Platform.isAndroidApp) {
+      await clearAndroidCookiesOnAccountChange(
+        `${this.webdavConfig.address}|${this.webdavConfig.username}`
+      );
+    }
     // init client if not inited
     if (this.client !== undefined && this.vaultFolderExists) {
       return;
@@ -255,7 +293,14 @@ export class FakeFsWebdav extends FakeFs {
     const customHeaders = parseCustomHeaders(
       this.webdavConfig.customHeaders ?? ""
     );
-    const headers: Record<string, string> = { ...cacheHeader, ...customHeaders };
+    // iOS 原生 HTTP 自动附 app 级会话 cookie（跨库共享），Nextcloud 会话身份优先于 Basic，
+    // 跨账号路径被 404；显式空 Cookie 头抑制原生注入，身份回到每请求的 Basic。
+    // Android 桥不抑制注入（空 Cookie 头反而触发 Nextcloud 412），改用账号变化时清 jar。
+    const headers: Record<string, string> = {
+      ...cacheHeader,
+      ...(Platform.isIosApp ? { cookie: "" } : {}),
+      ...customHeaders,
+    };
     for (const key of Object.keys(headers)) if (["x-nextclaw-local-transport", NATIVE_OWNER_HEADER].includes(key.toLowerCase())) delete headers[key];
     if (this.writeJournal) headers[NATIVE_OWNER_HEADER] = this.writeJournal.token;
     // Old experimental profiles must not silently change transport semantics.
