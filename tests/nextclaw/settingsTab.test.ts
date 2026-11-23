@@ -139,17 +139,22 @@ describe("NextClaw 设置页（渲染）：布局", () => {
     assert.equal(remote.settingEl.visible(), true);
   });
 
-  it("用户名与密码默认遮住，点眼睛切换显示", () => {
+  it("用户名明文显示，无眼睛按钮", () => {
     const { byName } = render({});
-    for (const name of ["settings_webdav_user", "settings_webdav_password"]) {
-      const s = byName(name);
-      assert.equal(s.text.inputEl.type, "password", name);
-      s.extraButton.click();
-      assert.equal(s.text.inputEl.type, "text", name);
-      assert.equal(s.extraButton.icon, "eye", name);
-      s.extraButton.click();
-      assert.equal(s.text.inputEl.type, "password", name);
-    }
+    const s = byName("settings_webdav_user");
+    assert.equal(s.text.inputEl.type, "text");
+    assert.equal(s.extraButton, undefined);
+  });
+
+  it("密码默认遮住，点眼睛切换显示", () => {
+    const { byName } = render({});
+    const s = byName("settings_webdav_password");
+    assert.equal(s.text.inputEl.type, "password");
+    s.extraButton.click();
+    assert.equal(s.text.inputEl.type, "text");
+    assert.equal(s.extraButton.icon, "eye");
+    s.extraButton.click();
+    assert.equal(s.text.inputEl.type, "password");
   });
 });
 

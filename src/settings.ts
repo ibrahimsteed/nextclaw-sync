@@ -143,7 +143,6 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName(t("nextclaw_group_account")).setHeading();
 
-    let usernameText: TextComponent | undefined;
     // 分支切换会改掉自动同步两项的取值，下拉框要跟着刷新（不重绘整页，免得打断输入）。
     let startupDropdown: DropdownComponent | undefined;
     let autorunDropdown: DropdownComponent | undefined;
@@ -152,7 +151,6 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
       .setName(t("settings_webdav_user"))
       .setDesc(t("settings_webdav_user_desc"))
       .addText((text) => {
-        usernameText = text;
         text.setValue(settings.webdav.username).onChange(async (value) => {
           // 用户名是分支判据，且地址要跟着它重算。
           // 逻辑在 nextclaw/usernameChange.ts，这里只把结果落到界面上。
@@ -171,8 +169,7 @@ export class NextclawSyncSettingTab extends PluginSettingTab {
           refreshRenewButton();
           await save();
         });
-      })
-      .addExtraButton((eye) => hideTextWithToggle(usernameText!, eye));
+      });
     // 桌面端提前说清楚：学生账号在这里填了也不会同步，别等点了同步才发现。
     if (Platform.isDesktopApp) {
       usernameSetting.descEl.createDiv({

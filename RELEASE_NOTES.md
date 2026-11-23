@@ -1,4 +1,9 @@
-# 0.2.10 — Account address template matches the hosted vault layout
+# 0.2.11 — Correct account address auto-fill; username shown as plain text
+
+This release combines two changes. (0.2.10 was tagged but never distributed;
+its change is included here.)
+
+## Account address template matches the hosted vault layout
 
 The server address auto-filled for a NextClaw account now includes the
 `data/` path segment:
@@ -14,12 +19,16 @@ On the NextClaw host, the Nextcloud Files Desktop sync root is
 high, so users had to edit the address by hand. The new template fills in
 the correct address directly; the remote folder stays `ObsidianVault_Math`.
 
-Everything else is unchanged:
+The address field remains editable, and an address you changed yourself is
+never overwritten when the username changes. The read-only demo vault and
+other WebDAV servers are unaffected.
 
-- The address field remains editable. An address you changed yourself is
-  never overwritten when the username changes.
-- The read-only demo vault (no username) is unaffected.
-- Other WebDAV servers are unaffected.
-- The cross-vault session cookie fix from 0.2.9 is included.
+## Username field is no longer masked
 
-Regression suite: 682 passing, 0 failing.
+The username input on the settings page is now plain text. The username is
+an account identifier, not a secret, and masking it made it hard to verify
+while typing. The password field keeps its mask and show/hide toggle.
+
+The cross-vault session cookie fix from 0.2.9 is included.
+
+Regression suite: 683 passing, 0 failing.
