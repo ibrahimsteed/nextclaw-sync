@@ -34,9 +34,12 @@ export const NEXTCLAW_PUBLIC_SHARE_PASSWORD = "public-share-no-password";
 /**
  * B 分支：用户自己账号的地址模板，`{username}` 在用户填入用户名后替换。
  * 这是**可编辑的初始值**，不是隐藏的固定值——用户可改为任意兼容 WebDAV 的服务。
+ *
+ * `data/` 一层对应宿主机的固定 Vault 路径：Nextcloud Files Desktop 的同步根是
+ * `/home/ctyun/customers/<user>`，Vault 必须落在 `<同步根>/data/Documents/ObsidianVault_Math`。
  */
 export const NEXTCLAW_ACCOUNT_WEBDAV_URL_TEMPLATE =
-  "https://cloud.nextclaw.chat/remote.php/dav/files/{username}/Documents";
+  "https://cloud.nextclaw.chat/remote.php/dav/files/{username}/data/Documents";
 
 export const NEXTCLAW_USERNAME_PLACEHOLDER = "{username}";
 

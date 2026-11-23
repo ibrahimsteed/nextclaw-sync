@@ -38,7 +38,7 @@ export const applyUsernameChange = (
   }
 
   // 地址跟着用户名**每一次**变化重算，不能只在切换那一次算——
-  // 否则会被定死成用户名第一个字符生成的那个（如 .../files/s/Documents）。
+  // 否则会被定死成用户名第一个字符生成的那个（如 .../files/s/data/Documents）。
   // isManagedAddress 保证用户自己改过的地址不会被覆盖。
   if (branchAfter === "B" && isManagedAddress(webdav.address)) {
     webdav.address = accountAddressFor(webdav.username);

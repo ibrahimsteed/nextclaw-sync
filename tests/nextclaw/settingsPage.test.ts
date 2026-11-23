@@ -2,6 +2,7 @@ import { strict as assert } from "assert";
 import { readFileSync } from "fs";
 import * as path from "path";
 import { DEFAULT_DEBUG_FOLDER } from "../../src/baseTypes";
+import { accountAddressFor } from "../../src/nextclaw/branch";
 import { BranchLocks } from "../../src/nextclaw/branchUi";
 import {
   NEXTCLAW_PUBLIC_WEBDAV_URL,
@@ -46,7 +47,7 @@ const messy = (webdav: Record<string, any>) => ({
   currLogLevel: "debug",
 }) as any;
 
-const studentAddr = "https://cloud.nextclaw.chat/remote.php/dav/files/s1/Documents";
+const studentAddr = accountAddressFor("s1");
 
 describe("NextClaw 设置页：隐藏项每次加载强制为预设值", () => {
   it("模式 B：隐藏项全部回到预设", () => {
